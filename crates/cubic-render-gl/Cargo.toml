@@ -1,0 +1,12 @@
+[package]
+name = "cubic-render-gl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cubic-render = { path = "../cubic-render" }
+glow = { workspace = true }
+glutin = { workspace = true, features = ["egl", "glx"] }
+raw-window-handle = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }

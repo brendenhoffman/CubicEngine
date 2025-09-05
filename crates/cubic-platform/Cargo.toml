@@ -1,0 +1,9 @@
+[package]
+name = "cubic-platform"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = { workspace = true, features = ["rwh_06"] }
+anyhow = { workspace = true }
+tracing = { workspace = true }

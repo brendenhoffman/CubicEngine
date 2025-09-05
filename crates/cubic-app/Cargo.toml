@@ -1,0 +1,16 @@
+[package]
+name = "cubic-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tracing = { workspace = true }
+cubic-core = { path = "../cubic-core" }
+cubic-render = { path = "../cubic-render" }
+cubic-render-gl = { path = "../cubic-render-gl" }
+cubic-render-vk = { path = "../cubic-render-vk" }
+cubic-platform = { path = "../cubic-platform" }
+
+# winit lives in cubic-platform for now, APIs in use here via that crate

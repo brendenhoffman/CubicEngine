@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "crates/cubic-core",
+  "crates/cubic-math",
+  "crates/cubic-platform",
+  "crates/cubic-render",
+  "crates/cubic-render-gl",
+  "crates/cubic-render-vk",
+  "crates/cubic-app",
+]
+resolver = "2"
+
+[workspace.dependencies]
+ash = "0.38"
+ash-window = "0.13"
+raw-window-handle = "0.6"
+winit = "0.30"
+glutin = "0.32"
+glow = "0.16"
+anyhow = "1"
+tracing = "0.1"
+thiserror = "1"
+glam = "0.30"
+tracing-subscriber = "0.3"
+clap = "4"
+bitflags = "2"
