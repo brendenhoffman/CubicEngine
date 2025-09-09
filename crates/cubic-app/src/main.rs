@@ -101,8 +101,8 @@ impl ApplicationHandler for App {
                 info!("CloseRequested");
                 self.exiting = true;
                 if let Some(w) = &self.window {
-                  self.backend = None;
-                  self.window = None;
+                    self.backend = None;
+                    self.window = None;
                 }
                 event_loop.exit();
             }
@@ -131,7 +131,9 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if self.exiting { return; }
+        if self.exiting {
+            return;
+        }
         // Render one frame every tick; keeps things simple and guarantees first frame on Wayland.
         if let Some(backend) = &mut self.backend {
             let res = match backend {
@@ -157,7 +159,10 @@ fn main() -> Result<()> {
         backend_choice: args.backend,
         window: None,
         backend: None,
-        render_size: RenderSize { width: 1, height: 1 },
+        render_size: RenderSize {
+            width: 1,
+            height: 1,
+        },
         exiting: false,
     };
 
