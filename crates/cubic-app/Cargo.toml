@@ -12,5 +12,7 @@ cubic-render = { path = "../cubic-render" }
 cubic-render-gl = { path = "../cubic-render-gl" }
 cubic-render-vk = { path = "../cubic-render-vk" }
 cubic-platform = { path = "../cubic-platform" }
+serde = { workspace = true }
+toml = { workspace = true }
 
 # winit lives in cubic-platform for now, APIs in use here via that crate

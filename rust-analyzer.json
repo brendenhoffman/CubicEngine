@@ -1,0 +1,8 @@
+{
+  "rust-analyzer.procMacro.enable": true,
+  "rust-analyzer.procMacro.attributes.enable": true,
+  "rust-analyzer.procMacro.server": "builtin",
+  "rust-analyzer.procMacro.rustcArgs": [
+    "--release"
+  ]
+}

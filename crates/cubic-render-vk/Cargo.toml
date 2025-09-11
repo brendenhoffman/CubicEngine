@@ -10,3 +10,6 @@ ash-window = { workspace = true }
 raw-window-handle = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+
+[build-dependencies]
+shaderc = { workspace = true }

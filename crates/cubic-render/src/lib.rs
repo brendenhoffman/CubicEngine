@@ -18,4 +18,6 @@ pub trait Renderer {
 
     fn resize(&mut self, size: RenderSize) -> Result<()>;
     fn render(&mut self) -> Result<()>;
+    fn set_clear_color(&mut self, rgba: [f32; 4]);
+    fn set_vsync(&mut self, _on: bool) {}
 }
