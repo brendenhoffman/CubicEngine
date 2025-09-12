@@ -43,6 +43,8 @@ pub struct VkRenderer {
     debug_messenger: vk::DebugUtilsMessengerEXT,
     acq_slots: Vec<AcquireSlot>,
     acq_index: usize,
+    hdr: bool,
+    have_swapchain_colorspace_ext: bool,
 }
 
 struct FrameSync {
@@ -62,6 +64,7 @@ struct SwapchainConfig {
     vsync: bool,
     vsync_mode: VkVsyncMode,
     want_hdr: bool,
+    allow_extended_colorspace: bool,
 }
 
 struct SwapchainBundle {
@@ -70,6 +73,7 @@ struct SwapchainBundle {
     extent: vk::Extent2D,
     images: Vec<vk::Image>,
     image_views: Vec<vk::ImageView>,
+    color_space: vk::ColorSpaceKHR,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,6 +87,12 @@ enum RenderPath {
     Core13, // Vulkan 1.3 core dynamic rendering + sync2
     KhrExt, // Vulkan 1.2 + VK_KHR_dynamic_rendering + VK_KHR_synchronization2
     Legacy, // No dynamic rendering: would need render pass/framebuffer path
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum HdrMode {
+    Off,
+    Auto,
 }
 
 #[cfg(debug_assertions)]
@@ -158,6 +168,9 @@ fn fmt_name(f: ash::vk::Format) -> &'static str {
         ash::vk::Format::B8G8R8A8_SRGB => "B8G8R8A8_SRGB",
         ash::vk::Format::R8G8B8A8_SRGB => "R8G8B8A8_SRGB",
         ash::vk::Format::R8G8B8A8_UNORM => "R8G8B8A8_UNORM",
+        vk::Format::A2B10G10R10_UNORM_PACK32 => "A2B10G10R10_UNORM",
+        vk::Format::A2R10G10B10_UNORM_PACK32 => "A2R10G10B10_UNORM",
+        vk::Format::R16G16B16A16_SFLOAT => "R16G16B16A16_SFLOAT",
         _ => "OTHER",
     }
 }
@@ -180,26 +193,6 @@ fn pm_name(m: ash::vk::PresentModeKHR) -> &'static str {
         ash::vk::PresentModeKHR::FIFO_RELAXED => "FIFO_RELAXED",
         _ => "OTHER",
     }
-}
-
-fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
-    formats
-        .iter()
-        .copied()
-        .find(|f| f.format == vk::Format::B8G8R8A8_SRGB)
-        .or_else(|| {
-            formats
-                .iter()
-                .copied()
-                .find(|f| f.format == vk::Format::R8G8B8A8_SRGB)
-        })
-        .or_else(|| {
-            formats.iter().copied().find(|f| {
-                f.format == vk::Format::B8G8R8A8_UNORM
-                    && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-            })
-        })
-        .unwrap_or_else(|| formats[0])
 }
 
 fn choose_present_mode(
@@ -261,14 +254,31 @@ unsafe fn create_instance(entry: &Entry, display_raw: RawDisplayHandle) -> Resul
     let ext_slice = ash_window::enumerate_required_extensions(display_raw)
         .context("enumerate_required_extensions")?;
 
+    let inst_exts = entry
+        .enumerate_instance_extension_properties(None)
+        .context("enumerate_instance_extension_properties(instance)")?;
+    let has_swapchain_cs = inst_exts.iter().any(|e| unsafe {
+        std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::swapchain_colorspace::NAME
+    });
+
+    // Build the final list we’ll enable
     #[cfg(debug_assertions)]
     let ext_vec = {
         let mut v = ext_slice.to_vec();
+        if has_swapchain_cs {
+            v.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+        }
         v.push(ash::ext::debug_utils::NAME.as_ptr());
         v
     };
     #[cfg(not(debug_assertions))]
-    let ext_vec = ext_slice.to_vec();
+    let ext_vec = {
+        let mut v = ext_slice.to_vec();
+        if has_swapchain_cs {
+            v.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+        }
+        v
+    };
 
     #[cfg(debug_assertions)]
     let layers = [std::ffi::CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
@@ -318,6 +328,56 @@ unsafe fn pick_device_and_queue(
     Err(anyhow!("no suitable physical device/queue family"))
 }
 
+fn pick_surface_format(
+    formats: &[vk::SurfaceFormatKHR],
+    want_hdr: bool,
+    allow_extended: bool,
+) -> (vk::SurfaceFormatKHR, &'static str) {
+    if want_hdr && allow_extended {
+        // Prefer true HDR10 (PQ) on 10/16 bit
+        if let Some(f) = formats.iter().copied().find(|f| {
+            f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT
+                && (f.format == vk::Format::R16G16B16A16_SFLOAT
+                    || f.format == vk::Format::A2B10G10R10_UNORM_PACK32
+                    || f.format == vk::Format::A2R10G10B10_UNORM_PACK32)
+        }) {
+            return (f, "hdr10_pq");
+        }
+        // Next best: scRGB linear FP16 (wide gamut, HDR-ish path on many desktops)
+        if let Some(f) = formats.iter().copied().find(|f| {
+            (f.color_space == vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT
+             /* some WSI also expose NONLINEAR variant */ ||
+             f.color_space == vk::ColorSpaceKHR::EXTENDED_SRGB_NONLINEAR_EXT)
+                && f.format == vk::Format::R16G16B16A16_SFLOAT
+        }) {
+            return (f, "scrgb_fp16");
+        }
+    }
+
+    // SDR fallbacks
+    if let Some(f) = formats
+        .iter()
+        .copied()
+        .find(|f| f.format == vk::Format::B8G8R8A8_SRGB)
+    {
+        return (f, "sdr_bgra8_srgb");
+    }
+    if let Some(f) = formats
+        .iter()
+        .copied()
+        .find(|f| f.format == vk::Format::R8G8B8A8_SRGB)
+    {
+        return (f, "sdr_rgba8_srgb");
+    }
+    if let Some(f) = formats.iter().copied().find(|f| {
+        f.format == vk::Format::B8G8R8A8_UNORM && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+    }) {
+        return (f, "sdr_bgra8_unorm_srgbcs");
+    }
+
+    (formats[0], "driver_default")
+}
+
 unsafe fn create_swapchain_bundle(
     device: &ash::Device,
     surf_i: &surface::Instance,
@@ -328,48 +388,29 @@ unsafe fn create_swapchain_bundle(
 ) -> Result<SwapchainBundle> {
     let caps = surf_i.get_physical_device_surface_capabilities(phys, surface)?;
     let formats = surf_i.get_physical_device_surface_formats(phys, surface)?;
+    //dump_surface_formats("enumerate", &formats);
+    tracing::info!(
+        "hdr_request={} allow_extended_colorspace={} have_swapchain_colorspace_ext={}",
+        cfg.want_hdr,
+        cfg.allow_extended_colorspace,
+        cfg.allow_extended_colorspace
+    );
     let modes = surf_i.get_physical_device_surface_present_modes(phys, surface)?;
-    let surf_format = if cfg.want_hdr {
-        // Priorities (from most flexible to "true HDR10"):
-        // 1) 16-bit float + extended-sRGB-linear (scRGB)
-        formats
-            .iter()
-            .copied()
-            .find(|f| {
-                f.format == vk::Format::R16G16B16A16_SFLOAT
-                    && (f.color_space == vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT
-                        || f.color_space == vk::ColorSpaceKHR::EXTENDED_SRGB_NONLINEAR_EXT)
-            })
-            // 2) 10-bit UNORM + HDR10 PQ (OS may map to HDR path)
-            .or_else(|| {
-                formats.iter().copied().find(|f| {
-                    (f.format == vk::Format::A2B10G10R10_UNORM_PACK32
-                        || f.format == vk::Format::A2R10G10B10_UNORM_PACK32)
-                        && (f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT)
-                })
-            })
-            // 3) Fall back to your normal sRGB picker
-            .unwrap_or_else(|| choose_surface_format(&formats))
-    } else {
-        choose_surface_format(&formats)
-    };
+
+    let (surf_format, pick_reason) =
+        pick_surface_format(&formats, cfg.want_hdr, cfg.allow_extended_colorspace);
+
     let present_mode = choose_present_mode(&modes, cfg.vsync, cfg.vsync_mode);
     let extent = extent_from_caps(&caps, cfg.hint);
 
     tracing::info!(
-        "swapchain: fmt={}, cs={}, present={}, extent={}x{}",
+        "reason: {}, format: {} / {}, present_mode: {}, vsync={}, mode={:?}, extent: {}x{}, images(min={} → picked={})",
+        pick_reason,
         fmt_name(surf_format.format),
         cs_name(surf_format.color_space),
         pm_name(present_mode),
-        extent.width,
-        extent.height
-    );
-
-    info!(
-        "swapchain choose → format: {} / {}, present_mode: {}, extent: {}x{}, images(min={} → picked={})",
-        fmt_name(surf_format.format),
-        cs_name(surf_format.color_space),
-        pm_name(present_mode),
+        cfg.vsync,
+        cfg.vsync_mode,
         extent.width, extent.height,
         caps.min_image_count,
 
@@ -439,6 +480,7 @@ unsafe fn create_swapchain_bundle(
         extent,
         images,
         image_views: views,
+        color_space: surf_format.color_space,
     })
 }
 
@@ -660,6 +702,13 @@ unsafe fn build_renderer(
     let has_dynren_khr = has(ash::khr::dynamic_rendering::NAME);
     let has_hdr_meta = has(ash::ext::hdr_metadata::NAME);
 
+    let inst_exts = entry
+        .enumerate_instance_extension_properties(None)
+        .unwrap_or_default();
+    let have_swapchain_colorspace_ext = inst_exts.iter().any(|e| unsafe {
+        std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::swapchain_colorspace::NAME
+    });
+
     let mut feats12 = vk::PhysicalDeviceVulkan12Features {
         s_type: vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
         ..Default::default()
@@ -763,12 +812,14 @@ unsafe fn build_renderer(
     let swapchain_loader = swapchain::Device::new(&instance, &device);
     let initial_vsync = true;
     let initial_mode = VkVsyncMode::Mailbox;
+    let initial_hdr = std::env::var("CUBIC_HDR").ok().as_deref() == Some("1");
 
     let cfg = SwapchainConfig {
         hint: size,
         vsync: initial_vsync,
         vsync_mode: initial_mode,
-        want_hdr: std::env::var("CUBIC_HDR").ok().as_deref() == Some("1"),
+        want_hdr: initial_hdr,
+        allow_extended_colorspace: have_swapchain_colorspace_ext,
     };
 
     let bundle = create_swapchain_bundle(
@@ -786,44 +837,26 @@ unsafe fn build_renderer(
         extent,
         images,
         image_views,
+        color_space,
     } = bundle;
 
-    let selected_cs_is_hdr10 = {
-        // We need the colorspace; store it alongside format if you want, or re-query one surface format:
-        // Easiest: re-query the chosen surface format again here (cheap).
-        let formats = surface_loader
-            .get_physical_device_surface_formats(phys, surface)
-            .unwrap_or_default();
-        // Find the exact format we used for the swapchain
-        formats
-            .iter()
-            .any(|f| f.format == format && f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT)
-    };
-
-    if has_hdr_meta && selected_cs_is_hdr10 {
+    if has_hdr_meta && color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT {
         let hdr = ash::ext::hdr_metadata::Device::new(&instance, &device);
-
-        // Very conservative metadata (you can read real values from the display later)
         let metadata = vk::HdrMetadataEXT {
             s_type: vk::StructureType::HDR_METADATA_EXT,
-            // SMPTE 2086 primaries/white point in chromaticity (x,y); use Rec.2020-ish ballpark
             display_primary_red: vk::XYColorEXT { x: 0.708, y: 0.292 },
             display_primary_green: vk::XYColorEXT { x: 0.170, y: 0.797 },
             display_primary_blue: vk::XYColorEXT { x: 0.131, y: 0.046 },
             white_point: vk::XYColorEXT {
                 x: 0.3127,
                 y: 0.3290,
-            }, // D65
-            // Nits → code units are “candelas per square meter”
-            max_luminance: 1000.0, // typical HDR10 max mastering
-            min_luminance: 0.001,  // HDR10 min mastering
-            // Content Light Level (optional but helpful)
+            },
+            max_luminance: 1000.0,
+            min_luminance: 0.001,
             max_content_light_level: 1000.0,
             max_frame_average_light_level: 400.0,
             ..Default::default()
         };
-
-        // Apply metadata to this swapchain
         unsafe {
             hdr.set_hdr_metadata(&[swapchain], std::slice::from_ref(&metadata));
         }
@@ -923,6 +956,8 @@ unsafe fn build_renderer(
         debug_messenger,
         acq_slots,
         acq_index: 0,
+        hdr: initial_hdr,
+        have_swapchain_colorspace_ext,
     };
 
     r.record_commands()?;
@@ -945,29 +980,16 @@ impl VkRenderer {
 
         let _ = unsafe { self.recreate_swapchain(want) };
     }
-    pub fn set_hdr(&mut self, on: bool) {
-        let want = on;
-        // Recreate swapchain with new preference
-        let cfg_before = std::env::var("CUBIC_HDR").ok();
-        // If you like env toggling during dev:
-        if want {
-            std::env::set_var("CUBIC_HDR", "1");
-        } else {
-            std::env::remove_var("CUBIC_HDR");
+    pub fn set_hdr_enabled(&mut self, on: bool) {
+        if self.hdr == on {
+            return;
         }
-
-        let want_size = RenderSize {
+        self.hdr = on;
+        let want = RenderSize {
             width: self.extent.width,
             height: self.extent.height,
         };
-        let _ = unsafe { self.recreate_swapchain(want_size) };
-
-        // (Optional) restore previous env var after recreating if you don’t want global state
-        if let Some(v) = cfg_before {
-            std::env::set_var("CUBIC_HDR", v);
-        } else {
-            std::env::remove_var("CUBIC_HDR");
-        }
+        let _ = unsafe { self.recreate_swapchain(want) };
     }
 
     unsafe fn record_commands(&mut self) -> Result<()> {
@@ -1134,7 +1156,8 @@ impl VkRenderer {
             hint: size,
             vsync: self.vsync,
             vsync_mode: self.vsync_mode,
-            want_hdr: std::env::var("CUBIC_HDR").ok().as_deref() == Some("1"),
+            want_hdr: self.hdr,
+            allow_extended_colorspace: self.have_swapchain_colorspace_ext,
         };
 
         let bundle = create_swapchain_bundle(
@@ -1152,7 +1175,40 @@ impl VkRenderer {
             extent,
             images,
             image_views,
+            color_space,
         } = bundle;
+
+        let has_hdr_meta = {
+            let ext_props = self
+                .instance
+                .enumerate_device_extension_properties(self.phys)
+                .unwrap_or_default();
+            ext_props.iter().any(|e| unsafe {
+                std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::hdr_metadata::NAME
+            })
+        };
+
+        if has_hdr_meta && color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT {
+            let hdr = ash::ext::hdr_metadata::Device::new(&self.instance, &self.device);
+            let metadata = vk::HdrMetadataEXT {
+                s_type: vk::StructureType::HDR_METADATA_EXT,
+                display_primary_red: vk::XYColorEXT { x: 0.708, y: 0.292 },
+                display_primary_green: vk::XYColorEXT { x: 0.170, y: 0.797 },
+                display_primary_blue: vk::XYColorEXT { x: 0.131, y: 0.046 },
+                white_point: vk::XYColorEXT {
+                    x: 0.3127,
+                    y: 0.3290,
+                },
+                max_luminance: 1000.0,
+                min_luminance: 0.001,
+                max_content_light_level: 1000.0,
+                max_frame_average_light_level: 400.0,
+                ..Default::default()
+            };
+            unsafe {
+                hdr.set_hdr_metadata(&[swapchain], std::slice::from_ref(&metadata));
+            }
+        }
 
         let old_format = self.format;
 

@@ -39,6 +39,8 @@ struct RenderCfg {
     unfocused_fps: u32,
     #[serde(default)]
     fps_when_vsync_off: u32,
+    #[serde(default)]
+    hdr: bool,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, Default)]
@@ -73,6 +75,7 @@ impl Default for RenderCfg {
             unfocused: UnfocusedPolicy::Throttle,
             unfocused_fps: 30,
             fps_when_vsync_off: 0,
+            hdr: false,
         }
     }
 }
@@ -158,6 +161,7 @@ impl ApplicationHandler for App {
                         VsyncMode::Mailbox => cubic_render_vk::VkVsyncMode::Mailbox,
                     };
                     r.as_mut().set_vsync_mode(mode);
+                    r.as_mut().set_hdr_enabled(self.cfg.render.hdr);
                 }
             }
 

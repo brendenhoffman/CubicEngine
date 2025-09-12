@@ -1,0 +1,4 @@
+#!/bin/bash
+export RUST_LOG=info
+cargo run --bin cubic-app -- --backend vk
+

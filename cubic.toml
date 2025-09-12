@@ -1,5 +1,6 @@
 [render]
 clear_color = [0.02, 0.02, 0.04, 1.0]
+hdr = true
 
 vsync = true
 vsync_mode = "mailbox"  # "mailbox" | "fifo"  (Vulkan only; GL ignores)
