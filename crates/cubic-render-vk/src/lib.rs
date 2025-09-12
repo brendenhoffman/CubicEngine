@@ -48,7 +48,6 @@ pub struct VkRenderer {
 }
 
 struct FrameSync {
-    image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
 }
@@ -148,7 +147,6 @@ impl Drop for VkRenderer {
             for f in &self.frames {
                 d.destroy_fence(f.in_flight, None);
                 d.destroy_semaphore(f.render_finished, None);
-                d.destroy_semaphore(f.image_available, None);
             }
             for s in &self.acq_slots {
                 self.device.destroy_fence(s.fence, None);
@@ -384,6 +382,7 @@ unsafe fn create_swapchain_bundle(
     swap_d: &swapchain::Device,
     phys: vk::PhysicalDevice,
     surface: vk::SurfaceKHR,
+    old_swapchain: vk::SwapchainKHR,
     cfg: SwapchainConfig,
 ) -> Result<SwapchainBundle> {
     let caps = surf_i.get_physical_device_surface_capabilities(phys, surface)?;
@@ -447,11 +446,12 @@ unsafe fn create_swapchain_bundle(
         composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
         present_mode,
         clipped: vk::TRUE,
+        old_swapchain,
         ..Default::default()
     };
 
-    let swapchain = swap_d.create_swapchain(&swap_info, None)?;
-    let images = swap_d.get_swapchain_images(swapchain)?;
+    let new_swapchain = swap_d.create_swapchain(&swap_info, None)?;
+    let images = swap_d.get_swapchain_images(new_swapchain)?;
     let mut views = Vec::with_capacity(images.len());
 
     for &img in &images {
@@ -475,7 +475,7 @@ unsafe fn create_swapchain_bundle(
     }
 
     Ok(SwapchainBundle {
-        swapchain,
+        swapchain: new_swapchain,
         format: surf_format.format,
         extent,
         images,
@@ -828,6 +828,7 @@ unsafe fn build_renderer(
         &swapchain_loader,
         phys,
         surface,
+        vk::SwapchainKHR::null(),
         cfg,
     )?;
 
@@ -907,12 +908,10 @@ unsafe fn build_renderer(
     };
 
     for _ in 0..image_count {
-        let ia = device.create_semaphore(&sem_info, None)?;
         let rf = device.create_semaphore(&sem_info, None)?;
         let inflight = device.create_fence(&fence_info, None)?;
 
         frames.push(FrameSync {
-            image_available: ia,
             render_finished: rf,
             in_flight: inflight,
         });
@@ -1140,16 +1139,10 @@ impl VkRenderer {
         for &iv in &self.image_views {
             self.device.destroy_image_view(iv, None);
         }
-
-        self.swapchain_loader
-            .destroy_swapchain(self.swapchain, None);
-
         for f in &self.frames {
             self.device.destroy_fence(f.in_flight, None);
             self.device.destroy_semaphore(f.render_finished, None);
-            self.device.destroy_semaphore(f.image_available, None);
         }
-
         self.frames.clear();
 
         let cfg = SwapchainConfig {
@@ -1166,8 +1159,12 @@ impl VkRenderer {
             &self.swapchain_loader,
             self.phys,
             self.surface,
+            self.swapchain,
             cfg,
         )?;
+
+        self.swapchain_loader
+            .destroy_swapchain(self.swapchain, None);
 
         let SwapchainBundle {
             swapchain,
@@ -1228,12 +1225,10 @@ impl VkRenderer {
         };
 
         for _ in 0..image_count {
-            let ia = self.device.create_semaphore(&sem_info, None)?;
             let rf = self.device.create_semaphore(&sem_info, None)?;
             let inflight = self.device.create_fence(&fence_info, None)?;
 
             self.frames.push(FrameSync {
-                image_available: ia,
                 render_finished: rf,
                 in_flight: inflight,
             });
@@ -1267,6 +1262,7 @@ impl VkRenderer {
             self.cmd_bufs = self.device.allocate_command_buffers(&alloc_info)?;
         }
 
+        self.acq_index = 0;
         self.record_commands()?;
 
         Ok(())
@@ -1423,8 +1419,8 @@ impl Renderer for VkRenderer {
                     let _ = self.recreate_swapchain(want);
 
                     if !self.paused {
-                        self.paused = true;
-                        info!("vk: present → OUT_OF_DATE/SUBOPTIMAL → paused=true");
+                        self.paused = false;
+                        info!("vk: present → OUT_OF_DATE/SUBOPTIMAL");
                     }
                 }
                 Err(e) => return Err(anyhow::anyhow!("queue_present: {e:?}")),
