@@ -4,5 +4,8 @@
   "rust-analyzer.procMacro.server": "builtin",
   "rust-analyzer.procMacro.rustcArgs": [
     "--release"
+  ],
+  "rust-analyzer.diagnostics.disabled": [
+    "inactive-code"
   ]
 }

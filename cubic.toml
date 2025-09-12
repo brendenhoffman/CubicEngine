@@ -1,0 +1,9 @@
+[render]
+clear_color = [0.02, 0.02, 0.04, 1.0]
+
+vsync = true
+vsync_mode = "mailbox"  # "mailbox" | "fifo"  (Vulkan only; GL ignores)
+fps_when_vsync_off = 60 # cap when vsync=false; omit or 0 to disable
+
+unfocused = "vsync_on" # "throttle" | "vsync_on" | "none"
+unfocused_fps = 30

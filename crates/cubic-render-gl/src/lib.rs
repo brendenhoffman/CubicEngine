@@ -194,8 +194,8 @@ impl Renderer for GlRenderer {
     fn resize(&mut self, size: RenderSize) -> Result<()> {
         self.size = size;
 
-        let w = NonZeroU32::new(size.width.max(1)).unwrap();
-        let h = NonZeroU32::new(size.height.max(1)).unwrap();
+        let w = NonZeroU32::new(size.width).unwrap();
+        let h = NonZeroU32::new(size.height).unwrap();
 
         self.surface.resize(&self.context, w, h);
         self.set_vsync(self.vsync);
