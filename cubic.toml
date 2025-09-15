@@ -1,6 +1,7 @@
 [render]
 clear_color = [0.02, 0.02, 0.04, 1.0]
 hdr = true
+hdr_flavor = "prefer_scrgb"           # "prefer_scrgb" (safe default) | "prefer_hdr10"
 
 vsync = true
 vsync_mode = "mailbox"  # "mailbox" | "fifo"  (Vulkan only; GL ignores)

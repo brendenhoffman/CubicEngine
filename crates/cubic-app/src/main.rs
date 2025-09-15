@@ -41,6 +41,8 @@ struct RenderCfg {
     fps_when_vsync_off: u32,
     #[serde(default)]
     hdr: bool,
+    #[serde(default)]
+    hdr_flavor: HdrFlavorCfg,
 }
 
 #[derive(Debug, Clone, Copy, serde::Deserialize, Default)]
@@ -60,6 +62,14 @@ enum UnfocusedPolicy {
     Throttle,
 }
 
+#[derive(Debug, Clone, Copy, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum HdrFlavorCfg {
+    #[default]
+    PreferScrgb,
+    PreferHdr10,
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct AppCfg {
     #[serde(default)]
@@ -76,6 +86,7 @@ impl Default for RenderCfg {
             unfocused_fps: 30,
             fps_when_vsync_off: 0,
             hdr: false,
+            hdr_flavor: HdrFlavorCfg::PreferScrgb,
         }
     }
 }
@@ -162,6 +173,11 @@ impl ApplicationHandler for App {
                     };
                     r.as_mut().set_vsync_mode(mode);
                     r.as_mut().set_hdr_enabled(self.cfg.render.hdr);
+                    let flavor = match self.cfg.render.hdr_flavor {
+                        HdrFlavorCfg::PreferScrgb => cubic_render_vk::HdrFlavor::PreferScrgb,
+                        HdrFlavorCfg::PreferHdr10 => cubic_render_vk::HdrFlavor::PreferHdr10,
+                    };
+                    r.as_mut().set_hdr_flavor(flavor);
                 }
             }
 

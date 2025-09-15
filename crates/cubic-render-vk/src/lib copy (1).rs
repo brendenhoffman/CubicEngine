@@ -1,4 +1,3 @@
-#![deny(unsafe_op_in_unsafe_fn)]
 use anyhow::{anyhow, Context, Result};
 #[cfg(debug_assertions)]
 use ash::ext::debug_utils as ext_debug;
@@ -6,11 +5,9 @@ use ash::khr::{surface, swapchain};
 use ash::util::read_spv;
 use ash::{vk, Entry, Instance};
 use cubic_render::{RenderSize, Renderer};
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle};
 use std::io::Cursor;
-#[cfg(debug_assertions)]
-use std::time::SystemTime;
-use std::{fs, path::Path, path::PathBuf};
+use std::{fs, path::PathBuf};
 use tracing::info;
 
 const TRI_VERTS: &[Vertex] = &[
@@ -66,7 +63,7 @@ pub struct VkRenderer {
     #[allow(dead_code)]
     path: RenderPath,
     #[cfg(debug_assertions)]
-    debug_messenger: Option<vk::DebugUtilsMessengerEXT>,
+    debug_messenger: vk::DebugUtilsMessengerEXT,
     acq_slots: Vec<AcquireSlot>,
     acq_index: usize,
     has_hdr_metadata_ext: bool,
@@ -87,22 +84,16 @@ pub struct VkRenderer {
     ubufs: Vec<vk::Buffer>,
     umems: Vec<vk::DeviceMemory>,
     pipeline_cache: vk::PipelineCache,
-    timeline: vk::Semaphore,
-    timeline_value: u64,
-    display_raw: RawDisplayHandle,
-    window_raw: RawWindowHandle,
-    backoff_frames: u32,
-    #[cfg(debug_assertions)]
-    shader_dev: Option<ShaderDev>,
 }
 
 struct FrameSync {
     render_finished: vk::Semaphore,
+    in_flight: vk::Fence,
 }
 
 struct AcquireSlot {
     sem: vk::Semaphore,
-    last_signal_value: u64,
+    fence: vk::Fence,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -140,14 +131,6 @@ struct CameraUbo {
 struct Vertex {
     pos: [f32; 3],
     color: [f32; 3],
-}
-
-#[cfg(debug_assertions)]
-struct ShaderDev {
-    vert_path: PathBuf,
-    frag_path: PathBuf,
-    vert_mtime: SystemTime,
-    frag_mtime: SystemTime,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -223,13 +206,16 @@ unsafe extern "system" fn debug_callback(
     _user: *mut std::os::raw::c_void,
 ) -> vk::Bool32 {
     if !data.is_null() {
-        let msg = unsafe { std::ffi::CStr::from_ptr((*data).p_message) };
+        let msg = std::ffi::CStr::from_ptr((*data).p_message);
         eprintln!("[Vulkan] {:?}", msg);
     }
     vk::FALSE
 }
 #[cfg(debug_assertions)]
-fn create_debug_messenger(entry: &ash::Entry, instance: &ash::Instance) -> Result<DebugState> {
+unsafe fn create_debug_messenger(
+    entry: &ash::Entry,
+    instance: &ash::Instance,
+) -> Result<DebugState> {
     let debug_loader = ext_debug::Instance::new(entry, instance);
     let ci = vk::DebugUtilsMessengerCreateInfoEXT {
         s_type: vk::StructureType::DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
@@ -242,18 +228,30 @@ fn create_debug_messenger(entry: &ash::Entry, instance: &ash::Instance) -> Resul
         pfn_user_callback: Some(debug_callback),
         ..Default::default()
     };
-    Ok(unsafe { debug_loader.create_debug_utils_messenger(&ci, None)? })
+    Ok(debug_loader.create_debug_utils_messenger(&ci, None)?)
 }
 
 #[cfg(not(debug_assertions))]
-fn create_debug_messenger(_entry: &ash::Entry, _instance: &ash::Instance) -> Result<DebugState> {
+unsafe fn create_debug_messenger(
+    _entry: &ash::Entry,
+    _instance: &ash::Instance,
+) -> Result<DebugState> {
     Ok(())
 }
 
 #[cfg(debug_assertions)]
-fn destroy_debug_messenger(entry: &ash::Entry, instance: &ash::Instance, dbg: DebugState) {
+unsafe fn destroy_debug_messenger(entry: &ash::Entry, instance: &ash::Instance, dbg: DebugState) {
     let loader = ext_debug::Instance::new(entry, instance);
-    unsafe { loader.destroy_debug_utils_messenger(dbg, None) };
+    loader.destroy_debug_utils_messenger(dbg, None);
+}
+
+#[cfg(not(debug_assertions))]
+unsafe fn destroy_debug_messenger(
+    _entry: &ash::Entry,
+    _instance: &ash::Instance,
+    _dbg: DebugState,
+) {
+    // no-op
 }
 
 // STRICT TEARDOWN ORDER:
@@ -268,27 +266,23 @@ fn destroy_debug_messenger(entry: &ash::Entry, instance: &ash::Instance, dbg: De
 impl Drop for VkRenderer {
     fn drop(&mut self) {
         #[cfg(debug_assertions)]
-        {
+        unsafe {
             let entry = Entry::linked();
-            if let Some(dbg) = self.debug_messenger {
-                destroy_debug_messenger(&entry, &self.instance, dbg);
-            }
+            destroy_debug_messenger(&entry, &self.instance, self.debug_messenger);
         }
 
         unsafe {
             let d = &self.device;
 
-            // 1) Wait GPU to finish last work we submitted via timeline
-            if self.timeline_value > 0 {
-                let wait_info = vk::SemaphoreWaitInfo {
-                    s_type: vk::StructureType::SEMAPHORE_WAIT_INFO,
-                    flags: vk::SemaphoreWaitFlags::empty(),
-                    semaphore_count: 1,
-                    p_semaphores: &self.timeline,
-                    p_values: &self.timeline_value,
-                    ..Default::default()
-                };
-                let _ = d.wait_semaphores(&wait_info, u64::MAX);
+            // 1) WAIT ALL FENCES (both per-image in-flight and acquire-slot)
+            //    Ensures no submits are still referencing old resources.
+            if !self.frames.is_empty() {
+                let img_fences: Vec<_> = self.frames.iter().map(|f| f.in_flight).collect();
+                let _ = d.wait_for_fences(&img_fences, true, u64::MAX);
+            }
+            if !self.acq_slots.is_empty() {
+                let acq_fences: Vec<_> = self.acq_slots.iter().map(|s| s.fence).collect();
+                let _ = d.wait_for_fences(&acq_fences, true, u64::MAX);
             }
 
             // 2) QUIESCE DEVICE (covers any remaining queue work)
@@ -315,15 +309,14 @@ impl Drop for VkRenderer {
 
             // 7) DESTROY PER-FRAME SYNCS (render-finished, in-flight) BEFORE DEVICE
             for f in &self.frames {
+                d.destroy_fence(f.in_flight, None);
                 d.destroy_semaphore(f.render_finished, None);
             }
             //    Also destroy acquire-slot syncs (sems + fences)
             for s in &self.acq_slots {
+                d.destroy_fence(s.fence, None);
                 d.destroy_semaphore(s.sem, None);
             }
-            // Destroy timeline semaphore
-            d.destroy_semaphore(self.timeline, None);
-
             // Destroy depth
             d.destroy_image_view(self.depth_view, None);
             d.destroy_image(self.depth_image, None);
@@ -458,7 +451,7 @@ fn pipeline_cache_path(props: &vk::PhysicalDeviceProperties) -> PathBuf {
     ))
 }
 
-fn create_or_load_pipeline_cache(
+unsafe fn create_or_load_pipeline_cache(
     device: &ash::Device,
     path: &PathBuf,
 ) -> Result<vk::PipelineCache> {
@@ -478,77 +471,47 @@ fn create_or_load_pipeline_cache(
         p_initial_data,
         ..Default::default()
     };
-    let cache = unsafe { device.create_pipeline_cache(&ci, None)? };
-    Ok(cache)
+    Ok(device.create_pipeline_cache(&ci, None)?)
 }
 
-fn save_pipeline_cache(
+unsafe fn save_pipeline_cache(
     device: &ash::Device,
     cache: vk::PipelineCache,
     path: &PathBuf,
 ) -> Result<()> {
-    let bytes = match unsafe { device.get_pipeline_cache_data(cache) } {
-        Ok(b) => b,
-        Err(_) => return Ok(()), // benign; empty cache or device lost, nothing to save
-    };
-
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+    match device.get_pipeline_cache_data(cache) {
+        Ok(bytes) => {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            fs::write(path, &bytes)?;
+        }
+        Err(_) => {
+            // benign; some drivers may fail if cache is empty or device lost
+        }
     }
-    fs::write(path, &bytes)?;
     Ok(())
 }
 
-// Prefer pure depth formats only: D32F -> D16
-fn pick_depth_format(instance: &ash::Instance, phys: vk::PhysicalDevice) -> vk::Format {
-    for &fmt in &[vk::Format::D32_SFLOAT, vk::Format::D16_UNORM] {
-        let props = unsafe { instance.get_physical_device_format_properties(phys, fmt) };
-        if props
-            .optimal_tiling_features
-            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
-        {
+unsafe fn pick_depth_format(instance: &ash::Instance, phys: vk::PhysicalDevice) -> vk::Format {
+    // Prefer 32f → 24+S8 → 16f
+    let candidates = [
+        vk::Format::D32_SFLOAT,
+        vk::Format::D24_UNORM_S8_UINT,
+        vk::Format::D32_SFLOAT_S8_UINT,
+        vk::Format::D16_UNORM,
+    ];
+    for &fmt in &candidates {
+        let props = instance.get_physical_device_format_properties(phys, fmt);
+        let feats = props.optimal_tiling_features;
+        if feats.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT) {
             return fmt;
         }
     }
-    vk::Format::D32_SFLOAT
+    vk::Format::D32_SFLOAT // fallback; most desktop GPUs support it
 }
 
-fn has_stencil(format: vk::Format) -> bool {
-    matches!(
-        format,
-        vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D24_UNORM_S8_UINT
-    )
-}
-
-fn make_depth_view(
-    device: &ash::Device,
-    image: vk::Image,
-    format: vk::Format,
-) -> anyhow::Result<vk::ImageView> {
-    let mut aspect = vk::ImageAspectFlags::DEPTH;
-    if has_stencil(format) {
-        aspect |= vk::ImageAspectFlags::STENCIL;
-    }
-    let sub = vk::ImageSubresourceRange {
-        aspect_mask: aspect,
-        base_mip_level: 0,
-        level_count: 1,
-        base_array_layer: 0,
-        layer_count: 1,
-    };
-    let iv = vk::ImageViewCreateInfo {
-        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
-        image,
-        view_type: vk::ImageViewType::TYPE_2D,
-        format,
-        components: vk::ComponentMapping::default(),
-        subresource_range: sub,
-        ..Default::default()
-    };
-    Ok(unsafe { device.create_image_view(&iv, None)? })
-}
-
-fn create_depth_resources(
+unsafe fn create_depth_resources(
     instance: &ash::Instance,
     device: &ash::Device,
     phys: vk::PhysicalDevice,
@@ -572,10 +535,10 @@ fn create_depth_resources(
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         ..Default::default()
     };
-    let image = unsafe { device.create_image(&img_ci, None)? };
+    let image = device.create_image(&img_ci, None)?;
 
-    let mem_req = unsafe { device.get_image_memory_requirements(image) };
-    let mem_props = unsafe { instance.get_physical_device_memory_properties(phys) };
+    let mem_req = device.get_image_memory_requirements(image);
+    let mem_props = instance.get_physical_device_memory_properties(phys);
     let mut mem_type_idx = 0;
     for i in 0..mem_props.memory_type_count {
         let is_type_ok = (mem_req.memory_type_bits & (1 << i)) != 0;
@@ -593,14 +556,29 @@ fn create_depth_resources(
         memory_type_index: mem_type_idx,
         ..Default::default()
     };
-    let memory = unsafe { device.allocate_memory(&alloc, None)? };
-    unsafe { device.bind_image_memory(image, memory, 0)? };
+    let memory = device.allocate_memory(&alloc, None)?;
+    device.bind_image_memory(image, memory, 0)?;
 
-    let depth_view = make_depth_view(device, image, depth_format)?;
-    Ok((image, memory, depth_view))
+    let sub = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::DEPTH,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let view_ci = vk::ImageViewCreateInfo {
+        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+        image,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: depth_format,
+        subresource_range: sub,
+        ..Default::default()
+    };
+    let view = device.create_image_view(&view_ci, None)?;
+    Ok((image, memory, view))
 }
 
-fn create_instance(entry: &Entry, display_raw: RawDisplayHandle) -> Result<Instance> {
+unsafe fn create_instance(entry: &Entry, display_raw: RawDisplayHandle) -> Result<Instance> {
     let app = std::ffi::CString::new("CubicEngine").unwrap();
 
     let app_info = vk::ApplicationInfo {
@@ -616,11 +594,9 @@ fn create_instance(entry: &Entry, display_raw: RawDisplayHandle) -> Result<Insta
     let ext_slice = ash_window::enumerate_required_extensions(display_raw)
         .context("enumerate_required_extensions")?;
 
-    let inst_exts = unsafe {
-        entry
-            .enumerate_instance_extension_properties(None)
-            .context("enumerate_instance_extension_properties(instance)")?
-    };
+    let inst_exts = entry
+        .enumerate_instance_extension_properties(None)
+        .context("enumerate_instance_extension_properties(instance)")?;
     let has_swapchain_cs = inst_exts.iter().any(|e| unsafe {
         std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::swapchain_colorspace::NAME
     });
@@ -667,22 +643,28 @@ fn create_instance(entry: &Entry, display_raw: RawDisplayHandle) -> Result<Insta
         ..Default::default()
     };
 
-    Ok(unsafe { entry.create_instance(&create_info, None)? })
+    Ok(entry.create_instance(&create_info, None)?)
 }
 
-type InitRet = (
+unsafe fn init_instance_and_surface(
+    window: &dyn HasWindowHandle,
+    display: &dyn HasDisplayHandle,
+) -> Result<(
     ash::Entry,
     ash::Instance,
     surface::Instance,
     vk::SurfaceKHR,
-    Option<DebugState>,
+    DebugState,
     bool,
-);
+)> {
+    // STRICT ORDER:
+    // 1) Create VkInstance (enables platform WSI + debug ext)
+    // 2) Create VkSurfaceKHR FROM THIS INSTANCE
+    // 3) (Later) Query physical devices/queues AGAINST THIS SURFACE (present support)
+    // 4) (Later) Create VkDevice using features/exts chosen for the selected phys
+    // Changing this order => surface may be incompatible with chosen device/queue.
 
-fn init_instance_and_surface(
-    window: &dyn HasWindowHandle,
-    display: &dyn HasDisplayHandle,
-) -> anyhow::Result<InitRet> {
+    // --- Platform handles (can fail on some backends) ---
     let dh = display
         .display_handle()
         .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -692,34 +674,29 @@ fn init_instance_and_surface(
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .as_raw();
 
+    // --- Instance (with required WSI + optional debug/swapchain-colorspace) ---
     let entry = Entry::linked();
+    let instance = create_instance(&entry, dh)
+        .context("create_instance (with WSI + optional debug/colorspace exts)")?;
 
-    let instance = create_instance(&entry, dh)?;
-
+    // --- Surface loader bound to THIS instance, then create surface from window/display ---
     let surface_loader = surface::Instance::new(&entry, &instance);
+    let surface = ash_window::create_surface(&entry, &instance, dh, wh, None)
+        .context("ash_window::create_surface")?;
 
-    let surface = unsafe {
-        ash_window::create_surface(&entry, &instance, dh, wh, None)
-            .context("ash_window::create_surface")?
-    };
+    // --- Debug messenger (instance-scoped) ---
+    let debug_state = create_debug_messenger(&entry, &instance)?;
 
-    // Only create the debug messenger in debug builds
-    let debug_state = if cfg!(debug_assertions) {
-        Some(create_debug_messenger(&entry, &instance)?)
-    } else {
-        None
-    };
-
-    let have_swapchain_colorspace_ext = unsafe {
-        entry
-            .enumerate_instance_extension_properties(None)
-            .unwrap_or_default()
-            .iter()
-            .any(|e| {
-                std::ffi::CStr::from_ptr(e.extension_name.as_ptr())
-                    == ash::ext::swapchain_colorspace::NAME
-            })
-    };
+    // --- Detect if the INSTANCE has the swapchain colorspace extension available ---
+    // We record this bool to steer HDR surface format selection later.
+    let have_swapchain_colorspace_ext = entry
+        .enumerate_instance_extension_properties(None)
+        .unwrap_or_default()
+        .iter()
+        .any(|e| {
+            std::ffi::CStr::from_ptr(e.extension_name.as_ptr())
+                == ash::ext::swapchain_colorspace::NAME
+        });
 
     Ok((
         entry,
@@ -731,7 +708,7 @@ fn init_instance_and_surface(
     ))
 }
 
-fn select_device_and_queue(
+unsafe fn select_device_and_queue(
     instance: &ash::Instance,
     surf_i: &surface::Instance,
     surface: vk::SurfaceKHR,
@@ -739,7 +716,7 @@ fn select_device_and_queue(
     pick_device_and_queue(instance, surf_i, surface)
 }
 
-fn decide_path_and_create_device(
+unsafe fn decide_path_and_create_device(
     _entry: &ash::Entry,
     instance: &ash::Instance,
     phys: vk::PhysicalDevice,
@@ -767,17 +744,13 @@ fn decide_path_and_create_device(
     };
 
     // --- One shot device extension query ---
-    let ext_props = unsafe {
-        instance
-            .enumerate_device_extension_properties(phys)
-            .context("enumerate_device_extension_properties(device)")?
-    };
-    let has = unsafe {
-        |name: &std::ffi::CStr| -> bool {
-            ext_props
-                .iter()
-                .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name)
-        }
+    let ext_props = instance
+        .enumerate_device_extension_properties(phys)
+        .context("enumerate_device_extension_properties(device)")?;
+    let has = |name: &std::ffi::CStr| -> bool {
+        ext_props
+            .iter()
+            .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name)
     };
 
     let mut device_exts: Vec<*const i8> = vec![swapchain::NAME.as_ptr()];
@@ -812,11 +785,8 @@ fn decide_path_and_create_device(
         ..Default::default()
     };
 
-    // Enable timeline semaphore
-    feats12.timeline_semaphore = vk::TRUE;
-
     let (path, pnext): (RenderPath, *const std::ffi::c_void) = if !force_khr {
-        let dev_api = unsafe { instance.get_physical_device_properties(phys).api_version };
+        let dev_api = instance.get_physical_device_properties(phys).api_version;
         let maj = vk::api_version_major(dev_api);
         let min = vk::api_version_minor(dev_api);
 
@@ -875,19 +845,17 @@ fn decide_path_and_create_device(
         ..Default::default()
     };
 
-    let device = unsafe {
-        instance
-            .create_device(phys, &dinfo, None)
-            .context("create_device")?
-    };
+    let device = instance
+        .create_device(phys, &dinfo, None)
+        .context("create_device")?;
 
-    let queue = unsafe { device.get_device_queue(queue_family, 0) };
+    let queue = device.get_device_queue(queue_family, 0);
     Ok((device, queue, path, has_hdr_meta))
 }
 
 // ORDER NOTE: must be called AFTER creating the (new) swapchain and BEFORE first present.
 // Scope: only HDR10/PQ swapchains need metadata; scRGB doesn't use VK_EXT_hdr_metadata.
-fn create_hdr_metadata_if_needed(
+unsafe fn create_hdr_metadata_if_needed(
     instance: &ash::Instance,
     device: &ash::Device,
     has_hdr_meta: bool,
@@ -920,10 +888,10 @@ fn create_hdr_metadata_if_needed(
     };
 
     // Apply to the current swapchain. Safe to reapply on recreate.
-    unsafe { hdr.set_hdr_metadata(&[swapchain], std::slice::from_ref(&metadata)) };
+    hdr.set_hdr_metadata(&[swapchain], std::slice::from_ref(&metadata));
 }
 
-fn create_command_resources(
+unsafe fn create_command_resources(
     device: &ash::Device,
     queue_family: u32,
     image_count: usize,
@@ -934,7 +902,7 @@ fn create_command_resources(
         flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
         ..Default::default()
     };
-    let pool = unsafe { device.create_command_pool(&pool_info, None)? };
+    let pool = device.create_command_pool(&pool_info, None)?;
     let alloc_info = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
         command_pool: pool,
@@ -942,18 +910,18 @@ fn create_command_resources(
         command_buffer_count: image_count as u32,
         ..Default::default()
     };
-    let bufs = unsafe { device.allocate_command_buffers(&alloc_info)? };
+    let bufs = device.allocate_command_buffers(&alloc_info)?;
     Ok(CommandResources { pool, bufs })
 }
 
 #[inline]
-fn find_memory_type(
+unsafe fn find_memory_type(
     instance: &ash::Instance,
     phys: vk::PhysicalDevice,
     type_bits: u32,
     req: vk::MemoryPropertyFlags,
 ) -> u32 {
-    let mem = unsafe { instance.get_physical_device_memory_properties(phys) };
+    let mem = instance.get_physical_device_memory_properties(phys);
     for i in 0..mem.memory_type_count {
         let ok = (type_bits & (1 << i)) != 0
             && mem.memory_types[i as usize].property_flags.contains(req);
@@ -964,7 +932,7 @@ fn find_memory_type(
     panic!("No suitable memory type");
 }
 
-fn create_buffer_and_memory(
+unsafe fn create_buffer_and_memory(
     instance: &ash::Instance,
     device: &ash::Device,
     phys: vk::PhysicalDevice,
@@ -979,8 +947,8 @@ fn create_buffer_and_memory(
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         ..Default::default()
     };
-    let buf = unsafe { device.create_buffer(&bci, None)? };
-    let req = unsafe { device.get_buffer_memory_requirements(buf) };
+    let buf = device.create_buffer(&bci, None)?;
+    let req = device.get_buffer_memory_requirements(buf);
     let mem_type = find_memory_type(instance, phys, req.memory_type_bits, props);
     let mai = vk::MemoryAllocateInfo {
         s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
@@ -988,12 +956,12 @@ fn create_buffer_and_memory(
         memory_type_index: mem_type,
         ..Default::default()
     };
-    let mem = unsafe { device.allocate_memory(&mai, None)? };
-    unsafe { device.bind_buffer_memory(buf, mem, 0)? };
+    let mem = device.allocate_memory(&mai, None)?;
+    device.bind_buffer_memory(buf, mem, 0)?;
     Ok((buf, mem))
 }
 
-fn create_host_visible_ubo(
+unsafe fn create_host_visible_ubo(
     instance: &ash::Instance,
     device: &ash::Device,
     phys: vk::PhysicalDevice,
@@ -1009,7 +977,7 @@ fn create_host_visible_ubo(
     )
 }
 
-fn create_camera_desc_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+unsafe fn create_camera_desc_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     let binding = vk::DescriptorSetLayoutBinding {
         binding: 0,
         descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
@@ -1023,67 +991,12 @@ fn create_camera_desc_set_layout(device: &ash::Device) -> Result<vk::DescriptorS
         p_bindings: &binding,
         ..Default::default()
     };
-    Ok(unsafe { device.create_descriptor_set_layout(&ci, None)? })
-}
-
-#[inline]
-fn stage_flags2_from_legacy(stage: vk::PipelineStageFlags) -> vk::PipelineStageFlags2 {
-    // Minimal mapping for your usage (COLOR_ATTACHMENT_OUTPUT)
-    vk::PipelineStageFlags2::from_raw(stage.as_raw() as u64)
-}
-
-#[inline]
-fn semaphore_submit_info_wait(
-    sem: vk::Semaphore,
-    value: u64,
-    stage: vk::PipelineStageFlags2,
-) -> vk::SemaphoreSubmitInfo<'static> {
-    vk::SemaphoreSubmitInfo {
-        s_type: vk::StructureType::SEMAPHORE_SUBMIT_INFO,
-        p_next: std::ptr::null(),
-        semaphore: sem,
-        value,
-        stage_mask: stage,
-        device_index: 0,
-        ..Default::default()
-    }
-}
-
-#[inline]
-fn semaphore_submit_info_signal(
-    sem: vk::Semaphore,
-    value: u64,
-    stage: vk::PipelineStageFlags2,
-) -> vk::SemaphoreSubmitInfo<'static> {
-    vk::SemaphoreSubmitInfo {
-        s_type: vk::StructureType::SEMAPHORE_SUBMIT_INFO,
-        p_next: std::ptr::null(),
-        semaphore: sem,
-        value,
-        stage_mask: stage,
-        device_index: 0,
-        ..Default::default()
-    }
-}
-
-fn create_timeline_semaphore(device: &ash::Device, initial: u64) -> Result<vk::Semaphore> {
-    let type_ci = vk::SemaphoreTypeCreateInfo {
-        s_type: vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO,
-        semaphore_type: vk::SemaphoreType::TIMELINE,
-        initial_value: initial,
-        ..Default::default()
-    };
-    let sem_ci = vk::SemaphoreCreateInfo {
-        s_type: vk::StructureType::SEMAPHORE_CREATE_INFO,
-        p_next: (&type_ci as *const _) as *const _,
-        ..Default::default()
-    };
-    Ok(unsafe { device.create_semaphore(&sem_ci, None)? })
+    Ok(device.create_descriptor_set_layout(&ci, None)?)
 }
 
 /// One-shot staging upload: host->staging, then staging->dst (device-local).
 /// Uses the graphics queue and a one-time command buffer; waits until done.
-fn upload_via_staging(
+unsafe fn upload_via_staging(
     instance: &ash::Instance,
     device: &ash::Device,
     phys: vk::PhysicalDevice,
@@ -1103,9 +1016,9 @@ fn upload_via_staging(
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
     // map + copy
-    let ptr = unsafe { device.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())? };
-    unsafe { std::ptr::copy_nonoverlapping(src_data.as_ptr(), ptr as *mut u8, src_data.len()) };
-    unsafe { device.unmap_memory(staging_mem) };
+    let ptr = device.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())?;
+    std::ptr::copy_nonoverlapping(src_data.as_ptr(), ptr as *mut u8, src_data.len());
+    device.unmap_memory(staging_mem);
 
     // 2) record one-time copy cmd
     let ai = vk::CommandBufferAllocateInfo {
@@ -1115,20 +1028,20 @@ fn upload_via_staging(
         command_buffer_count: 1,
         ..Default::default()
     };
-    let cmd = unsafe { device.allocate_command_buffers(&ai)?[0] };
+    let cmd = device.allocate_command_buffers(&ai)?[0];
     let bi = vk::CommandBufferBeginInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
         flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
         ..Default::default()
     };
-    unsafe { device.begin_command_buffer(cmd, &bi)? };
+    device.begin_command_buffer(cmd, &bi)?;
     let region = vk::BufferCopy {
         src_offset: 0,
         dst_offset: 0,
         size,
     };
-    unsafe { device.cmd_copy_buffer(cmd, staging, dst, std::slice::from_ref(&region)) };
-    unsafe { device.end_command_buffer(cmd)? };
+    device.cmd_copy_buffer(cmd, staging, dst, std::slice::from_ref(&region));
+    device.end_command_buffer(cmd)?;
 
     // 3) submit and wait
     let si = vk::SubmitInfo {
@@ -1137,20 +1050,17 @@ fn upload_via_staging(
         p_command_buffers: &cmd,
         ..Default::default()
     };
-    let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
-    unsafe { device.queue_submit(queue, std::slice::from_ref(&si), fence)? };
-    unsafe { device.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)? };
-    unsafe { device.destroy_fence(fence, None) };
+    device.queue_submit(queue, std::slice::from_ref(&si), vk::Fence::null())?;
+    device.queue_wait_idle(queue)?; // simple + safe for now
 
     // 4) cleanup staging + temp cmd
-    unsafe { device.free_command_buffers(cmd_pool, std::slice::from_ref(&cmd)) };
-    unsafe { device.destroy_buffer(staging, None) };
-    unsafe { device.free_memory(staging_mem, None) };
-
+    device.free_command_buffers(cmd_pool, std::slice::from_ref(&cmd));
+    device.destroy_buffer(staging, None);
+    device.free_memory(staging_mem, None);
     Ok(())
 }
 
-fn create_sync_objects(
+unsafe fn create_sync_objects(
     device: &ash::Device,
     image_count: usize,
 ) -> Result<(Vec<AcquireSlot>, Vec<FrameSync>)> {
@@ -1158,27 +1068,34 @@ fn create_sync_objects(
     let mut frames = Vec::with_capacity(image_count);
 
     let sem_ci = vk::SemaphoreCreateInfo::default();
-
-    // Two acquire slots (binary semaphores), tracked by timeline values
+    let acq_fence_ci = vk::FenceCreateInfo {
+        s_type: vk::StructureType::FENCE_CREATE_INFO,
+        flags: vk::FenceCreateFlags::SIGNALED,
+        ..Default::default()
+    };
     for _ in 0..2 {
-        let sem = unsafe { device.create_semaphore(&sem_ci, None)? };
-        acq_slots.push(AcquireSlot {
-            sem,
-            last_signal_value: 0,
-        });
+        let sem = device.create_semaphore(&sem_ci, None)?;
+        let fence = device.create_fence(&acq_fence_ci, None)?;
+        acq_slots.push(AcquireSlot { sem, fence });
     }
 
-    // Per-image present wait semaphores (binary)
+    let fence_ci = vk::FenceCreateInfo {
+        s_type: vk::StructureType::FENCE_CREATE_INFO,
+        flags: vk::FenceCreateFlags::SIGNALED,
+        ..Default::default()
+    };
     for _ in 0..image_count {
-        let rf = unsafe { device.create_semaphore(&sem_ci, None)? };
+        let rf = device.create_semaphore(&sem_ci, None)?;
+        let inflight = device.create_fence(&fence_ci, None)?;
         frames.push(FrameSync {
             render_finished: rf,
+            in_flight: inflight,
         });
     }
     Ok((acq_slots, frames))
 }
 
-fn create_frame_uniforms_and_sets(
+unsafe fn create_frame_uniforms_and_sets(
     instance: &ash::Instance,
     device: &ash::Device,
     phys: vk::PhysicalDevice,
@@ -1213,7 +1130,7 @@ fn create_frame_uniforms_and_sets(
         p_pool_sizes: pool_sizes.as_ptr(),
         ..Default::default()
     };
-    let pool = unsafe { device.create_descriptor_pool(&pool_ci, None)? };
+    let pool = device.create_descriptor_pool(&pool_ci, None)?;
 
     // 3) Allocate sets
     let layouts = vec![set_layout; image_count];
@@ -1224,7 +1141,7 @@ fn create_frame_uniforms_and_sets(
         p_set_layouts: layouts.as_ptr(),
         ..Default::default()
     };
-    let sets = unsafe { device.allocate_descriptor_sets(&alloc)? };
+    let sets = device.allocate_descriptor_sets(&alloc)?;
 
     // 4) Write buffer bindings
     let mut writes = Vec::with_capacity(image_count);
@@ -1245,48 +1162,12 @@ fn create_frame_uniforms_and_sets(
             ..Default::default()
         });
     }
-    unsafe { device.update_descriptor_sets(&writes, &[]) };
+    device.update_descriptor_sets(&writes, &[]);
 
     Ok((ubufs, umems, pool, sets))
 }
 
-#[inline]
-fn is_swapchain_out_of_date(e: vk::Result) -> bool {
-    matches!(
-        e,
-        vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR
-    )
-}
-
-#[inline]
-fn is_surface_lost(e: vk::Result) -> bool {
-    e == vk::Result::ERROR_SURFACE_LOST_KHR
-}
-
-#[inline]
-fn is_device_lost(e: vk::Result) -> bool {
-    e == vk::Result::ERROR_DEVICE_LOST
-}
-
-fn recreate_surface(
-    entry: &ash::Entry,
-    instance: &ash::Instance,
-    surf_i: &surface::Instance,
-    old_surface: &mut vk::SurfaceKHR,
-    display_raw: RawDisplayHandle,
-    window_raw: raw_window_handle::RawWindowHandle,
-) -> Result<vk::SurfaceKHR> {
-    let new_surface =
-        unsafe { ash_window::create_surface(entry, instance, display_raw, window_raw, None) }
-            .context("recreate_surface: ash_window::create_surface")?;
-    if *old_surface != vk::SurfaceKHR::null() {
-        unsafe { surf_i.destroy_surface(*old_surface, None) };
-    }
-    *old_surface = new_surface;
-    Ok(new_surface)
-}
-
-fn make_initial_swapchain_resources(
+unsafe fn make_initial_swapchain_resources(
     device: &ash::Device,
     instance: &ash::Instance,
     surf_i: &surface::Instance,
@@ -1338,29 +1219,24 @@ fn make_initial_swapchain_resources(
     Ok((bundle, cmds, pipe, acq, frames))
 }
 
-fn pick_device_and_queue(
+unsafe fn pick_device_and_queue(
     instance: &Instance,
     surf_i: &surface::Instance,
     surface: vk::SurfaceKHR,
 ) -> Result<(vk::PhysicalDevice, u32)> {
-    let phys_devs = unsafe { instance.enumerate_physical_devices()? };
-
-    for phys in phys_devs {
-        let qprops = unsafe { instance.get_physical_device_queue_family_properties(phys) };
+    for phys in instance.enumerate_physical_devices()? {
+        let qprops = instance.get_physical_device_queue_family_properties(phys);
 
         for (i, q) in qprops.iter().enumerate() {
-            if q.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
-                let supports_surface =
-                    unsafe { surf_i.get_physical_device_surface_support(phys, i as u32, surface) }
-                        .unwrap_or(false);
-
-                if supports_surface {
-                    return Ok((phys, i as u32));
-                }
+            if q.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+                && surf_i
+                    .get_physical_device_surface_support(phys, i as u32, surface)
+                    .unwrap_or(false)
+            {
+                return Ok((phys, i as u32));
             }
         }
     }
-
     Err(anyhow!("no suitable physical device/queue family"))
 }
 
@@ -1426,31 +1302,7 @@ fn pick_surface_format(
     (formats[0], "driver_default")
 }
 
-fn make_color_view(
-    device: &ash::Device,
-    image: vk::Image,
-    format: vk::Format,
-) -> anyhow::Result<vk::ImageView> {
-    let sub = vk::ImageSubresourceRange {
-        aspect_mask: vk::ImageAspectFlags::COLOR,
-        base_mip_level: 0,
-        level_count: 1, // or vk::REMAINING_MIP_LEVELS
-        base_array_layer: 0,
-        layer_count: 1, // or vk::REMAINING_ARRAY_LAYERS for arrays
-    };
-    let iv = vk::ImageViewCreateInfo {
-        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
-        image,
-        view_type: vk::ImageViewType::TYPE_2D,
-        format,
-        components: vk::ComponentMapping::default(), // identity swizzle
-        subresource_range: sub,
-        ..Default::default()
-    };
-    Ok(unsafe { device.create_image_view(&iv, None)? })
-}
-
-fn create_swapchain_bundle(
+unsafe fn create_swapchain_bundle(
     device: &ash::Device,
     surf_i: &surface::Instance,
     swap_d: &swapchain::Device,
@@ -1461,16 +1313,17 @@ fn create_swapchain_bundle(
 ) -> Result<SwapchainBundle> {
     // --- Query surface capabilities / formats / present modes ---
     // capabilities: image counts, transforms, current extent (or UINT_MAX for free-size)
-    let caps = unsafe { surf_i.get_physical_device_surface_capabilities(phys, surface)? };
+    let caps = surf_i.get_physical_device_surface_capabilities(phys, surface)?;
     // (format, colorspace) pairs exposed by WSI; must choose one
-    let formats = unsafe { surf_i.get_physical_device_surface_formats(phys, surface)? };
+    let formats = surf_i.get_physical_device_surface_formats(phys, surface)?;
     // present modes: FIFO is always available; MAILBOX/IMMEDIATE are optional
-    let modes = unsafe { surf_i.get_physical_device_surface_present_modes(phys, surface)? };
+    let modes = surf_i.get_physical_device_surface_present_modes(phys, surface)?;
 
     tracing::info!(
-        "hdr_request={} allow_extended_colorspace={}",
+        "hdr_request={} allow_extended_colorspace={} have_swapchain_colorspace_ext={}",
         cfg.want_hdr,
         cfg.allow_extended_colorspace,
+        cfg.allow_extended_colorspace
     );
 
     // --- Choose (format, colorspace) and present mode based on config ---
@@ -1501,15 +1354,11 @@ fn create_swapchain_bundle(
     );
 
     // --- Decide image count ---
-    let want_images = if present_mode == vk::PresentModeKHR::MAILBOX {
-        (caps.min_image_count + 1).max(3)
-    } else {
-        caps.min_image_count + 1
-    };
+    // Heuristic: one more than minimum (for better overlap) but capped by max (0 == "no max").
     let min_count = if caps.max_image_count == 0 {
-        want_images
+        caps.min_image_count + 1
     } else {
-        want_images.min(caps.max_image_count)
+        (caps.min_image_count + 1).min(caps.max_image_count)
     };
 
     // --- Surface transform ---
@@ -1522,18 +1371,6 @@ fn create_swapchain_bundle(
     } else {
         caps.current_transform
     };
-
-    // PIck supported alpha flag
-    let composite_alpha = [
-        vk::CompositeAlphaFlagsKHR::OPAQUE,
-        vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
-        vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
-        vk::CompositeAlphaFlagsKHR::INHERIT,
-    ]
-    .iter()
-    .copied()
-    .find(|f| caps.supported_composite_alpha.contains(*f))
-    .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
 
     // --- Swapchain create info ---
     // IMPORTANT: image_usage must match how you use the images; here we only render to them.
@@ -1549,7 +1386,7 @@ fn create_swapchain_bundle(
         image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT,
         image_sharing_mode: vk::SharingMode::EXCLUSIVE, // single graphics queue family
         pre_transform,
-        composite_alpha,
+        composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE, // ignore window alpha
         present_mode,
         clipped: vk::TRUE, // don't care about obscured pixels
         old_swapchain,     // enables seamless re-creation w/ resource reuse
@@ -1557,15 +1394,29 @@ fn create_swapchain_bundle(
     };
 
     // --- Create swapchain + fetch images ---
-    let new_swapchain = unsafe { swap_d.create_swapchain(&swap_info, None)? };
-    let images = unsafe { swap_d.get_swapchain_images(new_swapchain)? };
+    let new_swapchain = swap_d.create_swapchain(&swap_info, None)?;
+    let images = swap_d.get_swapchain_images(new_swapchain)?;
 
     // --- Create image views (one per swapchain image) ---
     // View format MUST match swapchain image format for direct rendering.
-    let mut views = Vec::new();
+    let mut views = Vec::with_capacity(images.len());
     for &img in &images {
-        let view = make_color_view(device, img, surf_format.format)?;
-        views.push(view);
+        let sub = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        let iv_info = vk::ImageViewCreateInfo {
+            s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+            image: img,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: surf_format.format,
+            subresource_range: sub,
+            ..Default::default()
+        };
+        views.push(device.create_image_view(&iv_info, None)?);
     }
 
     // --- Return the bundle used by higher-level code (recording, present, etc.) ---
@@ -1579,18 +1430,7 @@ fn create_swapchain_bundle(
     })
 }
 
-#[inline]
-fn load_spv_file(path: &Path) -> Result<Vec<u32>> {
-    let bytes = fs::read(path).with_context(|| format!("read {:?}", path))?;
-    read_spv(&mut Cursor::new(&bytes[..])).with_context(|| format!("read_spv {:?}", path))
-}
-
-#[inline]
-fn load_spv_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
-    read_spv(&mut Cursor::new(bytes)).context("read_spv from embedded bytes")
-}
-
-fn create_pipeline(
+unsafe fn create_pipeline(
     device: &ash::Device,
     cache: vk::PipelineCache,
     color_format: vk::Format,
@@ -1602,46 +1442,24 @@ fn create_pipeline(
     // On swapchain format change, pipeline must be rebuilt before recording.
 
     // --- Load + create shader modules (destroyed before return) ---
-    // Try CUBIC_SHADER_DIR override first (e.g., for mods or dev drops),
-    // otherwise fall back to embedded SPIR-V from build.rs.
-    let (vs_words, fs_words): (Vec<u32>, Vec<u32>) = {
-        if let Ok(dir) = std::env::var("CUBIC_SHADER_DIR") {
-            let vs_path = std::path::Path::new(&dir).join("tri.vert.spv");
-            let fs_path = std::path::Path::new(&dir).join("tri.frag.spv");
-            if vs_path.exists() && fs_path.exists() {
-                (load_spv_file(&vs_path)?, load_spv_file(&fs_path)?)
-            } else {
-                let vs_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/tri.vert.spv"));
-                let fs_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/tri.frag.spv"));
-                (
-                    load_spv_bytes(&vs_bytes[..])?,
-                    load_spv_bytes(&fs_bytes[..])?,
-                )
-            }
-        } else {
-            let vs_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/tri.vert.spv"));
-            let fs_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/tri.frag.spv"));
-            (
-                load_spv_bytes(&vs_bytes[..])?,
-                load_spv_bytes(&fs_bytes[..])?,
-            )
-        }
-    };
-
+    let vs_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/tri.vert.spv"));
+    let fs_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/tri.frag.spv"));
+    let vs_code = read_spv(&mut Cursor::new(&vs_bytes[..]))?;
+    let fs_code = read_spv(&mut Cursor::new(&fs_bytes[..]))?;
     let vs_ci = vk::ShaderModuleCreateInfo {
         s_type: vk::StructureType::SHADER_MODULE_CREATE_INFO,
-        p_code: vs_words.as_ptr(),
-        code_size: vs_words.len() * 4,
+        p_code: vs_code.as_ptr(),
+        code_size: vs_code.len() * 4,
         ..Default::default()
     };
     let fs_ci = vk::ShaderModuleCreateInfo {
         s_type: vk::StructureType::SHADER_MODULE_CREATE_INFO,
-        p_code: fs_words.as_ptr(),
-        code_size: fs_words.len() * 4,
+        p_code: fs_code.as_ptr(),
+        code_size: fs_code.len() * 4,
         ..Default::default()
     };
-    let vs = unsafe { device.create_shader_module(&vs_ci, None)? };
-    let fs = unsafe { device.create_shader_module(&fs_ci, None)? };
+    let vs = device.create_shader_module(&vs_ci, None)?;
+    let fs = device.create_shader_module(&fs_ci, None)?;
     let entry = std::ffi::CString::new("main").unwrap();
 
     // --- Shader stage infos ---
@@ -1761,7 +1579,7 @@ fn create_pipeline(
         p_set_layouts: &set_layout,
         ..Default::default()
     };
-    let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+    let layout = device.create_pipeline_layout(&layout_info, None)?;
 
     // --- Dynamic rendering info (ext / core 1.3 replacement for render passes) ---
     let rendering = vk::PipelineRenderingCreateInfo {
@@ -1791,46 +1609,25 @@ fn create_pipeline(
     };
 
     // --- Create pipeline; destroy shader modules afterwards ---
-    let pipelines = unsafe {
-        device.create_graphics_pipelines(cache, std::slice::from_ref(&pipeline_info), None)
-    }
-    .map_err(|(_, err)| anyhow!("create_graphics_pipelines failed: {:?}", err))?;
-
-    unsafe {
-        device.destroy_shader_module(vs, None);
-        device.destroy_shader_module(fs, None);
-    }
+    let pipelines =
+        match device.create_graphics_pipelines(cache, std::slice::from_ref(&pipeline_info), None) {
+            Ok(p) => p,
+            Err((_, err)) => return Err(anyhow!("create_graphics_pipelines failed: {:?}", err)),
+        };
+    device.destroy_shader_module(vs, None);
+    device.destroy_shader_module(fs, None);
 
     Ok((layout, pipelines[0]))
 }
 
-#[inline]
-fn slice_as_bytes<T>(s: &[T]) -> &[u8] {
-    // SAFETY: Caller must ensure T has no padding/invalid bit patterns when reinterpreted as bytes.
-    // Here we only use it for Vertex (repr(C), plain floats) and u32 indices.
-    unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * std::mem::size_of::<T>())
-    }
-}
-
-fn build_renderer(
+unsafe fn build_renderer(
     window: &dyn HasWindowHandle,
     display: &dyn HasDisplayHandle,
     size: RenderSize,
 ) -> Result<VkRenderer> {
     // 1) Instance + surface (and record whether colorspace ext exists)
-    #[cfg(debug_assertions)]
     let (entry, instance, surface_loader, surface, debug_state, have_swapchain_colorspace_ext) =
         init_instance_and_surface(window, display)?;
-    #[cfg(not(debug_assertions))]
-    let (entry, instance, surface_loader, surface, _debug_state, have_swapchain_colorspace_ext) =
-        init_instance_and_surface(window, display)?;
-
-    let display_raw = display
-        .display_handle()
-        .map_err(|e| anyhow!("{e}"))?
-        .as_raw();
-    let window_raw = window.window_handle().map_err(|e| anyhow!("{e}"))?.as_raw();
 
     // 2) Pick device/queue family
     let (phys, queue_family) = select_device_and_queue(&instance, &surface_loader, surface)?;
@@ -1838,13 +1635,9 @@ fn build_renderer(
     // 3) Create device + choose render path, detect HDR metadata support
     let (device, queue, path, has_hdr_meta) =
         decide_path_and_create_device(&entry, &instance, phys, queue_family)?;
-    let props = unsafe { instance.get_physical_device_properties(phys) };
+    let props = instance.get_physical_device_properties(phys);
     let cache_path = pipeline_cache_path(&props);
     let pipeline_cache = create_or_load_pipeline_cache(&device, &cache_path)?;
-
-    // Create timeline semaphore
-    let timeline = create_timeline_semaphore(&device, 0)?;
-    let timeline_value: u64 = 0;
 
     // 4) WSI device wrapper
     let swapchain_loader = swapchain::Device::new(&instance, &device);
@@ -1852,29 +1645,6 @@ fn build_renderer(
     // 5) Initial runtime knobs
     let initial_cfg = RuntimeConfig::from_env(have_swapchain_colorspace_ext);
     let cfg = initial_cfg.to_swapchain_config(size);
-    #[cfg(debug_assertions)]
-    let shader_dev = {
-        if let Ok(dir) = std::env::var("CUBIC_SHADER_DIR") {
-            let dir = PathBuf::from(dir);
-            let vp = dir.join("tri.vert.glsl");
-            let fp = dir.join("tri.frag.glsl");
-            // Note: .metadata() will error if the files don’t exist; that’s fine → no hot reload
-            if vp.exists() && fp.exists() {
-                let vm = fs::metadata(&vp)?.modified()?;
-                let fm = fs::metadata(&fp)?.modified()?;
-                Some(ShaderDev {
-                    vert_path: vp,
-                    frag_path: fp,
-                    vert_mtime: vm,
-                    frag_mtime: fm,
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
 
     // Create depth buffers
     let depth_format = pick_depth_format(&instance, phys);
@@ -1930,11 +1700,24 @@ fn build_renderer(
     )?;
 
     // Upload via staging
-    let vbytes = slice_as_bytes(TRI_VERTS);
-    let ibytes = slice_as_bytes(TRI_IDXS);
-
-    upload_via_staging(&instance, &device, phys, queue, cmd.pool, vbuf, vbytes)?;
-    upload_via_staging(&instance, &device, phys, queue, cmd.pool, ibuf, ibytes)?;
+    upload_via_staging(
+        &instance,
+        &device,
+        phys,
+        queue,
+        cmd.pool,
+        vbuf,
+        std::slice::from_raw_parts(TRI_VERTS.as_ptr() as *const u8, vsize as usize),
+    )?;
+    upload_via_staging(
+        &instance,
+        &device,
+        phys,
+        queue,
+        cmd.pool,
+        ibuf,
+        std::slice::from_raw_parts(TRI_IDXS.as_ptr() as *const u8, isize as usize),
+    )?;
 
     // 7) Assemble VkRenderer
     let mut r = VkRenderer {
@@ -1989,13 +1772,6 @@ fn build_renderer(
         ubufs,
         umems,
         pipeline_cache,
-        timeline,
-        timeline_value,
-        display_raw,
-        window_raw,
-        backoff_frames: 0,
-        #[cfg(debug_assertions)]
-        shader_dev,
     };
 
     // 8) Record per-image command buffers once
@@ -2015,7 +1791,7 @@ impl VkRenderer {
             width: self.extent.width,
             height: self.extent.height,
         };
-        let _ = self.recreate_swapchain(want);
+        let _ = unsafe { self.recreate_swapchain(want) };
     }
     pub fn set_hdr_enabled(&mut self, on: bool) {
         if self.cfg.hdr == on {
@@ -2026,7 +1802,7 @@ impl VkRenderer {
             width: self.extent.width,
             height: self.extent.height,
         };
-        let _ = self.recreate_swapchain(want);
+        let _ = unsafe { self.recreate_swapchain(want) };
     }
     pub fn set_hdr_flavor(&mut self, flavor: HdrFlavor) {
         if self.cfg.hdr_flavor == flavor {
@@ -2037,69 +1813,7 @@ impl VkRenderer {
             width: self.extent.width,
             height: self.extent.height,
         };
-        let _ = self.recreate_swapchain(want);
-    }
-
-    #[inline]
-    fn should_skip_for_backoff(&mut self) -> bool {
-        if self.backoff_frames > 0 {
-            self.backoff_frames -= 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    fn hot_reload_shaders_if_changed(&mut self) -> Result<()> {
-        let Some(dev) = self.shader_dev.as_mut() else {
-            return Ok(());
-        };
-
-        let vm = fs::metadata(&dev.vert_path).and_then(|m| m.modified()).ok();
-        let fm = fs::metadata(&dev.frag_path).and_then(|m| m.modified()).ok();
-
-        let vert_changed = vm.is_some() && vm.unwrap() > dev.vert_mtime;
-        let frag_changed = fm.is_some() && fm.unwrap() > dev.frag_mtime;
-
-        if !(vert_changed || frag_changed) {
-            return Ok(());
-        }
-
-        info!("vk: shader change detected → rebuilding pipeline");
-        // Update mtimes first (so a failed compile won’t loop forever—but we still log errors)
-        if let Some(t) = vm {
-            dev.vert_mtime = t;
-        }
-        if let Some(t) = fm {
-            dev.frag_mtime = t;
-        }
-
-        // Idle to safely swap pipelines (simple & safe for now)
-        unsafe { self.device.device_wait_idle().ok() };
-
-        // Build new pipeline with current formats/layouts
-        let (new_layout, new_pipeline) = create_pipeline(
-            &self.device,
-            self.pipeline_cache,
-            self.format,
-            self.depth_format,
-            self.extent,
-            self.desc_set_layout,
-        )?;
-
-        // Swap in
-        unsafe { self.device.destroy_pipeline(self.pipeline, None) };
-        unsafe {
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None)
-        };
-        self.pipeline_layout = new_layout;
-        self.pipeline = new_pipeline;
-
-        // Re-record command buffers (bind point changed)
-        self.record_commands()?;
-        Ok(())
+        let _ = unsafe { self.recreate_swapchain(want) };
     }
 
     fn make_identity_mvp() -> CameraUbo {
@@ -2113,29 +1827,29 @@ impl VkRenderer {
         }
     }
 
-    fn update_camera_ubo_for_image(&self, image_index: usize, data: &CameraUbo) -> Result<()> {
+    unsafe fn update_camera_ubo_for_image(
+        &self,
+        image_index: usize,
+        data: &CameraUbo,
+    ) -> Result<()> {
         let size = std::mem::size_of::<CameraUbo>() as vk::DeviceSize;
-        let ptr = unsafe {
-            self.device.map_memory(
-                self.umems[image_index],
-                0,
-                size,
-                vk::MemoryMapFlags::empty(),
-            )?
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data as *const _ as *const u8,
-                ptr as *mut u8,
-                std::mem::size_of::<CameraUbo>(),
-            )
-        };
-        unsafe { self.device.unmap_memory(self.umems[image_index]) };
+        let ptr = self.device.map_memory(
+            self.umems[image_index],
+            0,
+            size,
+            vk::MemoryMapFlags::empty(),
+        )?;
+        std::ptr::copy_nonoverlapping(
+            data as *const _ as *const u8,
+            ptr as *mut u8,
+            std::mem::size_of::<CameraUbo>(),
+        );
+        self.device.unmap_memory(self.umems[image_index]);
         Ok(())
     }
 
     #[inline]
-    fn transition_to_color(&self, cmd: vk::CommandBuffer, image: vk::Image) {
+    unsafe fn transition_to_color(&self, cmd: vk::CommandBuffer, image: vk::Image) {
         let subrange = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
@@ -2164,11 +1878,11 @@ impl VkRenderer {
             p_image_memory_barriers: &pre_barrier,
             ..Default::default()
         };
-        unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep_pre) };
+        self.device.cmd_pipeline_barrier2(cmd, &dep_pre);
     }
 
     #[inline]
-    fn transition_depth_to_attachment(&self, cmd: vk::CommandBuffer, image: vk::Image) {
+    unsafe fn transition_depth_to_attachment(&self, cmd: vk::CommandBuffer, image: vk::Image) {
         let subrange = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::DEPTH,
             base_mip_level: 0,
@@ -2196,11 +1910,11 @@ impl VkRenderer {
             p_image_memory_barriers: &pre,
             ..Default::default()
         };
-        unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep) };
+        self.device.cmd_pipeline_barrier2(cmd, &dep);
     }
 
     #[inline]
-    fn begin_rendering(&self, cmd: vk::CommandBuffer, image_view: vk::ImageView) {
+    unsafe fn begin_rendering(&self, cmd: vk::CommandBuffer, image_view: vk::ImageView) {
         let color_att = vk::RenderingAttachmentInfo {
             s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
             image_view,
@@ -2241,19 +1955,17 @@ impl VkRenderer {
             ..Default::default()
         };
 
-        unsafe { self.device.cmd_begin_rendering(cmd, &rendering_info) };
+        self.device.cmd_begin_rendering(cmd, &rendering_info);
     }
 
     #[inline]
-    fn bind_draw_geometry(&self, cmd: vk::CommandBuffer, image_index: usize) -> Result<()> {
+    unsafe fn bind_draw_geometry(&self, cmd: vk::CommandBuffer, image_index: usize) -> Result<()> {
         if self.pipeline == vk::Pipeline::null() {
             return Err(anyhow!("pipeline is VK_NULL_HANDLE at record time"));
         }
 
-        unsafe {
-            self.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline)
-        };
+        self.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
 
         // dynamic viewport/scissor
         let vp = vk::Viewport {
@@ -2265,48 +1977,40 @@ impl VkRenderer {
             min_depth: 0.0,
             max_depth: 1.0,
         };
-        unsafe {
-            self.device
-                .cmd_set_viewport(cmd, 0, std::slice::from_ref(&vp))
-        };
+        self.device
+            .cmd_set_viewport(cmd, 0, std::slice::from_ref(&vp));
         let sc = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: self.extent,
         };
-        unsafe {
-            self.device
-                .cmd_set_scissor(cmd, 0, std::slice::from_ref(&sc))
-        };
+        self.device
+            .cmd_set_scissor(cmd, 0, std::slice::from_ref(&sc));
 
         // Bind per-image descriptor set (set = 0)
         let set = self.desc_sets[image_index];
-        unsafe {
-            self.device.cmd_bind_descriptor_sets(
-                cmd,
-                vk::PipelineBindPoint::GRAPHICS,
-                self.pipeline_layout,
-                0, // firstSet
-                std::slice::from_ref(&set),
-                &[], // no dynamic offsets
-            )
-        };
+        self.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.pipeline_layout,
+            0, // firstSet
+            std::slice::from_ref(&set),
+            &[], // no dynamic offsets
+        );
 
         // bind vertex + index buffers
         let offsets = [0_u64];
-        unsafe {
-            self.device
-                .cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&self.vbuf), &offsets);
-            self.device
-                .cmd_bind_index_buffer(cmd, self.ibuf, 0, vk::IndexType::UINT32);
+        self.device
+            .cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&self.vbuf), &offsets);
+        self.device
+            .cmd_bind_index_buffer(cmd, self.ibuf, 0, vk::IndexType::UINT32);
 
-            self.device
-                .cmd_draw_indexed(cmd, self.index_count, 1, 0, 0, 0)
-        };
+        self.device
+            .cmd_draw_indexed(cmd, self.index_count, 1, 0, 0, 0);
         Ok(())
     }
 
     #[inline]
-    fn transition_to_present(&self, cmd: vk::CommandBuffer, image: vk::Image) {
+    unsafe fn transition_to_present(&self, cmd: vk::CommandBuffer, image: vk::Image) {
         let subrange = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
             base_mip_level: 0,
@@ -2334,11 +2038,11 @@ impl VkRenderer {
             p_image_memory_barriers: &post_barrier,
             ..Default::default()
         };
-        unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep_post) };
+        self.device.cmd_pipeline_barrier2(cmd, &dep_post);
     }
 
     #[inline]
-    fn record_one_command(
+    unsafe fn record_one_command(
         &self,
         cmd: vk::CommandBuffer,
         image: vk::Image,
@@ -2346,31 +2050,30 @@ impl VkRenderer {
         image_index: usize,
     ) -> Result<()> {
         // reset + begin
-        unsafe {
-            self.device
-                .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?
-        };
+        self.device
+            .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         let begin = vk::CommandBufferBeginInfo {
             s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
             ..Default::default()
         };
-        unsafe { self.device.begin_command_buffer(cmd, &begin)? };
+        self.device.begin_command_buffer(cmd, &begin)?;
 
         // body
         self.transition_to_color(cmd, image);
         self.transition_depth_to_attachment(cmd, self.depth_image);
         self.begin_rendering(cmd, image_view);
         self.bind_draw_geometry(cmd, image_index)?;
-        unsafe { self.device.cmd_end_rendering(cmd) };
+        self.device.cmd_end_rendering(cmd);
         self.transition_to_present(cmd, image);
 
         // end
-        unsafe { self.device.end_command_buffer(cmd)? };
+        self.device.end_command_buffer(cmd)?;
         Ok(())
     }
 
     // --- Public-ish: record all per-swapchain-image CBs ----------------------
-    fn record_commands(&mut self) -> Result<()> {
+
+    unsafe fn record_commands(&mut self) -> Result<()> {
         for (i, &cmd) in self.cmd_bufs.iter().enumerate() {
             self.record_one_command(cmd, self.images[i], self.image_views[i], i)?;
         }
@@ -2387,49 +2090,47 @@ impl VkRenderer {
     // 7) Resize command buffers if image count changed
     // 8) Re-record commands for ALL images
     // Any deviation can cause sporadic DEVICE_LOST or image-in-use errors.
-    fn recreate_swapchain(&mut self, size: RenderSize) -> Result<()> {
+    unsafe fn recreate_swapchain(&mut self, size: RenderSize) -> Result<()> {
         // Guard min size window
         if size.width == 0 || size.height == 0 {
             return Ok(());
         }
 
-        // 1) Wait for GPU to reach the last signaled timeline value (flush all prior work)
-        if self.timeline_value > 0 {
-            let wait_info = vk::SemaphoreWaitInfo {
-                s_type: vk::StructureType::SEMAPHORE_WAIT_INFO,
-                flags: vk::SemaphoreWaitFlags::empty(),
-                semaphore_count: 1,
-                p_semaphores: &self.timeline,
-                p_values: &self.timeline_value,
-                ..Default::default()
-            };
-            unsafe { self.device.wait_semaphores(&wait_info, u64::MAX).ok() };
+        // 1) Wait all in-flight image fences + acquire fences (no work using old sc)
+        let image_fences: Vec<_> = self.frames.iter().map(|f| f.in_flight).collect();
+        if !image_fences.is_empty() {
+            let _ = self.device.wait_for_fences(&image_fences, true, u64::MAX);
+        }
+        let acq_fences: Vec<_> = self.acq_slots.iter().map(|s| s.fence).collect();
+        if !acq_fences.is_empty() {
+            let _ = self.device.wait_for_fences(&acq_fences, true, u64::MAX);
         }
 
         // 2) device_wait_idle() to avoid destroying in-use views/pipelines
-        unsafe { self.device.device_wait_idle().ok() };
+        self.device.device_wait_idle().ok();
 
         // 3) Destroy per-image views + per-image sync tied to OLD swapchain
         for &iv in &self.image_views {
-            unsafe { self.device.destroy_image_view(iv, None) };
+            self.device.destroy_image_view(iv, None);
         }
         for f in &self.frames {
-            unsafe { self.device.destroy_semaphore(f.render_finished, None) };
+            self.device.destroy_fence(f.in_flight, None);
+            self.device.destroy_semaphore(f.render_finished, None);
         }
         self.frames.clear();
 
         // 3b) Destroy per-image UBOs + descriptor pool tied to OLD swapchain
         for &b in &self.ubufs {
-            unsafe { self.device.destroy_buffer(b, None) };
+            self.device.destroy_buffer(b, None);
         }
         for &m in &self.umems {
-            unsafe { self.device.free_memory(m, None) };
+            self.device.free_memory(m, None);
         }
         self.ubufs.clear();
         self.umems.clear();
 
         if self.desc_pool != vk::DescriptorPool::null() {
-            unsafe { self.device.destroy_descriptor_pool(self.desc_pool, None) };
+            self.device.destroy_descriptor_pool(self.desc_pool, None);
             self.desc_pool = vk::DescriptorPool::null();
         }
         // NOTE: keep self.desc_set_layout (it’s swapchain-agnostic and used by the pipeline layout)
@@ -2448,10 +2149,8 @@ impl VkRenderer {
             self.swapchain,
             cfg,
         )?;
-        unsafe {
-            self.swapchain_loader
-                .destroy_swapchain(self.swapchain, None)
-        };
+        self.swapchain_loader
+            .destroy_swapchain(self.swapchain, None);
         let SwapchainBundle {
             swapchain,
             format,
@@ -2480,13 +2179,13 @@ impl VkRenderer {
 
         // 4e) Recreate depth resources for the NEW extent (using same depth format)
         if self.depth_view != vk::ImageView::null() {
-            unsafe { self.device.destroy_image_view(self.depth_view, None) };
+            self.device.destroy_image_view(self.depth_view, None);
         }
         if self.depth_image != vk::Image::null() {
-            unsafe { self.device.destroy_image(self.depth_image, None) };
+            self.device.destroy_image(self.depth_image, None);
         }
         if self.depth_mem != vk::DeviceMemory::null() {
-            unsafe { self.device.free_memory(self.depth_mem, None) };
+            self.device.free_memory(self.depth_mem, None);
         }
         let (dimg, dmem, dview) = create_depth_resources(
             &self.instance,
@@ -2515,10 +2214,17 @@ impl VkRenderer {
         // 5b) Recreate per-image sync
         let image_count = self.images.len();
         let sem_info = vk::SemaphoreCreateInfo::default();
+        let fence_info = vk::FenceCreateInfo {
+            s_type: vk::StructureType::FENCE_CREATE_INFO,
+            flags: vk::FenceCreateFlags::SIGNALED,
+            ..Default::default()
+        };
         for _ in 0..image_count {
-            let rf = unsafe { self.device.create_semaphore(&sem_info, None)? };
+            let rf = self.device.create_semaphore(&sem_info, None)?;
+            let inflight = self.device.create_fence(&fence_info, None)?;
             self.frames.push(FrameSync {
                 render_finished: rf,
+                in_flight: inflight,
             });
         }
 
@@ -2532,21 +2238,17 @@ impl VkRenderer {
                 self.extent,
                 self.desc_set_layout, // pipeline layout includes set 0 = camera UBO
             )?;
-            unsafe { self.device.destroy_pipeline(self.pipeline, None) };
-            unsafe {
-                self.device
-                    .destroy_pipeline_layout(self.pipeline_layout, None)
-            };
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
             self.pipeline_layout = new_layout;
             self.pipeline = new_pipeline;
         }
 
         // 7) Resize CBs if image count changed
         if self.cmd_bufs.len() != self.images.len() {
-            unsafe {
-                self.device
-                    .free_command_buffers(self.cmd_pool, &self.cmd_bufs)
-            };
+            self.device
+                .free_command_buffers(self.cmd_pool, &self.cmd_bufs);
             let alloc_info = vk::CommandBufferAllocateInfo {
                 s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
                 command_pool: self.cmd_pool,
@@ -2554,7 +2256,7 @@ impl VkRenderer {
                 command_buffer_count: self.images.len() as u32,
                 ..Default::default()
             };
-            self.cmd_bufs = unsafe { self.device.allocate_command_buffers(&alloc_info)? };
+            self.cmd_bufs = self.device.allocate_command_buffers(&alloc_info)?;
         }
 
         // 8) Record
@@ -2571,7 +2273,7 @@ impl Renderer for VkRenderer {
         display: &dyn HasDisplayHandle,
         size: RenderSize,
     ) -> Result<Self> {
-        build_renderer(window, display, size)
+        unsafe { build_renderer(window, display, size) }
     }
 
     fn set_vsync(&mut self, on: bool) {
@@ -2583,53 +2285,29 @@ impl Renderer for VkRenderer {
             width: self.extent.width,
             height: self.extent.height,
         };
-        let _ = self.recreate_swapchain(want);
+        let _ = unsafe { self.recreate_swapchain(want) };
     }
 
     fn resize(&mut self, size: RenderSize) -> Result<()> {
-        // Handle minimized / 0×0 and pause
         if size.width == 0 || size.height == 0 {
             if !self.paused {
                 info!("vk: resize to 0x0 → paused=true");
             }
+
             self.paused = true;
             return Ok(());
         }
 
-        // Coming back from pause
         if self.paused {
             info!(
                 "vk: resize to {}x{} → paused=false",
                 size.width, size.height
             );
         }
+
         self.paused = false;
 
-        // Try to recreate the swapchain; if the surface was lost, rebuild it once and retry
-
-        match self.recreate_swapchain(size) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // If we can peel out a vk::Result and it's SURFACE_LOST, rebuild the surface
-                if let Some(vkerr) = e.downcast_ref::<vk::Result>() {
-                    if *vkerr == vk::Result::ERROR_SURFACE_LOST_KHR {
-                        let entry = Entry::linked();
-                        // requires: self.display_raw / self.window_raw fields and recreate_surface() helper
-                        recreate_surface(
-                            &entry,
-                            &self.instance,
-                            &self.surface_loader,
-                            &mut self.surface,
-                            self.display_raw,
-                            self.window_raw,
-                        )?;
-                        // retry swapchain on the new surface
-                        return self.recreate_swapchain(size);
-                    }
-                }
-                Err(e)
-            }
-        }
+        unsafe { self.recreate_swapchain(size) }
     }
 
     fn set_clear_color(&mut self, rgba: [f32; 4]) {
@@ -2637,7 +2315,9 @@ impl Renderer for VkRenderer {
             color: vk::ClearColorValue { float32: rgba },
         };
 
-        let _ = self.record_commands();
+        unsafe {
+            let _ = self.record_commands();
+        }
     }
 
     // STRICT PER-FRAME ORDER:
@@ -2650,158 +2330,111 @@ impl Renderer for VkRenderer {
         if self.paused {
             return Ok(());
         }
-        // Backoff check
-        if self.should_skip_for_backoff() {
-            return Ok(());
-        }
-        #[cfg(debug_assertions)]
-        self.hot_reload_shaders_if_changed()?;
 
-        // Query caps
-        let caps = match unsafe {
-            self.surface_loader
+        unsafe {
+            // Guard for min surface
+            match self
+                .surface_loader
                 .get_physical_device_surface_capabilities(self.phys, self.surface)
-        } {
-            Ok(caps) => caps,
-            Err(e) => {
-                if !self.paused {
-                    self.paused = true;
-                    info!("vk: surface caps error {:?} → paused=true", e);
+            {
+                Ok(caps) => {
+                    if caps.current_extent.width == 0 || caps.current_extent.height == 0 {
+                        if !self.paused {
+                            self.paused = true;
+                            info!("vk: current_extent is 0x0 → paused=true");
+                        }
+                        return Ok(());
+                    }
                 }
-                return Ok(());
+                Err(e) => {
+                    if !self.paused {
+                        self.paused = true;
+                        info!("vk: surface caps error {:?} → paused=true", e);
+                    }
+                    return Ok(());
+                }
             }
-        };
-        if caps.current_extent.width == 0 || caps.current_extent.height == 0 {
-            if !self.paused {
-                self.paused = true;
-                info!("vk: current_extent is 0x0 → paused=true");
-            }
-            return Ok(());
-        }
 
-        // 1) Acquire
-        let s = &self.acq_slots[self.acq_index];
-        if s.last_signal_value > 0 {
-            let wait_info = vk::SemaphoreWaitInfo {
-                s_type: vk::StructureType::SEMAPHORE_WAIT_INFO,
-                flags: vk::SemaphoreWaitFlags::empty(),
-                semaphore_count: 1,
-                p_semaphores: &self.timeline,
-                p_values: &s.last_signal_value,
-                ..Default::default()
-            };
-            unsafe {
-                self.device.wait_semaphores(&wait_info, u64::MAX)?;
-            }
-        }
+            // Use current acquire slot
+            let s = &self.acq_slots[self.acq_index];
 
-        let (image_index, _) = match unsafe {
-            self.swapchain_loader.acquire_next_image(
+            // Make sure this slot is free (completed last submit that used it)
+            self.device
+                .wait_for_fences(&[s.fence], true, u64::MAX)
+                .context("wait_for_fences(acquire slot)")?;
+            self.device.reset_fences(&[s.fence])?;
+
+            // 1) Acquire
+            let (image_index, _) = match self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
                 s.sem,
                 vk::Fence::null(),
-            )
-        } {
-            // same match arms…
-            Ok(pair) => pair,
-            Err(e) if is_swapchain_out_of_date(e) => {
-                /* … */
-                return Ok(());
+            ) {
+                Ok(pair) => pair,
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) | Err(vk::Result::SUBOPTIMAL_KHR) => {
+                    let want = RenderSize {
+                        width: self.extent.width,
+                        height: self.extent.height,
+                    };
+                    let _ = self.recreate_swapchain(want);
+                    // Skip this frame after recreate; try again next tick.
+                    return Ok(());
+                }
+                Err(e) => return Err(anyhow::anyhow!("acquire_next_image: {e:?}")),
+            };
+
+            let img = image_index as usize;
+            let f_img = &self.frames[img];
+            let cmd = self.cmd_bufs[img];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let mvp = Self::make_identity_mvp(); // later: fill from real camera matrices
+            self.update_camera_ubo_for_image(img, &mvp)?;
+
+            // 2) Submit (wait on acquire sem; signal render-finished; track with this slot's fence)
+            let submit = vk::SubmitInfo {
+                s_type: vk::StructureType::SUBMIT_INFO,
+                wait_semaphore_count: 1,
+                p_wait_semaphores: &s.sem,
+                p_wait_dst_stage_mask: wait_stages.as_ptr(),
+                command_buffer_count: 1,
+                p_command_buffers: &cmd,
+                signal_semaphore_count: 1,
+                p_signal_semaphores: &f_img.render_finished,
+                ..Default::default()
+            };
+            self.device
+                .queue_submit(self.queue, std::slice::from_ref(&submit), s.fence)
+                .context("queue_submit")?;
+
+            // 3) Present (wait on render-finished)
+            let present = vk::PresentInfoKHR {
+                s_type: vk::StructureType::PRESENT_INFO_KHR,
+                wait_semaphore_count: 1,
+                p_wait_semaphores: &f_img.render_finished,
+                swapchain_count: 1,
+                p_swapchains: &self.swapchain,
+                p_image_indices: &image_index,
+                ..Default::default()
+            };
+
+            match self.swapchain_loader.queue_present(self.queue, &present) {
+                Ok(_) => { /* all good */ }
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) | Err(vk::Result::SUBOPTIMAL_KHR) => {
+                    // Recreate and continue next frame
+                    let want = RenderSize {
+                        width: self.extent.width,
+                        height: self.extent.height,
+                    };
+                    let _ = self.recreate_swapchain(want);
+                }
+                Err(e) => return Err(anyhow::anyhow!("queue_present: {e:?}")),
             }
-            Err(e) if is_surface_lost(e) => {
-                /* … */
-                return Ok(());
-            }
-            Err(e) if is_device_lost(e) => return Err(anyhow!("vk: device lost during acquire")),
-            Err(e) => return Err(anyhow!("acquire_next_image: {e:?}")),
-        };
 
-        let img = image_index as usize;
-        let f_img = &self.frames[img];
-        let cmd = self.cmd_bufs[img];
-        let mvp = Self::make_identity_mvp(); // later: fill from real camera matrices
+            // Rotate acquire slot
+            self.acq_index = (self.acq_index + 1) % self.acq_slots.len();
 
-        self.update_camera_ubo_for_image(img, &mvp)?;
-
-        // 2) Submit (wait on acquire sem; signal render-finished; bump timeline)
-        let next_value = self.timeline_value.wrapping_add(1);
-
-        // legacy -> sync2 stage mask you already have
-        let stage_color = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
-        let stage2_color = stage_flags2_from_legacy(stage_color);
-
-        // Build the semaphore infos
-        let wait_acquire = semaphore_submit_info_wait(s.sem, 0, stage2_color);
-        let signal_present = semaphore_submit_info_signal(f_img.render_finished, 0, stage2_color);
-        let signal_timeline = semaphore_submit_info_signal(self.timeline, next_value, stage2_color);
-
-        // IMPORTANT: store in locals so the pointers in SubmitInfo2 stay valid
-        let waits = [wait_acquire];
-        let signals = [signal_present, signal_timeline];
-
-        let cmd_info = vk::CommandBufferSubmitInfo {
-            s_type: vk::StructureType::COMMAND_BUFFER_SUBMIT_INFO,
-            command_buffer: cmd,
-            device_mask: 0,
-            ..Default::default()
-        };
-
-        let submit2 = vk::SubmitInfo2 {
-            s_type: vk::StructureType::SUBMIT_INFO_2,
-            wait_semaphore_info_count: waits.len() as u32,
-            p_wait_semaphore_infos: waits.as_ptr(),
-            command_buffer_info_count: 1,
-            p_command_buffer_infos: &cmd_info,
-            signal_semaphore_info_count: signals.len() as u32,
-            p_signal_semaphore_infos: signals.as_ptr(),
-            ..Default::default()
-        };
-
-        // Submit with robust error handling
-        let submit_res = unsafe {
-            self.device.queue_submit2(
-                self.queue,
-                std::slice::from_ref(&submit2),
-                vk::Fence::null(),
-            )
-        };
-
-        match submit_res {
-            Ok(()) => {
-                self.timeline_value = next_value;
-                self.acq_slots[self.acq_index].last_signal_value = next_value;
-            }
-            Err(vk::Result::ERROR_DEVICE_LOST) => {
-                return Err(anyhow!("vk: device lost during submit"));
-            }
-            Err(e) => {
-                return Err(anyhow!("queue_submit2: {e:?}"));
-            }
+            Ok(())
         }
-
-        // 3) Present (wait on render-finished)
-        let present = vk::PresentInfoKHR {
-            s_type: vk::StructureType::PRESENT_INFO_KHR,
-            wait_semaphore_count: 1,
-            p_wait_semaphores: &f_img.render_finished,
-            swapchain_count: 1,
-            p_swapchains: &self.swapchain,
-            p_image_indices: &image_index,
-            ..Default::default()
-        };
-
-        match unsafe { self.swapchain_loader.queue_present(self.queue, &present) } {
-            Ok(_) => {}
-            Err(e) if is_swapchain_out_of_date(e) => { /* … */ }
-            Err(e) if is_surface_lost(e) => { /* … */ }
-            Err(e) if is_device_lost(e) => return Err(anyhow!("vk: device lost during present")),
-            Err(e) => return Err(anyhow!("queue_present: {e:?}")),
-        }
-
-        // Rotate acquire slot
-        self.acq_index = (self.acq_index + 1) % self.acq_slots.len();
-
-        Ok(())
     }
 }
