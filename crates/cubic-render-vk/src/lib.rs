@@ -86,6 +86,7 @@ pub struct VkRenderer {
     desc_sets: Vec<vk::DescriptorSet>,
     ubufs: Vec<vk::Buffer>,
     umems: Vec<vk::DeviceMemory>,
+    umaps: Vec<*mut std::ffi::c_void>,
     pipeline_cache: vk::PipelineCache,
     timeline: vk::Semaphore,
     timeline_value: u64,
@@ -336,6 +337,9 @@ impl Drop for VkRenderer {
             d.free_memory(self.ibuf_mem, None);
 
             // Destroy frame resources
+            for &m in &self.umems {
+                self.device.unmap_memory(m);
+            }
             for &b in &self.ubufs {
                 d.destroy_buffer(b, None);
             }
@@ -572,29 +576,42 @@ fn create_depth_resources(
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         ..Default::default()
     };
-    let image = unsafe { device.create_image(&img_ci, None)? };
+    let image = unsafe { device.create_image(&img_ci, None) }.with_context(|| {
+        format!(
+            "create_image depth format={depth_format:?} extent={:?}",
+            extent
+        )
+    })?;
 
     let mem_req = unsafe { device.get_image_memory_requirements(image) };
-    let mem_props = unsafe { instance.get_physical_device_memory_properties(phys) };
-    let mut mem_type_idx = 0;
-    for i in 0..mem_props.memory_type_count {
-        let is_type_ok = (mem_req.memory_type_bits & (1 << i)) != 0;
-        let is_device_local = mem_props.memory_types[i as usize]
-            .property_flags
-            .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL);
-        if is_type_ok && is_device_local {
-            mem_type_idx = i;
-            break;
-        }
-    }
+    let mem_type_idx = find_memory_type(
+        instance,
+        phys,
+        mem_req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )
+    .with_context(|| {
+        format!(
+            "depth image memory selection: req_bits=0x{:08x}, size={}",
+            mem_req.memory_type_bits, mem_req.size
+        )
+    })?;
+
     let alloc = vk::MemoryAllocateInfo {
         s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
         allocation_size: mem_req.size,
         memory_type_index: mem_type_idx,
         ..Default::default()
     };
-    let memory = unsafe { device.allocate_memory(&alloc, None)? };
-    unsafe { device.bind_image_memory(image, memory, 0)? };
+    let memory = unsafe { device.allocate_memory(&alloc, None) }.with_context(|| {
+        format!(
+            "allocate_memory (depth) size={} mem_type_index={}",
+            mem_req.size, mem_type_idx
+        )
+    })?;
+
+    unsafe { device.bind_image_memory(image, memory, 0) }
+        .with_context(|| "bind_image_memory (depth)")?;
 
     let depth_view = make_depth_view(device, image, depth_format)?;
     Ok((image, memory, depth_view))
@@ -952,16 +969,20 @@ fn find_memory_type(
     phys: vk::PhysicalDevice,
     type_bits: u32,
     req: vk::MemoryPropertyFlags,
-) -> u32 {
+) -> anyhow::Result<u32> {
     let mem = unsafe { instance.get_physical_device_memory_properties(phys) };
+
     for i in 0..mem.memory_type_count {
-        let ok = (type_bits & (1 << i)) != 0
-            && mem.memory_types[i as usize].property_flags.contains(req);
-        if ok {
-            return i;
+        let type_ok = (type_bits & (1 << i)) != 0;
+        let props_ok = mem.memory_types[i as usize].property_flags.contains(req);
+        if type_ok && props_ok {
+            return Ok(i);
         }
     }
-    panic!("No suitable memory type");
+
+    Err(anyhow!(
+        "no suitable memory type: type_bits=0x{type_bits:08x}, required_flags={req:?}"
+    ))
 }
 
 fn create_buffer_and_memory(
@@ -979,17 +1000,28 @@ fn create_buffer_and_memory(
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         ..Default::default()
     };
-    let buf = unsafe { device.create_buffer(&bci, None)? };
+    let buf = unsafe { device.create_buffer(&bci, None) }
+        .with_context(|| format!("create_buffer usage={usage:?} size={size}"))?;
+
     let req = unsafe { device.get_buffer_memory_requirements(buf) };
-    let mem_type = find_memory_type(instance, phys, req.memory_type_bits, props);
+    let mem_type = find_memory_type(instance, phys, req.memory_type_bits, props)
+        .with_context(|| format!("buffer memory selection for usage={usage:?}, props={props:?}, size={size}, req_bits=0x{:08x}", req.memory_type_bits))?;
+
     let mai = vk::MemoryAllocateInfo {
         s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
         allocation_size: req.size,
         memory_type_index: mem_type,
         ..Default::default()
     };
-    let mem = unsafe { device.allocate_memory(&mai, None)? };
-    unsafe { device.bind_buffer_memory(buf, mem, 0)? };
+    let mem = unsafe { device.allocate_memory(&mai, None) }.with_context(|| {
+        format!(
+            "allocate_memory size={} mem_type_index={}",
+            req.size, mem_type
+        )
+    })?;
+
+    unsafe { device.bind_buffer_memory(buf, mem, 0) }.with_context(|| "bind_buffer_memory")?;
+
     Ok((buf, mem))
 }
 
@@ -1187,18 +1219,24 @@ fn create_frame_uniforms_and_sets(
 ) -> Result<(
     Vec<vk::Buffer>,
     Vec<vk::DeviceMemory>,
+    Vec<*mut std::ffi::c_void>,
     vk::DescriptorPool,
     Vec<vk::DescriptorSet>,
 )> {
-    let ubo_size = std::mem::size_of::<CameraUbo>() as vk::DeviceSize;
+    let limits = unsafe { instance.get_physical_device_properties(phys).limits };
+    let a = limits.min_uniform_buffer_offset_alignment.max(1);
+    let ubo_size = ((std::mem::size_of::<CameraUbo>() as u64 + a - 1) / a) * a;
 
     // 1) Make UBOs
     let mut ubufs = Vec::with_capacity(image_count);
     let mut umems = Vec::with_capacity(image_count);
+    let mut umaps = Vec::with_capacity(image_count);
     for _ in 0..image_count {
         let (b, m) = create_host_visible_ubo(instance, device, phys, ubo_size)?;
+        let ptr = unsafe { device.map_memory(m, 0, ubo_size, vk::MemoryMapFlags::empty())? };
         ubufs.push(b);
         umems.push(m);
+        umaps.push(ptr);
     }
 
     // 2) Pool
@@ -1247,7 +1285,7 @@ fn create_frame_uniforms_and_sets(
     }
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-    Ok((ubufs, umems, pool, sets))
+    Ok((ubufs, umems, umaps, pool, sets))
 }
 
 #[inline]
@@ -1858,7 +1896,6 @@ fn build_renderer(
             let dir = PathBuf::from(dir);
             let vp = dir.join("tri.vert.glsl");
             let fp = dir.join("tri.frag.glsl");
-            // Note: .metadata() will error if the files don’t exist; that’s fine → no hot reload
             if vp.exists() && fp.exists() {
                 let vm = fs::metadata(&vp)?.modified()?;
                 let fm = fs::metadata(&fp)?.modified()?;
@@ -1899,7 +1936,7 @@ fn build_renderer(
     let (depth_image, depth_mem, depth_view) =
         create_depth_resources(&instance, &device, phys, sc.extent, depth_format)?;
 
-    let (ubufs, umems, desc_pool, desc_sets) = create_frame_uniforms_and_sets(
+    let (ubufs, umems, umaps, desc_pool, desc_sets) = create_frame_uniforms_and_sets(
         &instance,
         &device,
         phys,
@@ -1988,6 +2025,7 @@ fn build_renderer(
         desc_sets,
         ubufs,
         umems,
+        umaps,
         pipeline_cache,
         timeline,
         timeline_value,
@@ -2114,23 +2152,13 @@ impl VkRenderer {
     }
 
     fn update_camera_ubo_for_image(&self, image_index: usize, data: &CameraUbo) -> Result<()> {
-        let size = std::mem::size_of::<CameraUbo>() as vk::DeviceSize;
-        let ptr = unsafe {
-            self.device.map_memory(
-                self.umems[image_index],
-                0,
-                size,
-                vk::MemoryMapFlags::empty(),
-            )?
-        };
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data as *const _ as *const u8,
-                ptr as *mut u8,
+                self.umaps[image_index] as *mut u8,
                 std::mem::size_of::<CameraUbo>(),
-            )
-        };
-        unsafe { self.device.unmap_memory(self.umems[image_index]) };
+            );
+        }
         Ok(())
     }
 
@@ -2319,7 +2347,7 @@ impl VkRenderer {
             s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
             src_stage_mask: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
             src_access_mask: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            dst_stage_mask: vk::PipelineStageFlags2::BOTTOM_OF_PIPE,
+            dst_stage_mask: vk::PipelineStageFlags2::NONE,
             dst_access_mask: vk::AccessFlags2::empty(),
             old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             new_layout: vk::ImageLayout::PRESENT_SRC_KHR,
@@ -2500,15 +2528,16 @@ impl VkRenderer {
         self.depth_view = dview;
 
         // 5) Recreate per-image UBOs + descriptor sets
-        let (ubufs, umems, pool, sets) = create_frame_uniforms_and_sets(
+        let (ubufs, umems, umaps, pool, sets) = create_frame_uniforms_and_sets(
             &self.instance,
             &self.device,
             self.phys,
-            self.desc_set_layout, // swapchain-agnostic
-            self.images.len(),    // new image count
+            self.desc_set_layout,
+            self.images.len(),
         )?;
         self.ubufs = ubufs;
         self.umems = umems;
+        self.umaps = umaps;
         self.desc_pool = pool;
         self.desc_sets = sets;
 
