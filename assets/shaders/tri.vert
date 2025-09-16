@@ -8,7 +8,7 @@ layout(location=0) out vec3 vColor;
 
 void main() {
     // Small horizontal nudge so position changes are obvious
-    vec3 p = inPos + vec3(0.09, 0.1, 0.2);
+    vec3 p = inPos + vec3(0.19, 0.3, 0.5);
     gl_Position = uMVP * vec4(p, 1.0);
     vColor = inColor;
 }

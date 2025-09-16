@@ -5,6 +5,7 @@ use ash::ext::debug_utils as ext_debug;
 use ash::khr::{surface, swapchain};
 use ash::util::read_spv;
 use ash::{vk, Entry, Instance};
+use bytemuck::{Pod, Zeroable};
 use cubic_render::{RenderSize, Renderer};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use std::io::Cursor;
@@ -13,6 +14,7 @@ use std::time::SystemTime;
 use std::{fs, path::Path, path::PathBuf};
 use tracing::info;
 
+// 1) Public api / constants
 const TRI_VERTS: &[Vertex] = &[
     // index 0: top (red)
     Vertex {
@@ -32,11 +34,75 @@ const TRI_VERTS: &[Vertex] = &[
 ];
 const TRI_IDXS: &[u32] = &[0, 1, 2];
 
+#[derive(Clone, Copy, Debug)]
+pub enum VkVsyncMode {
+    Fifo,    // Target monitor refresh rate
+    Mailbox, // Smart Vsync, fps uncapped
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HdrFlavor {
+    PreferScrgb, // FP16 scRGB first, then HDR10
+    PreferHdr10, // HDR10 first, then scRGB
+}
+// END Public api / constants
+
+// 2) Debug wiring
 #[cfg(debug_assertions)]
 type DebugState = vk::DebugUtilsMessengerEXT;
 #[cfg(not(debug_assertions))]
 type DebugState = ();
 
+#[cfg(debug_assertions)]
+unsafe extern "system" fn debug_callback(
+    _severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    _types: vk::DebugUtilsMessageTypeFlagsEXT,
+    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _user: *mut std::os::raw::c_void,
+) -> vk::Bool32 {
+    if !data.is_null() {
+        let msg = unsafe { std::ffi::CStr::from_ptr((*data).p_message) };
+        eprintln!("[Vulkan] {:?}", msg);
+    }
+    vk::FALSE
+}
+#[cfg(debug_assertions)]
+fn create_debug_messenger(entry: &ash::Entry, instance: &ash::Instance) -> Result<DebugState> {
+    let debug_loader = ext_debug::Instance::new(entry, instance);
+    let ci = vk::DebugUtilsMessengerCreateInfoEXT {
+        s_type: vk::StructureType::DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+        message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+            | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+            | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+        message_type: vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+            | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
+            | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
+        pfn_user_callback: Some(debug_callback),
+        ..Default::default()
+    };
+    Ok(unsafe { debug_loader.create_debug_utils_messenger(&ci, None)? })
+}
+#[cfg(not(debug_assertions))]
+fn create_debug_messenger(_entry: &ash::Entry, _instance: &ash::Instance) -> Result<DebugState> {
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn destroy_debug_messenger(entry: &ash::Entry, instance: &ash::Instance, dbg: DebugState) {
+    let loader = ext_debug::Instance::new(entry, instance);
+    unsafe { loader.destroy_debug_utils_messenger(dbg, None) };
+}
+
+#[cfg(debug_assertions)]
+struct ShaderDev {
+    vert_spv: PathBuf,
+    frag_spv: PathBuf,
+    vert_mtime: SystemTime,
+    frag_mtime: SystemTime,
+}
+//END Debug wiring
+
+// 3) Renderer data model
 pub struct VkRenderer {
     instance: ash::Instance,
     surface_loader: surface::Instance,
@@ -86,7 +152,8 @@ pub struct VkRenderer {
     desc_sets: Vec<vk::DescriptorSet>,
     ubufs: Vec<vk::Buffer>,
     umems: Vec<vk::DeviceMemory>,
-    umaps: Vec<*mut std::ffi::c_void>,
+    ubo_ptrs: Vec<*mut std::ffi::c_void>,
+    ubo_size: vk::DeviceSize,
     pipeline_cache: vk::PipelineCache,
     timeline: vk::Semaphore,
     timeline_value: u64,
@@ -95,166 +162,6 @@ pub struct VkRenderer {
     backoff_frames: u32,
     #[cfg(debug_assertions)]
     shader_dev: Option<ShaderDev>,
-}
-
-struct FrameSync {
-    render_finished: vk::Semaphore,
-}
-
-struct AcquireSlot {
-    sem: vk::Semaphore,
-    last_signal_value: u64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct SwapchainConfig {
-    hint: RenderSize,
-    vsync: bool,
-    vsync_mode: VkVsyncMode,
-    want_hdr: bool,
-    allow_extended_colorspace: bool,
-    hdr_flavor: HdrFlavor,
-}
-
-struct SwapchainBundle {
-    swapchain: vk::SwapchainKHR,
-    format: vk::Format,
-    extent: vk::Extent2D,
-    images: Vec<vk::Image>,
-    image_views: Vec<vk::ImageView>,
-    color_space: vk::ColorSpaceKHR,
-}
-
-struct CommandResources {
-    pool: vk::CommandPool,
-    bufs: Vec<vk::CommandBuffer>,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct CameraUbo {
-    mvp: [[f32; 4]; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Vertex {
-    pos: [f32; 3],
-    color: [f32; 3],
-}
-
-#[cfg(debug_assertions)]
-struct ShaderDev {
-    vert_path: PathBuf,
-    frag_path: PathBuf,
-    vert_mtime: SystemTime,
-    frag_mtime: SystemTime,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RuntimeConfig {
-    vsync: bool,
-    vsync_mode: VkVsyncMode,
-    hdr: bool,
-    hdr_flavor: HdrFlavor,
-    allow_extended_colorspace: bool,
-}
-impl RuntimeConfig {
-    /// Build from environment (CUBIC_HDR, CUBIC_HDR_FLAVOR), plus a flag
-    /// detected at instance creation time.
-    fn from_env(allow_extended_colorspace: bool) -> Self {
-        let hdr = std::env::var("CUBIC_HDR").ok().as_deref() == Some("1");
-        let hdr_flavor = match std::env::var("CUBIC_HDR_FLAVOR").ok().as_deref() {
-            Some(s) if s.eq_ignore_ascii_case("hdr10") => HdrFlavor::PreferHdr10,
-            _ => HdrFlavor::PreferScrgb,
-        };
-
-        Self {
-            vsync: true,
-            vsync_mode: VkVsyncMode::Mailbox,
-            hdr,
-            hdr_flavor,
-            allow_extended_colorspace,
-        }
-    }
-
-    /// Convert to the swapchain’s creation config for a given target size.
-    fn to_swapchain_config(&self, hint: RenderSize) -> SwapchainConfig {
-        SwapchainConfig {
-            hint,
-            vsync: self.vsync,
-            vsync_mode: self.vsync_mode,
-            want_hdr: self.hdr,
-            allow_extended_colorspace: self.allow_extended_colorspace,
-            hdr_flavor: self.hdr_flavor,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum VkVsyncMode {
-    Fifo,    // Target monitor refresh rate
-    Mailbox, // Smart Vsync, fps uncapped
-}
-
-#[derive(Clone, Copy, Debug)]
-enum RenderPath {
-    Core13, // Vulkan 1.3 core dynamic rendering + sync2
-    KhrExt, // Vulkan 1.2 + VK_KHR_dynamic_rendering + VK_KHR_synchronization2
-    Legacy, // No dynamic rendering: would need render pass/framebuffer path
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum HdrMode {
-    Off,
-    Auto,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HdrFlavor {
-    PreferScrgb, // FP16 scRGB first, then HDR10
-    PreferHdr10, // HDR10 first, then scRGB
-}
-
-#[cfg(debug_assertions)]
-unsafe extern "system" fn debug_callback(
-    _severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-    _types: vk::DebugUtilsMessageTypeFlagsEXT,
-    data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-    _user: *mut std::os::raw::c_void,
-) -> vk::Bool32 {
-    if !data.is_null() {
-        let msg = unsafe { std::ffi::CStr::from_ptr((*data).p_message) };
-        eprintln!("[Vulkan] {:?}", msg);
-    }
-    vk::FALSE
-}
-#[cfg(debug_assertions)]
-fn create_debug_messenger(entry: &ash::Entry, instance: &ash::Instance) -> Result<DebugState> {
-    let debug_loader = ext_debug::Instance::new(entry, instance);
-    let ci = vk::DebugUtilsMessengerCreateInfoEXT {
-        s_type: vk::StructureType::DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-        message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
-            | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-            | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
-        message_type: vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-            | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION
-            | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE,
-        pfn_user_callback: Some(debug_callback),
-        ..Default::default()
-    };
-    Ok(unsafe { debug_loader.create_debug_utils_messenger(&ci, None)? })
-}
-
-#[cfg(not(debug_assertions))]
-fn create_debug_messenger(_entry: &ash::Entry, _instance: &ash::Instance) -> Result<DebugState> {
-    Ok(())
-}
-
-#[cfg(debug_assertions)]
-fn destroy_debug_messenger(entry: &ash::Entry, instance: &ash::Instance, dbg: DebugState) {
-    let loader = ext_debug::Instance::new(entry, instance);
-    unsafe { loader.destroy_debug_utils_messenger(dbg, None) };
 }
 
 // STRICT TEARDOWN ORDER:
@@ -337,15 +244,26 @@ impl Drop for VkRenderer {
             d.free_memory(self.ibuf_mem, None);
 
             // Destroy frame resources
-            for &m in &self.umems {
-                self.device.unmap_memory(m);
+            for (i, &m) in self.umems.iter().enumerate() {
+                let p = self
+                    .ubo_ptrs
+                    .get(i)
+                    .copied()
+                    .unwrap_or(std::ptr::null_mut());
+                if !p.is_null() {
+                    self.device.unmap_memory(m);
+                }
             }
             for &b in &self.ubufs {
-                d.destroy_buffer(b, None);
+                self.device.destroy_buffer(b, None);
             }
             for &m in &self.umems {
-                d.free_memory(m, None);
+                self.device.free_memory(m, None);
             }
+            self.ubufs.clear();
+            self.umems.clear();
+            self.ubo_ptrs.clear();
+            self.ubo_size = 0;
             if self.desc_pool != vk::DescriptorPool::null() {
                 d.destroy_descriptor_pool(self.desc_pool, None);
             }
@@ -366,8 +284,198 @@ impl Drop for VkRenderer {
         }
     }
 }
+// END Renderer data model
 
-// Info only
+// 4) Structs
+struct FrameSync {
+    render_finished: vk::Semaphore,
+}
+
+struct AcquireSlot {
+    sem: vk::Semaphore,
+    last_signal_value: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SwapchainConfig {
+    hint: RenderSize,
+    vsync: bool,
+    vsync_mode: VkVsyncMode,
+    want_hdr: bool,
+    allow_extended_colorspace: bool,
+    hdr_flavor: HdrFlavor,
+}
+
+struct SwapchainBundle {
+    swapchain: vk::SwapchainKHR,
+    format: vk::Format,
+    extent: vk::Extent2D,
+    images: Vec<vk::Image>,
+    image_views: Vec<vk::ImageView>,
+    color_space: vk::ColorSpaceKHR,
+}
+
+struct CommandResources {
+    pool: vk::CommandPool,
+    bufs: Vec<vk::CommandBuffer>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Zeroable, Pod)]
+struct CameraUbo {
+    mvp: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Zeroable, Pod)]
+struct Vertex {
+    pos: [f32; 3],
+    color: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimeConfig {
+    vsync: bool,
+    vsync_mode: VkVsyncMode,
+    hdr: bool,
+    hdr_flavor: HdrFlavor,
+    allow_extended_colorspace: bool,
+}
+impl RuntimeConfig {
+    /// Build from environment (CUBIC_HDR, CUBIC_HDR_FLAVOR), plus a flag
+    /// detected at instance creation time.
+    fn from_env(allow_extended_colorspace: bool) -> Self {
+        let hdr = std::env::var("CUBIC_HDR").ok().as_deref() == Some("1");
+        let hdr_flavor = match std::env::var("CUBIC_HDR_FLAVOR").ok().as_deref() {
+            Some(s) if s.eq_ignore_ascii_case("hdr10") => HdrFlavor::PreferHdr10,
+            _ => HdrFlavor::PreferScrgb,
+        };
+
+        Self {
+            vsync: true,
+            vsync_mode: VkVsyncMode::Mailbox,
+            hdr,
+            hdr_flavor,
+            allow_extended_colorspace,
+        }
+    }
+
+    /// Convert to the swapchain’s creation config for a given target size.
+    fn to_swapchain_config(&self, hint: RenderSize) -> SwapchainConfig {
+        SwapchainConfig {
+            hint,
+            vsync: self.vsync,
+            vsync_mode: self.vsync_mode,
+            want_hdr: self.hdr,
+            allow_extended_colorspace: self.allow_extended_colorspace,
+            hdr_flavor: self.hdr_flavor,
+        }
+    }
+}
+// END Structs
+
+// 5) Enums
+#[derive(Clone, Copy, Debug)]
+enum RenderPath {
+    Core13, // Vulkan 1.3 core dynamic rendering + sync2
+    KhrExt, // Vulkan 1.2 + VK_KHR_dynamic_rendering + VK_KHR_synchronization2
+    Legacy, // No dynamic rendering: would need render pass/framebuffer path
+}
+// END Enums
+
+// 6) Types
+type InitRet = (
+    ash::Entry,
+    ash::Instance,
+    surface::Instance,
+    vk::SurfaceKHR,
+    Option<DebugState>,
+    bool,
+);
+// END Types
+
+// 7) Inline helper functions
+#[inline]
+fn find_memory_type(
+    instance: &ash::Instance,
+    phys: vk::PhysicalDevice,
+    type_bits: u32,
+    req: vk::MemoryPropertyFlags,
+) -> anyhow::Result<u32> {
+    let mem = unsafe { instance.get_physical_device_memory_properties(phys) };
+
+    for i in 0..mem.memory_type_count {
+        let type_ok = (type_bits & (1 << i)) != 0;
+        let props_ok = mem.memory_types[i as usize].property_flags.contains(req);
+        if type_ok && props_ok {
+            return Ok(i);
+        }
+    }
+
+    Err(anyhow!(
+        "no suitable memory type: type_bits=0x{type_bits:08x}, required_flags={req:?}"
+    ))
+}
+
+#[inline]
+fn stage_flags2_from_legacy(stage: vk::PipelineStageFlags) -> vk::PipelineStageFlags2 {
+    // Minimal mapping for your usage (COLOR_ATTACHMENT_OUTPUT)
+    vk::PipelineStageFlags2::from_raw(stage.as_raw() as u64)
+}
+
+#[inline]
+fn semaphore_submit_info_wait(
+    sem: vk::Semaphore,
+    value: u64,
+    stage: vk::PipelineStageFlags2,
+) -> vk::SemaphoreSubmitInfo<'static> {
+    vk::SemaphoreSubmitInfo {
+        s_type: vk::StructureType::SEMAPHORE_SUBMIT_INFO,
+        p_next: std::ptr::null(),
+        semaphore: sem,
+        value,
+        stage_mask: stage,
+        device_index: 0,
+        ..Default::default()
+    }
+}
+
+#[inline]
+fn semaphore_submit_info_signal(
+    sem: vk::Semaphore,
+    value: u64,
+    stage: vk::PipelineStageFlags2,
+) -> vk::SemaphoreSubmitInfo<'static> {
+    vk::SemaphoreSubmitInfo {
+        s_type: vk::StructureType::SEMAPHORE_SUBMIT_INFO,
+        p_next: std::ptr::null(),
+        semaphore: sem,
+        value,
+        stage_mask: stage,
+        device_index: 0,
+        ..Default::default()
+    }
+}
+
+#[inline]
+fn is_swapchain_out_of_date(e: vk::Result) -> bool {
+    matches!(
+        e,
+        vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR
+    )
+}
+
+#[inline]
+fn is_surface_lost(e: vk::Result) -> bool {
+    e == vk::Result::ERROR_SURFACE_LOST_KHR
+}
+
+#[inline]
+fn is_device_lost(e: vk::Result) -> bool {
+    e == vk::Result::ERROR_DEVICE_LOST
+}
+
+#[inline]
 fn fmt_name(f: ash::vk::Format) -> &'static str {
     match f {
         ash::vk::Format::B8G8R8A8_UNORM => "B8G8R8A8_UNORM",
@@ -380,15 +488,20 @@ fn fmt_name(f: ash::vk::Format) -> &'static str {
         _ => "OTHER",
     }
 }
+
+#[inline]
 fn cs_name(cs: ash::vk::ColorSpaceKHR) -> &'static str {
     match cs {
         ash::vk::ColorSpaceKHR::SRGB_NONLINEAR => "SRGB_NONLINEAR",
         ash::vk::ColorSpaceKHR::DISPLAY_P3_NONLINEAR_EXT => "DISPLAY_P3_NONLINEAR",
         ash::vk::ColorSpaceKHR::HDR10_ST2084_EXT => "HDR10_ST2084",
         ash::vk::ColorSpaceKHR::EXTENDED_SRGB_LINEAR_EXT => "EXTENDED_SRGB_LINEAR",
+        ash::vk::ColorSpaceKHR::EXTENDED_SRGB_NONLINEAR_EXT => "EXTENDED_SRGB_NONLINEAR",
         _ => "OTHER",
     }
 }
+
+#[inline]
 fn pm_name(m: ash::vk::PresentModeKHR) -> &'static str {
     match m {
         ash::vk::PresentModeKHR::FIFO => "FIFO",
@@ -399,6 +512,7 @@ fn pm_name(m: ash::vk::PresentModeKHR) -> &'static str {
     }
 }
 
+#[inline]
 fn choose_present_mode(
     modes: &[vk::PresentModeKHR],
     vsync: bool,
@@ -427,6 +541,7 @@ fn choose_present_mode(
     }
 }
 
+#[inline]
 fn extent_from_caps(caps: &vk::SurfaceCapabilitiesKHR, want: RenderSize) -> vk::Extent2D {
     if caps.current_extent.width != u32::MAX {
         caps.current_extent
@@ -440,6 +555,17 @@ fn extent_from_caps(caps: &vk::SurfaceCapabilitiesKHR, want: RenderSize) -> vk::
                 .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         }
     }
+}
+// END Inline helper functions
+
+// 8) Helper functions
+fn load_spv_file(path: &Path) -> Result<Vec<u32>> {
+    let bytes = fs::read(path).with_context(|| format!("read {:?}", path))?;
+    read_spv(&mut Cursor::new(&bytes[..])).with_context(|| format!("read_spv {:?}", path))
+}
+
+fn load_spv_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
+    read_spv(&mut Cursor::new(bytes)).context("read_spv from embedded bytes")
 }
 
 fn hex_bytes(b: &[u8]) -> String {
@@ -455,7 +581,6 @@ fn pipeline_cache_path(props: &vk::PhysicalDeviceProperties) -> PathBuf {
     // Keep it simple: local file next to the binary.
     // You can switch to a platform cache dir later.
     let uuid = hex_bytes(&props.pipeline_cache_uuid);
-    // driverVersion is vendor-specific encoding, but useful enough for cache names.
     PathBuf::from(format!(
         "vk_pipeline_cache_{:04x}_{:04x}_{:08x}_{}.bin",
         props.vendor_id, props.device_id, props.driver_version, uuid
@@ -493,7 +618,7 @@ fn save_pipeline_cache(
 ) -> Result<()> {
     let bytes = match unsafe { device.get_pipeline_cache_data(cache) } {
         Ok(b) => b,
-        Err(_) => return Ok(()), // benign; empty cache or device lost, nothing to save
+        Err(_) => return Ok(()),
     };
 
     if let Some(parent) = path.parent() {
@@ -617,7 +742,7 @@ fn create_depth_resources(
     Ok((image, memory, depth_view))
 }
 
-fn create_instance(entry: &Entry, display_raw: RawDisplayHandle) -> Result<Instance> {
+fn create_instance(entry: &Entry, display_raw: RawDisplayHandle) -> Result<(Instance, bool)> {
     let app = std::ffi::CString::new("CubicEngine").unwrap();
 
     let app_info = vk::ApplicationInfo {
@@ -684,17 +809,9 @@ fn create_instance(entry: &Entry, display_raw: RawDisplayHandle) -> Result<Insta
         ..Default::default()
     };
 
-    Ok(unsafe { entry.create_instance(&create_info, None)? })
+    let instance = unsafe { entry.create_instance(&create_info, None)? };
+    Ok((instance, has_swapchain_cs))
 }
-
-type InitRet = (
-    ash::Entry,
-    ash::Instance,
-    surface::Instance,
-    vk::SurfaceKHR,
-    Option<DebugState>,
-    bool,
-);
 
 fn init_instance_and_surface(
     window: &dyn HasWindowHandle,
@@ -711,7 +828,7 @@ fn init_instance_and_surface(
 
     let entry = Entry::linked();
 
-    let instance = create_instance(&entry, dh)?;
+    let (instance, have_swapchain_colorspace_ext) = create_instance(&entry, dh)?;
 
     let surface_loader = surface::Instance::new(&entry, &instance);
 
@@ -720,22 +837,10 @@ fn init_instance_and_surface(
             .context("ash_window::create_surface")?
     };
 
-    // Only create the debug messenger in debug builds
     let debug_state = if cfg!(debug_assertions) {
         Some(create_debug_messenger(&entry, &instance)?)
     } else {
         None
-    };
-
-    let have_swapchain_colorspace_ext = unsafe {
-        entry
-            .enumerate_instance_extension_properties(None)
-            .unwrap_or_default()
-            .iter()
-            .any(|e| {
-                std::ffi::CStr::from_ptr(e.extension_name.as_ptr())
-                    == ash::ext::swapchain_colorspace::NAME
-            })
     };
 
     Ok((
@@ -754,152 +859,6 @@ fn select_device_and_queue(
     surface: vk::SurfaceKHR,
 ) -> Result<(vk::PhysicalDevice, u32)> {
     pick_device_and_queue(instance, surf_i, surface)
-}
-
-fn decide_path_and_create_device(
-    _entry: &ash::Entry,
-    instance: &ash::Instance,
-    phys: vk::PhysicalDevice,
-    queue_family: u32,
-) -> Result<(
-    ash::Device,
-    vk::Queue,
-    RenderPath,
-    bool, /*has_hdr_metadata*/
-)> {
-    // STRICT ORDER (feature pNext chain):
-    // Core 1.3 path: feats13 -> chained after feats12 -> chained after feats2
-    // KHR path:      feats_sync2_khr -> feats_dr_khr -> feats12 -> feats2
-    // DO NOT MIX core 1.3 structs with KHR equivalents in the same chain.
-    // Wrong chain = undefined features; validation won't always catch it.
-
-    // --- Queue we want on this device ---
-    let priorities = [1.0_f32];
-    let qinfo = vk::DeviceQueueCreateInfo {
-        s_type: vk::StructureType::DEVICE_QUEUE_CREATE_INFO,
-        queue_family_index: queue_family,
-        queue_count: 1,
-        p_queue_priorities: priorities.as_ptr(),
-        ..Default::default()
-    };
-
-    // --- One shot device extension query ---
-    let ext_props = unsafe {
-        instance
-            .enumerate_device_extension_properties(phys)
-            .context("enumerate_device_extension_properties(device)")?
-    };
-    let has = unsafe {
-        |name: &std::ffi::CStr| -> bool {
-            ext_props
-                .iter()
-                .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name)
-        }
-    };
-
-    let mut device_exts: Vec<*const i8> = vec![swapchain::NAME.as_ptr()];
-    let has_sync2_khr = has(ash::khr::synchronization2::NAME);
-    let has_dynren_khr = has(ash::khr::dynamic_rendering::NAME);
-    let has_hdr_meta = has(ash::ext::hdr_metadata::NAME);
-    if has_hdr_meta {
-        device_exts.push(ash::ext::hdr_metadata::NAME.as_ptr());
-    }
-
-    // --- Feature structs (must outlive create_device); build the correct pNext chain ---
-    let force_khr = std::env::var("CUBIC_FORCE_KHR").ok().as_deref() == Some("1");
-
-    let mut feats12 = vk::PhysicalDeviceVulkan12Features {
-        s_type: vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-        ..Default::default()
-    };
-    let mut feats13 = vk::PhysicalDeviceVulkan13Features {
-        s_type: vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-        ..Default::default()
-    };
-    let mut feats_sync2_khr = vk::PhysicalDeviceSynchronization2FeaturesKHR {
-        s_type: vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
-        ..Default::default()
-    };
-    let mut feats_dr_khr = vk::PhysicalDeviceDynamicRenderingFeaturesKHR {
-        s_type: vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
-        ..Default::default()
-    };
-    let mut feats2 = vk::PhysicalDeviceFeatures2 {
-        s_type: vk::StructureType::PHYSICAL_DEVICE_FEATURES_2,
-        ..Default::default()
-    };
-
-    // Enable timeline semaphore
-    feats12.timeline_semaphore = vk::TRUE;
-
-    let (path, pnext): (RenderPath, *const std::ffi::c_void) = if !force_khr {
-        let dev_api = unsafe { instance.get_physical_device_properties(phys).api_version };
-        let maj = vk::api_version_major(dev_api);
-        let min = vk::api_version_minor(dev_api);
-
-        if maj > 1 || (maj == 1 && min >= 3) {
-            // Core 1.3: enable core features only
-            feats13.synchronization2 = vk::TRUE;
-            feats13.dynamic_rendering = vk::TRUE;
-
-            feats12.p_next = (&mut feats13) as *mut _ as *mut _;
-            feats2.p_next = (&mut feats12) as *mut _ as *mut _;
-            (RenderPath::Core13, (&mut feats2) as *mut _ as *const _)
-        } else if has_sync2_khr && has_dynren_khr {
-            // Vulkan 1.2 + KHR
-            device_exts.push(ash::khr::synchronization2::NAME.as_ptr());
-            device_exts.push(ash::khr::dynamic_rendering::NAME.as_ptr());
-
-            feats_sync2_khr.synchronization2 = vk::TRUE;
-            feats_dr_khr.dynamic_rendering = vk::TRUE;
-
-            feats_sync2_khr.p_next = (&mut feats_dr_khr) as *mut _ as *mut _;
-            feats12.p_next = (&mut feats_sync2_khr) as *mut _ as *mut _;
-            feats2.p_next = (&mut feats12) as *mut _ as *mut _;
-            (RenderPath::KhrExt, (&mut feats2) as *mut _ as *const _)
-        } else {
-            (RenderPath::Legacy, std::ptr::null())
-        }
-    } else {
-        // Forced KHR path on 1.3 hardware (for testing)
-        device_exts.push(ash::khr::synchronization2::NAME.as_ptr());
-        device_exts.push(ash::khr::dynamic_rendering::NAME.as_ptr());
-
-        feats_sync2_khr.synchronization2 = vk::TRUE;
-        feats_dr_khr.dynamic_rendering = vk::TRUE;
-
-        feats_sync2_khr.p_next = (&mut feats_dr_khr) as *mut _ as *mut _;
-        feats12.p_next = (&mut feats_sync2_khr) as *mut _ as *mut _;
-        feats2.p_next = (&mut feats12) as *mut _ as *mut _;
-        (RenderPath::KhrExt, (&mut feats2) as *mut _ as *const _)
-    };
-
-    // IMPORTANT: if we’re on Legacy path, bail out BEFORE creating the device
-    if let RenderPath::Legacy = path {
-        return Err(anyhow!(
-            "Dynamic rendering not available on this device; legacy render-pass path not compiled"
-        ));
-    }
-
-    // --- Create device with our queue and the chosen feature chain ---
-    let dinfo = vk::DeviceCreateInfo {
-        s_type: vk::StructureType::DEVICE_CREATE_INFO,
-        p_next: pnext,
-        queue_create_info_count: 1,
-        p_queue_create_infos: &qinfo,
-        enabled_extension_count: device_exts.len() as u32,
-        pp_enabled_extension_names: device_exts.as_ptr(),
-        ..Default::default()
-    };
-
-    let device = unsafe {
-        instance
-            .create_device(phys, &dinfo, None)
-            .context("create_device")?
-    };
-
-    let queue = unsafe { device.get_device_queue(queue_family, 0) };
-    Ok((device, queue, path, has_hdr_meta))
 }
 
 // ORDER NOTE: must be called AFTER creating the (new) swapchain and BEFORE first present.
@@ -961,28 +920,6 @@ fn create_command_resources(
     };
     let bufs = unsafe { device.allocate_command_buffers(&alloc_info)? };
     Ok(CommandResources { pool, bufs })
-}
-
-#[inline]
-fn find_memory_type(
-    instance: &ash::Instance,
-    phys: vk::PhysicalDevice,
-    type_bits: u32,
-    req: vk::MemoryPropertyFlags,
-) -> anyhow::Result<u32> {
-    let mem = unsafe { instance.get_physical_device_memory_properties(phys) };
-
-    for i in 0..mem.memory_type_count {
-        let type_ok = (type_bits & (1 << i)) != 0;
-        let props_ok = mem.memory_types[i as usize].property_flags.contains(req);
-        if type_ok && props_ok {
-            return Ok(i);
-        }
-    }
-
-    Err(anyhow!(
-        "no suitable memory type: type_bits=0x{type_bits:08x}, required_flags={req:?}"
-    ))
 }
 
 fn create_buffer_and_memory(
@@ -1058,46 +995,6 @@ fn create_camera_desc_set_layout(device: &ash::Device) -> Result<vk::DescriptorS
     Ok(unsafe { device.create_descriptor_set_layout(&ci, None)? })
 }
 
-#[inline]
-fn stage_flags2_from_legacy(stage: vk::PipelineStageFlags) -> vk::PipelineStageFlags2 {
-    // Minimal mapping for your usage (COLOR_ATTACHMENT_OUTPUT)
-    vk::PipelineStageFlags2::from_raw(stage.as_raw() as u64)
-}
-
-#[inline]
-fn semaphore_submit_info_wait(
-    sem: vk::Semaphore,
-    value: u64,
-    stage: vk::PipelineStageFlags2,
-) -> vk::SemaphoreSubmitInfo<'static> {
-    vk::SemaphoreSubmitInfo {
-        s_type: vk::StructureType::SEMAPHORE_SUBMIT_INFO,
-        p_next: std::ptr::null(),
-        semaphore: sem,
-        value,
-        stage_mask: stage,
-        device_index: 0,
-        ..Default::default()
-    }
-}
-
-#[inline]
-fn semaphore_submit_info_signal(
-    sem: vk::Semaphore,
-    value: u64,
-    stage: vk::PipelineStageFlags2,
-) -> vk::SemaphoreSubmitInfo<'static> {
-    vk::SemaphoreSubmitInfo {
-        s_type: vk::StructureType::SEMAPHORE_SUBMIT_INFO,
-        p_next: std::ptr::null(),
-        semaphore: sem,
-        value,
-        stage_mask: stage,
-        device_index: 0,
-        ..Default::default()
-    }
-}
-
 fn create_timeline_semaphore(device: &ash::Device, initial: u64) -> Result<vk::Semaphore> {
     let type_ci = vk::SemaphoreTypeCreateInfo {
         s_type: vk::StructureType::SEMAPHORE_TYPE_CREATE_INFO,
@@ -1120,11 +1017,11 @@ fn upload_via_staging(
     device: &ash::Device,
     phys: vk::PhysicalDevice,
     queue: vk::Queue,
-    cmd_pool: vk::CommandPool, // reuse your existing pool
+    cmd_pool: vk::CommandPool,
     dst: vk::Buffer,
     src_data: &[u8],
 ) -> Result<()> {
-    // 1) staging buffer (HOST_VISIBLE|COHERENT)
+    // 1) Create HOST_VISIBLE|COHERENT staging buffer
     let size = src_data.len() as vk::DeviceSize;
     let (staging, staging_mem) = create_buffer_and_memory(
         instance,
@@ -1134,12 +1031,18 @@ fn upload_via_staging(
         vk::BufferUsageFlags::TRANSFER_SRC,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
-    // map + copy
-    let ptr = unsafe { device.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())? };
-    unsafe { std::ptr::copy_nonoverlapping(src_data.as_ptr(), ptr as *mut u8, src_data.len()) };
+
+    // Map + copy into staging
+    let mapped = unsafe {
+        std::slice::from_raw_parts_mut(
+            device.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8,
+            src_data.len(),
+        )
+    };
+    mapped.copy_from_slice(src_data);
     unsafe { device.unmap_memory(staging_mem) };
 
-    // 2) record one-time copy cmd
+    // 2) One-time copy staging -> dst
     let ai = vk::CommandBufferAllocateInfo {
         s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
         command_pool: cmd_pool,
@@ -1162,7 +1065,7 @@ fn upload_via_staging(
     unsafe { device.cmd_copy_buffer(cmd, staging, dst, std::slice::from_ref(&region)) };
     unsafe { device.end_command_buffer(cmd)? };
 
-    // 3) submit and wait
+    // 3) Submit + wait
     let si = vk::SubmitInfo {
         s_type: vk::StructureType::SUBMIT_INFO,
         command_buffer_count: 1,
@@ -1174,11 +1077,10 @@ fn upload_via_staging(
     unsafe { device.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)? };
     unsafe { device.destroy_fence(fence, None) };
 
-    // 4) cleanup staging + temp cmd
+    // 4) Cleanup
     unsafe { device.free_command_buffers(cmd_pool, std::slice::from_ref(&cmd)) };
     unsafe { device.destroy_buffer(staging, None) };
     unsafe { device.free_memory(staging_mem, None) };
-
     Ok(())
 }
 
@@ -1220,6 +1122,7 @@ fn create_frame_uniforms_and_sets(
     Vec<vk::Buffer>,
     Vec<vk::DeviceMemory>,
     Vec<*mut std::ffi::c_void>,
+    vk::DeviceSize,
     vk::DescriptorPool,
     Vec<vk::DescriptorSet>,
 )> {
@@ -1227,19 +1130,18 @@ fn create_frame_uniforms_and_sets(
     let a = limits.min_uniform_buffer_offset_alignment.max(1);
     let ubo_size = ((std::mem::size_of::<CameraUbo>() as u64 + a - 1) / a) * a;
 
-    // 1) Make UBOs
     let mut ubufs = Vec::with_capacity(image_count);
     let mut umems = Vec::with_capacity(image_count);
-    let mut umaps = Vec::with_capacity(image_count);
+    let mut ubo_ptrs = Vec::with_capacity(image_count);
+
     for _ in 0..image_count {
         let (b, m) = create_host_visible_ubo(instance, device, phys, ubo_size)?;
         let ptr = unsafe { device.map_memory(m, 0, ubo_size, vk::MemoryMapFlags::empty())? };
         ubufs.push(b);
         umems.push(m);
-        umaps.push(ptr);
+        ubo_ptrs.push(ptr);
     }
 
-    // 2) Pool
     let pool_sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::UNIFORM_BUFFER,
         descriptor_count: image_count as u32,
@@ -1247,13 +1149,12 @@ fn create_frame_uniforms_and_sets(
     let pool_ci = vk::DescriptorPoolCreateInfo {
         s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
         max_sets: image_count as u32,
-        pool_size_count: pool_sizes.len() as u32,
+        pool_size_count: 1,
         p_pool_sizes: pool_sizes.as_ptr(),
         ..Default::default()
     };
     let pool = unsafe { device.create_descriptor_pool(&pool_ci, None)? };
 
-    // 3) Allocate sets
     let layouts = vec![set_layout; image_count];
     let alloc = vk::DescriptorSetAllocateInfo {
         s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1264,7 +1165,6 @@ fn create_frame_uniforms_and_sets(
     };
     let sets = unsafe { device.allocate_descriptor_sets(&alloc)? };
 
-    // 4) Write buffer bindings
     let mut writes = Vec::with_capacity(image_count);
     let mut infos: Vec<vk::DescriptorBufferInfo> = Vec::with_capacity(image_count);
     for i in 0..image_count {
@@ -1285,25 +1185,7 @@ fn create_frame_uniforms_and_sets(
     }
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-    Ok((ubufs, umems, umaps, pool, sets))
-}
-
-#[inline]
-fn is_swapchain_out_of_date(e: vk::Result) -> bool {
-    matches!(
-        e,
-        vk::Result::ERROR_OUT_OF_DATE_KHR | vk::Result::SUBOPTIMAL_KHR
-    )
-}
-
-#[inline]
-fn is_surface_lost(e: vk::Result) -> bool {
-    e == vk::Result::ERROR_SURFACE_LOST_KHR
-}
-
-#[inline]
-fn is_device_lost(e: vk::Result) -> bool {
-    e == vk::Result::ERROR_DEVICE_LOST
+    Ok((ubufs, umems, ubo_ptrs, ubo_size, pool, sets))
 }
 
 fn recreate_surface(
@@ -1472,20 +1354,167 @@ fn make_color_view(
     let sub = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
         base_mip_level: 0,
-        level_count: 1, // or vk::REMAINING_MIP_LEVELS
+        level_count: 1,
         base_array_layer: 0,
-        layer_count: 1, // or vk::REMAINING_ARRAY_LAYERS for arrays
+        layer_count: 1,
     };
     let iv = vk::ImageViewCreateInfo {
         s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
         image,
         view_type: vk::ImageViewType::TYPE_2D,
         format,
-        components: vk::ComponentMapping::default(), // identity swizzle
+        components: vk::ComponentMapping::default(),
         subresource_range: sub,
         ..Default::default()
     };
     Ok(unsafe { device.create_image_view(&iv, None)? })
+}
+
+// 9) BIG BAD IMPORTANT STUFF
+fn decide_path_and_create_device(
+    _entry: &ash::Entry,
+    instance: &ash::Instance,
+    phys: vk::PhysicalDevice,
+    queue_family: u32,
+) -> Result<(
+    ash::Device,
+    vk::Queue,
+    RenderPath,
+    bool, /*has_hdr_metadata*/
+)> {
+    // STRICT ORDER (feature pNext chain):
+    // Core 1.3 path: feats13 -> chained after feats12 -> chained after feats2
+    // KHR path:      feats_sync2_khr -> feats_dr_khr -> feats12 -> feats2
+    // DO NOT MIX core 1.3 structs with KHR equivalents in the same chain.
+    // Wrong chain = undefined features; validation won't always catch it.
+
+    // --- Queue we want on this device ---
+    let priorities = [1.0_f32];
+    let qinfo = vk::DeviceQueueCreateInfo {
+        s_type: vk::StructureType::DEVICE_QUEUE_CREATE_INFO,
+        queue_family_index: queue_family,
+        queue_count: 1,
+        p_queue_priorities: priorities.as_ptr(),
+        ..Default::default()
+    };
+
+    // --- One shot device extension query ---
+    let ext_props = unsafe {
+        instance
+            .enumerate_device_extension_properties(phys)
+            .context("enumerate_device_extension_properties(device)")?
+    };
+    let has = unsafe {
+        |name: &std::ffi::CStr| -> bool {
+            ext_props
+                .iter()
+                .any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == name)
+        }
+    };
+
+    let mut device_exts: Vec<*const i8> = vec![swapchain::NAME.as_ptr()];
+    let has_sync2_khr = has(ash::khr::synchronization2::NAME);
+    let has_dynren_khr = has(ash::khr::dynamic_rendering::NAME);
+    let has_hdr_meta = has(ash::ext::hdr_metadata::NAME);
+    if has_hdr_meta {
+        device_exts.push(ash::ext::hdr_metadata::NAME.as_ptr());
+    }
+
+    // --- Feature structs (must outlive create_device); build the correct pNext chain ---
+    let force_khr = std::env::var("CUBIC_FORCE_KHR").ok().as_deref() == Some("1");
+
+    let mut feats12 = vk::PhysicalDeviceVulkan12Features {
+        s_type: vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+        ..Default::default()
+    };
+    let mut feats13 = vk::PhysicalDeviceVulkan13Features {
+        s_type: vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+        ..Default::default()
+    };
+    let mut feats_sync2_khr = vk::PhysicalDeviceSynchronization2FeaturesKHR {
+        s_type: vk::StructureType::PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES_KHR,
+        ..Default::default()
+    };
+    let mut feats_dr_khr = vk::PhysicalDeviceDynamicRenderingFeaturesKHR {
+        s_type: vk::StructureType::PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR,
+        ..Default::default()
+    };
+    let mut feats2 = vk::PhysicalDeviceFeatures2 {
+        s_type: vk::StructureType::PHYSICAL_DEVICE_FEATURES_2,
+        ..Default::default()
+    };
+
+    // Enable timeline semaphore
+    feats12.timeline_semaphore = vk::TRUE;
+
+    let (path, pnext): (RenderPath, *const std::ffi::c_void) = if !force_khr {
+        let dev_api = unsafe { instance.get_physical_device_properties(phys).api_version };
+        let maj = vk::api_version_major(dev_api);
+        let min = vk::api_version_minor(dev_api);
+
+        if maj > 1 || (maj == 1 && min >= 3) {
+            // Core 1.3: enable core features only
+            feats13.synchronization2 = vk::TRUE;
+            feats13.dynamic_rendering = vk::TRUE;
+
+            feats12.p_next = (&mut feats13) as *mut _ as *mut _;
+            feats2.p_next = (&mut feats12) as *mut _ as *mut _;
+            (RenderPath::Core13, (&mut feats2) as *mut _ as *const _)
+        } else if has_sync2_khr && has_dynren_khr {
+            // Vulkan 1.2 + KHR
+            device_exts.push(ash::khr::synchronization2::NAME.as_ptr());
+            device_exts.push(ash::khr::dynamic_rendering::NAME.as_ptr());
+
+            feats_sync2_khr.synchronization2 = vk::TRUE;
+            feats_dr_khr.dynamic_rendering = vk::TRUE;
+
+            feats_sync2_khr.p_next = (&mut feats_dr_khr) as *mut _ as *mut _;
+            feats12.p_next = (&mut feats_sync2_khr) as *mut _ as *mut _;
+            feats2.p_next = (&mut feats12) as *mut _ as *mut _;
+            (RenderPath::KhrExt, (&mut feats2) as *mut _ as *const _)
+        } else {
+            (RenderPath::Legacy, std::ptr::null())
+        }
+    } else {
+        // Forced KHR path on 1.3 hardware (for testing)
+        device_exts.push(ash::khr::synchronization2::NAME.as_ptr());
+        device_exts.push(ash::khr::dynamic_rendering::NAME.as_ptr());
+
+        feats_sync2_khr.synchronization2 = vk::TRUE;
+        feats_dr_khr.dynamic_rendering = vk::TRUE;
+
+        feats_sync2_khr.p_next = (&mut feats_dr_khr) as *mut _ as *mut _;
+        feats12.p_next = (&mut feats_sync2_khr) as *mut _ as *mut _;
+        feats2.p_next = (&mut feats12) as *mut _ as *mut _;
+        (RenderPath::KhrExt, (&mut feats2) as *mut _ as *const _)
+    };
+
+    // IMPORTANT: if we’re on Legacy path, bail out BEFORE creating the device
+    if let RenderPath::Legacy = path {
+        return Err(anyhow!(
+            "Dynamic rendering not available on this device; legacy render-pass path not compiled"
+        ));
+    }
+
+    // --- Create device with our queue and the chosen feature chain ---
+    let dinfo = vk::DeviceCreateInfo {
+        s_type: vk::StructureType::DEVICE_CREATE_INFO,
+        p_next: pnext,
+        queue_create_info_count: 1,
+        p_queue_create_infos: &qinfo,
+        enabled_extension_count: device_exts.len() as u32,
+        pp_enabled_extension_names: device_exts.as_ptr(),
+        ..Default::default()
+    };
+
+    let device = unsafe {
+        instance
+            .create_device(phys, &dinfo, None)
+            .context("create_device")?
+    };
+
+    let queue = unsafe { device.get_device_queue(queue_family, 0) };
+    Ok((device, queue, path, has_hdr_meta))
 }
 
 fn create_swapchain_bundle(
@@ -1617,17 +1646,6 @@ fn create_swapchain_bundle(
     })
 }
 
-#[inline]
-fn load_spv_file(path: &Path) -> Result<Vec<u32>> {
-    let bytes = fs::read(path).with_context(|| format!("read {:?}", path))?;
-    read_spv(&mut Cursor::new(&bytes[..])).with_context(|| format!("read_spv {:?}", path))
-}
-
-#[inline]
-fn load_spv_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
-    read_spv(&mut Cursor::new(bytes)).context("read_spv from embedded bytes")
-}
-
 fn create_pipeline(
     device: &ash::Device,
     cache: vk::PipelineCache,
@@ -1735,7 +1753,7 @@ fn create_pipeline(
         topology: vk::PrimitiveTopology::TRIANGLE_LIST,
         ..Default::default()
     };
-    // Dynamic state (viewport/scissor set later)
+    // Dynamic state
     let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
     let dynamic_state = vk::PipelineDynamicStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_DYNAMIC_STATE_CREATE_INFO,
@@ -1842,15 +1860,6 @@ fn create_pipeline(
     Ok((layout, pipelines[0]))
 }
 
-#[inline]
-fn slice_as_bytes<T>(s: &[T]) -> &[u8] {
-    // SAFETY: Caller must ensure T has no padding/invalid bit patterns when reinterpreted as bytes.
-    // Here we only use it for Vertex (repr(C), plain floats) and u32 indices.
-    unsafe {
-        std::slice::from_raw_parts(s.as_ptr() as *const u8, s.len() * std::mem::size_of::<T>())
-    }
-}
-
 fn build_renderer(
     window: &dyn HasWindowHandle,
     display: &dyn HasDisplayHandle,
@@ -1894,17 +1903,22 @@ fn build_renderer(
     let shader_dev = {
         if let Ok(dir) = std::env::var("CUBIC_SHADER_DIR") {
             let dir = PathBuf::from(dir);
-            let vp = dir.join("tri.vert.glsl");
-            let fp = dir.join("tri.frag.glsl");
+            let vp = dir.join("tri.vert.spv");
+            let fp = dir.join("tri.frag.spv");
             if vp.exists() && fp.exists() {
-                let vm = fs::metadata(&vp)?.modified()?;
-                let fm = fs::metadata(&fp)?.modified()?;
-                Some(ShaderDev {
-                    vert_path: vp,
-                    frag_path: fp,
-                    vert_mtime: vm,
-                    frag_mtime: fm,
-                })
+                if let (Ok(vm), Ok(fm)) = (
+                    fs::metadata(&vp).and_then(|m| m.modified()),
+                    fs::metadata(&fp).and_then(|m| m.modified()),
+                ) {
+                    Some(ShaderDev {
+                        vert_spv: vp,
+                        frag_spv: fp,
+                        vert_mtime: vm,
+                        frag_mtime: fm,
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -1936,7 +1950,7 @@ fn build_renderer(
     let (depth_image, depth_mem, depth_view) =
         create_depth_resources(&instance, &device, phys, sc.extent, depth_format)?;
 
-    let (ubufs, umems, umaps, desc_pool, desc_sets) = create_frame_uniforms_and_sets(
+    let (ubufs, umems, ubo_ptrs, ubo_size, desc_pool, desc_sets) = create_frame_uniforms_and_sets(
         &instance,
         &device,
         phys,
@@ -1967,8 +1981,8 @@ fn build_renderer(
     )?;
 
     // Upload via staging
-    let vbytes = slice_as_bytes(TRI_VERTS);
-    let ibytes = slice_as_bytes(TRI_IDXS);
+    let vbytes = bytemuck::cast_slice(TRI_VERTS);
+    let ibytes = bytemuck::cast_slice(TRI_IDXS);
 
     upload_via_staging(&instance, &device, phys, queue, cmd.pool, vbuf, vbytes)?;
     upload_via_staging(&instance, &device, phys, queue, cmd.pool, ibuf, ibytes)?;
@@ -2025,7 +2039,8 @@ fn build_renderer(
         desc_sets,
         ubufs,
         umems,
-        umaps,
+        ubo_ptrs,
+        ubo_size,
         pipeline_cache,
         timeline,
         timeline_value,
@@ -2094,8 +2109,8 @@ impl VkRenderer {
             return Ok(());
         };
 
-        let vm = fs::metadata(&dev.vert_path).and_then(|m| m.modified()).ok();
-        let fm = fs::metadata(&dev.frag_path).and_then(|m| m.modified()).ok();
+        let vm = fs::metadata(&dev.vert_spv).and_then(|m| m.modified()).ok();
+        let fm = fs::metadata(&dev.frag_spv).and_then(|m| m.modified()).ok();
 
         let vert_changed = vm.is_some() && vm.unwrap() > dev.vert_mtime;
         let frag_changed = fm.is_some() && fm.unwrap() > dev.frag_mtime;
@@ -2104,8 +2119,9 @@ impl VkRenderer {
             return Ok(());
         }
 
-        info!("vk: shader change detected → rebuilding pipeline");
-        // Update mtimes first (so a failed compile won’t loop forever—but we still log errors)
+        tracing::info!("vk: .spv change detected → rebuilding pipeline");
+
+        // Update mtimes first to avoid tight loops if rebuild fails.
         if let Some(t) = vm {
             dev.vert_mtime = t;
         }
@@ -2113,10 +2129,12 @@ impl VkRenderer {
             dev.frag_mtime = t;
         }
 
-        // Idle to safely swap pipelines (simple & safe for now)
-        unsafe { self.device.device_wait_idle().ok() };
+        // Ensure no in-flight use of old pipeline while swapping.
+        unsafe {
+            self.device.device_wait_idle().ok();
+        }
 
-        // Build new pipeline with current formats/layouts
+        // Rebuild using the same loader (it prefers CUBIC_SHADER_DIR/*.spv if present)
         let (new_layout, new_pipeline) = create_pipeline(
             &self.device,
             self.pipeline_cache,
@@ -2126,16 +2144,15 @@ impl VkRenderer {
             self.desc_set_layout,
         )?;
 
-        // Swap in
-        unsafe { self.device.destroy_pipeline(self.pipeline, None) };
         unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
             self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None)
-        };
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+        }
         self.pipeline_layout = new_layout;
         self.pipeline = new_pipeline;
 
-        // Re-record command buffers (bind point changed)
+        // Re-record CBs because pipeline handle changed.
         self.record_commands()?;
         Ok(())
     }
@@ -2151,13 +2168,19 @@ impl VkRenderer {
         }
     }
 
-    fn update_camera_ubo_for_image(&self, image_index: usize, data: &CameraUbo) -> Result<()> {
+    fn update_camera_ubo_for_image(
+        &self,
+        image_index: usize,
+        data: &CameraUbo,
+    ) -> anyhow::Result<()> {
+        let dst = self.ubo_ptrs[image_index];
+        if dst.is_null() {
+            return Err(anyhow::anyhow!("UBO memory not mapped"));
+        }
+        let src = bytemuck::bytes_of(data);
+
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                data as *const _ as *const u8,
-                self.umaps[image_index] as *mut u8,
-                std::mem::size_of::<CameraUbo>(),
-            );
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len());
         }
         Ok(())
     }
@@ -2397,7 +2420,7 @@ impl VkRenderer {
         Ok(())
     }
 
-    // --- Public-ish: record all per-swapchain-image CBs ----------------------
+    // --- Record all per-swapchain-image CBs ----------------------
     fn record_commands(&mut self) -> Result<()> {
         for (i, &cmd) in self.cmd_bufs.iter().enumerate() {
             self.record_one_command(cmd, self.images[i], self.image_views[i], i)?;
@@ -2447,6 +2470,16 @@ impl VkRenderer {
         self.frames.clear();
 
         // 3b) Destroy per-image UBOs + descriptor pool tied to OLD swapchain
+        for (i, &m) in self.umems.iter().enumerate() {
+            let p = self
+                .ubo_ptrs
+                .get(i)
+                .copied()
+                .unwrap_or(std::ptr::null_mut());
+            if !p.is_null() {
+                unsafe { self.device.unmap_memory(m) };
+            }
+        }
         for &b in &self.ubufs {
             unsafe { self.device.destroy_buffer(b, None) };
         }
@@ -2455,12 +2488,13 @@ impl VkRenderer {
         }
         self.ubufs.clear();
         self.umems.clear();
+        self.ubo_ptrs.clear();
+        self.ubo_size = 0;
 
         if self.desc_pool != vk::DescriptorPool::null() {
             unsafe { self.device.destroy_descriptor_pool(self.desc_pool, None) };
             self.desc_pool = vk::DescriptorPool::null();
         }
-        // NOTE: keep self.desc_set_layout (it’s swapchain-agnostic and used by the pipeline layout)
         self.desc_sets.clear();
 
         // 4a) cfg for new swapchain (hdr/vsync/flavor/extent)
@@ -2528,18 +2562,20 @@ impl VkRenderer {
         self.depth_view = dview;
 
         // 5) Recreate per-image UBOs + descriptor sets
-        let (ubufs, umems, umaps, pool, sets) = create_frame_uniforms_and_sets(
-            &self.instance,
-            &self.device,
-            self.phys,
-            self.desc_set_layout,
-            self.images.len(),
-        )?;
+        let (ubufs, umems, ubo_ptrs, ubo_size, desc_pool, desc_sets) =
+            create_frame_uniforms_and_sets(
+                &self.instance,
+                &self.device,
+                self.phys,
+                self.desc_set_layout,
+                self.images.len(),
+            )?;
         self.ubufs = ubufs;
         self.umems = umems;
-        self.umaps = umaps;
-        self.desc_pool = pool;
-        self.desc_sets = sets;
+        self.ubo_ptrs = ubo_ptrs;
+        self.ubo_size = ubo_size;
+        self.desc_pool = desc_pool;
+        self.desc_sets = desc_sets;
 
         // 5b) Recreate per-image sync
         let image_count = self.images.len();
@@ -2635,7 +2671,6 @@ impl Renderer for VkRenderer {
         self.paused = false;
 
         // Try to recreate the swapchain; if the surface was lost, rebuild it once and retry
-
         match self.recreate_swapchain(size) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -2735,11 +2770,33 @@ impl Renderer for VkRenderer {
             // same match arms…
             Ok(pair) => pair,
             Err(e) if is_swapchain_out_of_date(e) => {
-                /* … */
+                self.backoff_frames = 2;
+                let want = RenderSize {
+                    width: caps.current_extent.width,
+                    height: caps.current_extent.height,
+                };
+                let _ = self.recreate_swapchain(want);
                 return Ok(());
             }
             Err(e) if is_surface_lost(e) => {
-                /* … */
+                self.backoff_frames = 2;
+                let entry = Entry::linked();
+                if let Ok(_) = recreate_surface(
+                    &entry,
+                    &self.instance,
+                    &self.surface_loader,
+                    &mut self.surface,
+                    self.display_raw,
+                    self.window_raw,
+                ) {
+                    let want = RenderSize {
+                        width: caps.current_extent.width,
+                        height: caps.current_extent.height,
+                    };
+                    let _ = self.recreate_swapchain(want);
+                } else {
+                    self.paused = true;
+                }
                 return Ok(());
             }
             Err(e) if is_device_lost(e) => return Err(anyhow!("vk: device lost during acquire")),
@@ -2749,14 +2806,13 @@ impl Renderer for VkRenderer {
         let img = image_index as usize;
         let f_img = &self.frames[img];
         let cmd = self.cmd_bufs[img];
-        let mvp = Self::make_identity_mvp(); // later: fill from real camera matrices
+        let mvp = Self::make_identity_mvp();
 
         self.update_camera_ubo_for_image(img, &mvp)?;
 
         // 2) Submit (wait on acquire sem; signal render-finished; bump timeline)
         let next_value = self.timeline_value.wrapping_add(1);
 
-        // legacy -> sync2 stage mask you already have
         let stage_color = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT;
         let stage2_color = stage_flags2_from_legacy(stage_color);
 
@@ -2822,8 +2878,36 @@ impl Renderer for VkRenderer {
 
         match unsafe { self.swapchain_loader.queue_present(self.queue, &present) } {
             Ok(_) => {}
-            Err(e) if is_swapchain_out_of_date(e) => { /* … */ }
-            Err(e) if is_surface_lost(e) => { /* … */ }
+            Err(e) if is_swapchain_out_of_date(e) => {
+                self.backoff_frames = 2;
+                let want = RenderSize {
+                    width: caps.current_extent.width,
+                    height: caps.current_extent.height,
+                };
+                let _ = self.recreate_swapchain(want);
+                return Ok(());
+            }
+            Err(e) if is_surface_lost(e) => {
+                self.backoff_frames = 2;
+                let entry = Entry::linked();
+                if let Ok(_) = recreate_surface(
+                    &entry,
+                    &self.instance,
+                    &self.surface_loader,
+                    &mut self.surface,
+                    self.display_raw,
+                    self.window_raw,
+                ) {
+                    let want = RenderSize {
+                        width: caps.current_extent.width,
+                        height: caps.current_extent.height,
+                    };
+                    let _ = self.recreate_swapchain(want);
+                } else {
+                    self.paused = true;
+                }
+                return Ok(());
+            }
             Err(e) if is_device_lost(e) => return Err(anyhow!("vk: device lost during present")),
             Err(e) => return Err(anyhow!("queue_present: {e:?}")),
         }

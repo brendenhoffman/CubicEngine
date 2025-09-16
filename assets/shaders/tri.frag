@@ -4,5 +4,5 @@ layout(location=0) out vec4 outColor;
 
 void main() {
     // RGB → GRB so colors visibly “rotate”
-    outColor = vec4(vColor.g, vColor.r, vColor.b, 1.0);
+    outColor = vec4(vColor.b, vColor.g, vColor.r, 1.0);
 }
