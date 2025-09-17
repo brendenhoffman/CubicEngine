@@ -1,8 +1,12 @@
-#version 450
-layout(location=0) in vec3 vColor;
-layout(location=0) out vec4 outColor;
+#version 460
+
+layout(location = 0) in vec3 v_color;
+layout(location = 1) in vec2 v_uv;
+
+layout(set = 1, binding = 0) uniform sampler2D tex0;
+
+layout(location = 0) out vec4 outColor;
 
 void main() {
-    // RGB → GRB so colors visibly “rotate”
-    outColor = vec4(vColor.b, vColor.g, vColor.r, 1.0);
+    outColor = texture(tex0, v_uv);
 }

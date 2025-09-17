@@ -15,24 +15,44 @@ use std::{fs, path::Path, path::PathBuf};
 use tracing::info;
 
 // 1) Public api / constants
+const UV_TILE: f32 = 1.0;
+
 const TRI_VERTS: &[Vertex] = &[
-    // index 0: top (red)
+    // FRONT triangle (closer)
     Vertex {
-        pos: [0.0, 0.6, 0.0],
-        color: [1.0, 0.0, 0.0],
+        pos: [0.0, 0.5, -0.988],
+        color: [1.0, 0.2, 0.2],
+        uv: [0.5 * UV_TILE, 1.0 * UV_TILE], // top
     },
-    // index 1: left (green)
     Vertex {
-        pos: [-0.5, -0.4, 0.0],
-        color: [0.0, 1.0, 0.0],
+        pos: [-0.3, -0.4, -0.788],
+        color: [1.0, 0.2, 0.2],
+        uv: [0.0 * UV_TILE, 0.0 * UV_TILE], // bottom-left
     },
-    // index 2: right (blue)
     Vertex {
-        pos: [0.5, -0.4, 0.0],
-        color: [0.0, 0.0, 1.0],
+        pos: [0.3, -0.4, -0.788],
+        color: [1.0, 0.2, 0.2],
+        uv: [1.0 * UV_TILE, 0.0 * UV_TILE], // bottom-right
+    },
+    // BACK triangle (farther)
+    Vertex {
+        pos: [0.0, 0.4, -0.888],
+        color: [0.2, 0.8, 1.0],
+        uv: [0.5 * UV_TILE, 1.0 * UV_TILE], // top
+    },
+    Vertex {
+        pos: [-0.5, -0.4, -0.888],
+        color: [0.2, 0.8, 1.0],
+        uv: [0.0 * UV_TILE, 0.0 * UV_TILE], // bottom-left
+    },
+    Vertex {
+        pos: [0.5, -0.4, -0.888],
+        color: [0.2, 0.8, 1.0],
+        uv: [1.0 * UV_TILE, 0.0 * UV_TILE], // bottom-right
     },
 ];
-const TRI_IDXS: &[u32] = &[0, 1, 2];
+
+const TRI_IDXS: &[u32] = &[0, 1, 2, 3, 4, 5];
 
 #[derive(Clone, Copy, Debug)]
 pub enum VkVsyncMode {
@@ -148,7 +168,8 @@ pub struct VkRenderer {
     ibuf_mem: vk::DeviceMemory,
     index_count: u32,
     desc_pool: vk::DescriptorPool,
-    desc_set_layout: vk::DescriptorSetLayout,
+    desc_set_layout_camera: vk::DescriptorSetLayout,
+    desc_set_layout_material: vk::DescriptorSetLayout,
     desc_sets: Vec<vk::DescriptorSet>,
     ubufs: Vec<vk::Buffer>,
     umems: Vec<vk::DeviceMemory>,
@@ -162,6 +183,12 @@ pub struct VkRenderer {
     backoff_frames: u32,
     #[cfg(debug_assertions)]
     shader_dev: Option<ShaderDev>,
+    material_desc_pool: vk::DescriptorPool,
+    material_desc_set: vk::DescriptorSet,
+    tex_image: vk::Image,
+    tex_mem: vk::DeviceMemory,
+    tex_view: vk::ImageView,
+    tex_sampler: vk::Sampler,
 }
 
 // STRICT TEARDOWN ORDER:
@@ -267,9 +294,21 @@ impl Drop for VkRenderer {
             if self.desc_pool != vk::DescriptorPool::null() {
                 d.destroy_descriptor_pool(self.desc_pool, None);
             }
-            if self.desc_set_layout != vk::DescriptorSetLayout::null() {
-                d.destroy_descriptor_set_layout(self.desc_set_layout, None);
+            if self.desc_set_layout_material != vk::DescriptorSetLayout::null() {
+                d.destroy_descriptor_set_layout(self.desc_set_layout_material, None);
             }
+            if self.desc_set_layout_camera != vk::DescriptorSetLayout::null() {
+                d.destroy_descriptor_set_layout(self.desc_set_layout_camera, None);
+            }
+
+            // Material descriptor pool (set is freed with pool)
+            d.destroy_descriptor_pool(self.material_desc_pool, None);
+
+            // Texture + sampler
+            d.destroy_sampler(self.tex_sampler, None);
+            d.destroy_image_view(self.tex_view, None);
+            d.destroy_image(self.tex_image, None);
+            d.free_memory(self.tex_mem, None);
 
             // Save and destroy pipeline cache
             let props = self.instance.get_physical_device_properties(self.phys);
@@ -331,6 +370,14 @@ struct CameraUbo {
 struct Vertex {
     pos: [f32; 3],
     color: [f32; 3],
+    uv: [f32; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Zeroable, Pod)]
+struct PushData {
+    model: [[f32; 4]; 4],
+    tint: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -419,8 +466,20 @@ fn find_memory_type(
 
 #[inline]
 fn stage_flags2_from_legacy(stage: vk::PipelineStageFlags) -> vk::PipelineStageFlags2 {
-    // Minimal mapping for your usage (COLOR_ATTACHMENT_OUTPUT)
-    vk::PipelineStageFlags2::from_raw(stage.as_raw() as u64)
+    let mut out = vk::PipelineStageFlags2::empty();
+    if stage.contains(vk::PipelineStageFlags::TOP_OF_PIPE) {
+        out |= vk::PipelineStageFlags2::TOP_OF_PIPE;
+    }
+    if stage.contains(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT) {
+        out |= vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
+    }
+    if stage.contains(vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS) {
+        out |= vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS;
+    }
+    if stage.contains(vk::PipelineStageFlags::LATE_FRAGMENT_TESTS) {
+        out |= vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+    }
+    out
 }
 
 #[inline]
@@ -555,6 +614,79 @@ fn extent_from_caps(caps: &vk::SurfaceCapabilitiesKHR, want: RenderSize) -> vk::
                 .clamp(caps.min_image_extent.height, caps.max_image_extent.height),
         }
     }
+}
+#[inline]
+fn depth_aspect_mask(format: vk::Format) -> vk::ImageAspectFlags {
+    let mut aspect = vk::ImageAspectFlags::DEPTH;
+    if has_stencil(format) {
+        aspect |= vk::ImageAspectFlags::STENCIL;
+    }
+    aspect
+}
+
+#[inline]
+fn depth_attachment_layout(format: vk::Format) -> vk::ImageLayout {
+    if has_stencil(format) {
+        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+    } else {
+        vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL
+    }
+}
+
+#[inline]
+fn transition_color_to_transfer_dst(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    mips: u32,
+) {
+    let sub = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: mips,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    transition_image_layout2(
+        device,
+        cmd,
+        image,
+        sub,
+        vk::PipelineStageFlags2::TOP_OF_PIPE,
+        vk::AccessFlags2::empty(),
+        vk::ImageLayout::UNDEFINED,
+        vk::PipelineStageFlags2::TRANSFER,
+        vk::AccessFlags2::TRANSFER_WRITE,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    );
+}
+
+#[inline]
+fn transition_color_to_shader_read(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    mips: u32,
+) {
+    let sub = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: mips,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    transition_image_layout2(
+        device,
+        cmd,
+        image,
+        sub,
+        vk::PipelineStageFlags2::TRANSFER,
+        vk::AccessFlags2::TRANSFER_WRITE,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_READ,
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    );
 }
 // END Inline helper functions
 
@@ -1218,7 +1350,8 @@ fn make_initial_swapchain_resources(
     has_hdr_meta: bool,
     pipeline_cache: vk::PipelineCache,
     depth_format: vk::Format,
-    desc_set_layout: vk::DescriptorSetLayout,
+    desc_set_layout_camera: vk::DescriptorSetLayout,
+    desc_set_layout_material: vk::DescriptorSetLayout,
 ) -> Result<(
     SwapchainBundle,
     CommandResources,
@@ -1252,7 +1385,8 @@ fn make_initial_swapchain_resources(
         bundle.format,
         depth_format,
         bundle.extent,
-        desc_set_layout,
+        desc_set_layout_camera,
+        desc_set_layout_material,
     )?;
     let (acq, frames) = create_sync_objects(device, image_count)?;
     Ok((bundle, cmds, pipe, acq, frames))
@@ -1369,6 +1503,326 @@ fn make_color_view(
     };
     Ok(unsafe { device.create_image_view(&iv, None)? })
 }
+
+fn create_material_desc_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
+    // set = 1, binding = 0  (convention; set index is decided by pipeline layout order)
+    let binding = vk::DescriptorSetLayoutBinding {
+        binding: 0,
+        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        descriptor_count: 1,
+        stage_flags: vk::ShaderStageFlags::FRAGMENT,
+        ..Default::default()
+    };
+    let ci = vk::DescriptorSetLayoutCreateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        binding_count: 1,
+        p_bindings: &binding,
+        ..Default::default()
+    };
+    Ok(unsafe { device.create_descriptor_set_layout(&ci, None)? })
+}
+
+fn create_image_and_memory(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    phys: vk::PhysicalDevice,
+    extent: vk::Extent2D,
+    mip_levels: u32,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags, // e.g. TRANSFER_DST | SAMPLED
+    tiling: vk::ImageTiling,    // usually OPTIMAL
+) -> Result<(vk::Image, vk::DeviceMemory)> {
+    let ci = vk::ImageCreateInfo {
+        s_type: vk::StructureType::IMAGE_CREATE_INFO,
+        image_type: vk::ImageType::TYPE_2D,
+        format,
+        extent: vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        },
+        mip_levels,
+        array_layers: 1,
+        samples: vk::SampleCountFlags::TYPE_1,
+        tiling,
+        usage,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        ..Default::default()
+    };
+    let image = unsafe { device.create_image(&ci, None) }
+        .with_context(|| format!("create_image fmt={format:?} extent={:?}", extent))?;
+
+    let req = unsafe { device.get_image_memory_requirements(image) };
+    let mem_type_idx = find_memory_type(
+        instance,
+        phys,
+        req.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+    let ai = vk::MemoryAllocateInfo {
+        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
+        allocation_size: req.size,
+        memory_type_index: mem_type_idx,
+        ..Default::default()
+    };
+    let mem = unsafe { device.allocate_memory(&ai, None) }
+        .with_context(|| format!("allocate_memory (image) size={}", req.size))?;
+    unsafe { device.bind_image_memory(image, mem, 0) }?;
+    Ok((image, mem))
+}
+
+fn make_image_view_2d_color(
+    device: &ash::Device,
+    image: vk::Image,
+    format: vk::Format,
+    base_mip_level: u32,
+    level_count: u32,
+) -> Result<vk::ImageView> {
+    let sub = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level,
+        level_count,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let ci = vk::ImageViewCreateInfo {
+        s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+        image,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format,
+        components: vk::ComponentMapping::default(),
+        subresource_range: sub,
+        ..Default::default()
+    };
+    Ok(unsafe { device.create_image_view(&ci, None)? })
+}
+
+// sync2 layout transition (generic helper)
+fn transition_image_layout2(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    sub: vk::ImageSubresourceRange,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    old_layout: vk::ImageLayout,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+    new_layout: vk::ImageLayout,
+) {
+    let b = vk::ImageMemoryBarrier2 {
+        s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
+        src_stage_mask: src_stage,
+        src_access_mask: src_access,
+        dst_stage_mask: dst_stage,
+        dst_access_mask: dst_access,
+        old_layout,
+        new_layout,
+        image,
+        subresource_range: sub,
+        ..Default::default()
+    };
+    let dep = vk::DependencyInfo {
+        s_type: vk::StructureType::DEPENDENCY_INFO,
+        image_memory_barrier_count: 1,
+        p_image_memory_barriers: &b,
+        ..Default::default()
+    };
+    unsafe { device.cmd_pipeline_barrier2(cmd, &dep) };
+}
+
+fn copy_buffer_to_image(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    buffer: vk::Buffer,
+    image: vk::Image,
+    extent: vk::Extent2D,
+) {
+    let sub = vk::ImageSubresourceLayers {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        mip_level: 0,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let region = vk::BufferImageCopy {
+        buffer_offset: 0,
+        buffer_row_length: 0,   // tightly packed
+        buffer_image_height: 0, // tightly packed
+        image_subresource: sub,
+        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        image_extent: vk::Extent3D {
+            width: extent.width,
+            height: extent.height,
+            depth: 1,
+        },
+    };
+    unsafe {
+        device.cmd_copy_buffer_to_image(
+            cmd,
+            buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            std::slice::from_ref(&region),
+        )
+    };
+}
+
+fn create_sampler(device: &ash::Device, mip_levels: u32) -> Result<vk::Sampler> {
+    // No anisotropy yet (you didn’t enable it on device features). Safe defaults.
+    let ci = vk::SamplerCreateInfo {
+        s_type: vk::StructureType::SAMPLER_CREATE_INFO,
+        mag_filter: vk::Filter::LINEAR,
+        min_filter: vk::Filter::LINEAR,
+        mipmap_mode: vk::SamplerMipmapMode::LINEAR,
+        address_mode_u: vk::SamplerAddressMode::REPEAT,
+        address_mode_v: vk::SamplerAddressMode::REPEAT,
+        address_mode_w: vk::SamplerAddressMode::REPEAT,
+        min_lod: 0.0,
+        max_lod: mip_levels as f32,
+        ..Default::default()
+    };
+    Ok(unsafe { device.create_sampler(&ci, None)? })
+}
+
+fn create_material_desc_pool_and_set(
+    device: &ash::Device,
+    set_layout: vk::DescriptorSetLayout,
+) -> Result<(vk::DescriptorPool, vk::DescriptorSet)> {
+    let pool_sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        descriptor_count: 1,
+    }];
+    let pool_ci = vk::DescriptorPoolCreateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
+        max_sets: 1,
+        pool_size_count: pool_sizes.len() as u32,
+        p_pool_sizes: pool_sizes.as_ptr(),
+        ..Default::default()
+    };
+    let pool = unsafe { device.create_descriptor_pool(&pool_ci, None)? };
+
+    let alloc = vk::DescriptorSetAllocateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
+        descriptor_pool: pool,
+        descriptor_set_count: 1,
+        p_set_layouts: &set_layout,
+        ..Default::default()
+    };
+    let set = unsafe { device.allocate_descriptor_sets(&alloc)?[0] };
+    Ok((pool, set))
+}
+
+fn write_material_descriptors(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    view: vk::ImageView,
+    sampler: vk::Sampler,
+) {
+    let image_info = vk::DescriptorImageInfo {
+        sampler,
+        image_view: view,
+        image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    };
+    let write = vk::WriteDescriptorSet {
+        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+        dst_set: set,
+        dst_binding: 0,
+        descriptor_count: 1,
+        descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+        p_image_info: &image_info,
+        ..Default::default()
+    };
+    unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+}
+
+fn create_dummy_texture_and_sampler(
+    instance: &ash::Instance,
+    device: &ash::Device,
+    phys: vk::PhysicalDevice,
+    queue: vk::Queue,
+    cmd_pool: vk::CommandPool,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Sampler)> {
+    // 2x2 checkerboard RGBA
+    let extent = vk::Extent2D {
+        width: 2,
+        height: 2,
+    };
+    let pixels: [u8; 16] = [
+        255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+    ];
+
+    // Create device-local image
+    let (image, memory) = create_image_and_memory(
+        instance,
+        device,
+        phys,
+        extent,
+        1,
+        vk::Format::R8G8B8A8_UNORM,
+        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        vk::ImageTiling::OPTIMAL,
+    )?;
+
+    // Create staging buffer and copy pixels into it
+    let size = pixels.len() as vk::DeviceSize;
+    let (staging, staging_mem) = create_buffer_and_memory(
+        instance,
+        device,
+        phys,
+        size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    unsafe {
+        let mapped =
+            device.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), mapped, pixels.len());
+        device.unmap_memory(staging_mem);
+    }
+
+    // One-time command buffer to do the transitions + copy
+    let ai = vk::CommandBufferAllocateInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
+        command_pool: cmd_pool,
+        level: vk::CommandBufferLevel::PRIMARY,
+        command_buffer_count: 1,
+        ..Default::default()
+    };
+    let cmd = unsafe { device.allocate_command_buffers(&ai)?[0] };
+    let bi = vk::CommandBufferBeginInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+        flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+        ..Default::default()
+    };
+    unsafe { device.begin_command_buffer(cmd, &bi)? };
+
+    transition_color_to_transfer_dst(device, cmd, image, 1);
+    copy_buffer_to_image(device, cmd, staging, image, extent);
+    transition_color_to_shader_read(device, cmd, image, 1);
+
+    unsafe { device.end_command_buffer(cmd)? };
+    let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
+    let si = vk::SubmitInfo {
+        s_type: vk::StructureType::SUBMIT_INFO,
+        command_buffer_count: 1,
+        p_command_buffers: &cmd,
+        ..Default::default()
+    };
+    unsafe {
+        device.queue_submit(queue, std::slice::from_ref(&si), fence)?;
+        device.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
+        device.destroy_fence(fence, None);
+        device.free_command_buffers(cmd_pool, std::slice::from_ref(&cmd));
+        device.destroy_buffer(staging, None);
+        device.free_memory(staging_mem, None);
+    }
+
+    let view = make_image_view_2d_color(device, image, vk::Format::R8G8B8A8_UNORM, 0, 1)?;
+    let sampler = create_sampler(device, 1)?;
+
+    Ok((image, memory, view, sampler))
+}
+// END Helper functions
 
 // 9) BIG BAD IMPORTANT STUFF
 fn decide_path_and_create_device(
@@ -1652,7 +2106,8 @@ fn create_pipeline(
     color_format: vk::Format,
     depth_format: vk::Format,
     _extent: vk::Extent2D,
-    set_layout: vk::DescriptorSetLayout,
+    set_layout_camera: vk::DescriptorSetLayout,
+    set_layout_material: vk::DescriptorSetLayout,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
     // STRICT: color_attachment_formats MUST match current swapchain image format.
     // On swapchain format change, pipeline must be rebuilt before recording.
@@ -1738,6 +2193,12 @@ fn create_pipeline(
             format: vk::Format::R32G32B32_SFLOAT,
             offset: std::mem::size_of::<[f32; 3]>() as u32,
         },
+        vk::VertexInputAttributeDescription {
+            location: 2,
+            binding: 0,
+            format: vk::Format::R32G32_SFLOAT,
+            offset: (std::mem::size_of::<[f32; 3]>() * 2) as u32,
+        },
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -1790,8 +2251,7 @@ fn create_pipeline(
         s_type: vk::StructureType::PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
         depth_test_enable: vk::TRUE,
         depth_write_enable: vk::TRUE,
-        depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
-        // leave stencil disabled for now
+        depth_compare_op: vk::CompareOp::GREATER_OR_EQUAL, // reverse-z
         ..Default::default()
     };
     // Color blend (no blending; write all RGBA)
@@ -1811,10 +2271,11 @@ fn create_pipeline(
     };
 
     // --- Pipeline layout (no descriptors/push constants yet) ---
+    let layouts = [set_layout_camera, set_layout_material];
     let layout_info = vk::PipelineLayoutCreateInfo {
         s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
-        set_layout_count: 1,
-        p_set_layouts: &set_layout,
+        set_layout_count: layouts.len() as u32,
+        p_set_layouts: layouts.as_ptr(),
         ..Default::default()
     };
     let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
@@ -1929,7 +2390,8 @@ fn build_renderer(
 
     // Create depth buffers
     let depth_format = pick_depth_format(&instance, phys);
-    let desc_set_layout = create_camera_desc_set_layout(&device)?;
+    let desc_set_layout_camera = create_camera_desc_set_layout(&device)?;
+    let desc_set_layout_material = create_material_desc_set_layout(&device)?;
 
     // 6) Build all swapchain-scoped resources in one place
     let (sc, cmd, (pipeline_layout, pipeline), acq_slots, frames) =
@@ -1945,16 +2407,26 @@ fn build_renderer(
             has_hdr_meta,
             pipeline_cache,
             depth_format,
-            desc_set_layout,
+            desc_set_layout_camera,
+            desc_set_layout_material,
         )?;
     let (depth_image, depth_mem, depth_view) =
         create_depth_resources(&instance, &device, phys, sc.extent, depth_format)?;
+
+    // Global material set (swapchain-invariant)
+    let (material_desc_pool, material_desc_set) =
+        create_material_desc_pool_and_set(&device, desc_set_layout_material)?;
+
+    // Tiny 2×2 texture and sampler, then write the descriptor
+    let (tex_image, tex_mem, tex_view, tex_sampler) =
+        create_dummy_texture_and_sampler(&instance, &device, phys, queue, cmd.pool)?;
+    write_material_descriptors(&device, material_desc_set, tex_view, tex_sampler);
 
     let (ubufs, umems, ubo_ptrs, ubo_size, desc_pool, desc_sets) = create_frame_uniforms_and_sets(
         &instance,
         &device,
         phys,
-        desc_set_layout,
+        desc_set_layout_camera,
         sc.image_views.len(),
     )?;
 
@@ -2035,7 +2507,8 @@ fn build_renderer(
         ibuf_mem: imem,
         index_count: TRI_IDXS.len() as u32,
         desc_pool,
-        desc_set_layout,
+        desc_set_layout_camera,
+        desc_set_layout_material,
         desc_sets,
         ubufs,
         umems,
@@ -2049,6 +2522,12 @@ fn build_renderer(
         backoff_frames: 0,
         #[cfg(debug_assertions)]
         shader_dev,
+        material_desc_pool,
+        material_desc_set,
+        tex_image,
+        tex_mem,
+        tex_view,
+        tex_sampler,
     };
 
     // 8) Record per-image command buffers once
@@ -2058,6 +2537,25 @@ fn build_renderer(
 }
 
 impl VkRenderer {
+    /// RH camera, forward = -Z, Vulkan ZO (0..1), reverse-Z, infinite far plane.
+    /// `flip_y` should be false while you're using a negative viewport height.
+    fn perspective_rh_zo_reverse_infinite(
+        fovy: f32,
+        aspect: f32,
+        near: f32,
+        flip_y: bool,
+    ) -> [[f32; 4]; 4] {
+        let f = 1.0 / (0.5 * fovy).tan();
+        let c0 = [f / aspect, 0.0, 0.0, 0.0];
+        let mut c1 = [0.0, f, 0.0, 0.0];
+        let c2 = [0.0, 0.0, 0.0, -1.0];
+        let c3 = [0.0, 0.0, near, 0.0];
+        if flip_y {
+            c1[1] = -c1[1];
+        }
+        [c0, c1, c2, c3] // columns
+    }
+
     // Set cfg options
     pub fn set_vsync_mode(&mut self, mode: VkVsyncMode) {
         if self.cfg.vsync_mode as u8 == mode as u8 {
@@ -2141,7 +2639,8 @@ impl VkRenderer {
             self.format,
             self.depth_format,
             self.extent,
-            self.desc_set_layout,
+            self.desc_set_layout_camera,
+            self.desc_set_layout_material,
         )?;
 
         unsafe {
@@ -2155,17 +2654,6 @@ impl VkRenderer {
         // Re-record CBs because pipeline handle changed.
         self.record_commands()?;
         Ok(())
-    }
-
-    fn make_identity_mvp() -> CameraUbo {
-        CameraUbo {
-            mvp: [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-        }
     }
 
     fn update_camera_ubo_for_image(
@@ -2221,12 +2709,13 @@ impl VkRenderer {
     #[inline]
     fn transition_depth_to_attachment(&self, cmd: vk::CommandBuffer, image: vk::Image) {
         let subrange = vk::ImageSubresourceRange {
-            aspect_mask: vk::ImageAspectFlags::DEPTH,
+            aspect_mask: depth_aspect_mask(self.depth_format),
             base_mip_level: 0,
             level_count: 1,
             base_array_layer: 0,
             layer_count: 1,
         };
+
         let pre = vk::ImageMemoryBarrier2 {
             s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
             src_stage_mask: vk::PipelineStageFlags2::TOP_OF_PIPE,
@@ -2236,7 +2725,7 @@ impl VkRenderer {
             dst_access_mask: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
                 | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ,
             old_layout: vk::ImageLayout::UNDEFINED,
-            new_layout: vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            new_layout: depth_attachment_layout(self.depth_format),
             image,
             subresource_range: subrange,
             ..Default::default()
@@ -2265,12 +2754,12 @@ impl VkRenderer {
         let depth_att = vk::RenderingAttachmentInfo {
             s_type: vk::StructureType::RENDERING_ATTACHMENT_INFO,
             image_view: self.depth_view,
-            image_layout: vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            image_layout: depth_attachment_layout(self.depth_format),
             load_op: vk::AttachmentLoadOp::CLEAR,
             store_op: vk::AttachmentStoreOp::DONT_CARE,
             clear_value: vk::ClearValue {
                 depth_stencil: vk::ClearDepthStencilValue {
-                    depth: 1.0,
+                    depth: 0.0,
                     stencil: 0,
                 },
             },
@@ -2330,17 +2819,17 @@ impl VkRenderer {
         };
 
         // Bind per-image descriptor set (set = 0)
-        let set = self.desc_sets[image_index];
+        let set = [self.desc_sets[image_index], self.material_desc_set];
         unsafe {
             self.device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
-                0, // firstSet
-                std::slice::from_ref(&set),
+                0, // firstSet -> set 0 = camera, set 1 = material
+                &set,
                 &[], // no dynamic offsets
-            )
-        };
+            );
+        }
 
         // bind vertex + index buffers
         let offsets = [0_u64];
@@ -2567,7 +3056,7 @@ impl VkRenderer {
                 &self.instance,
                 &self.device,
                 self.phys,
-                self.desc_set_layout,
+                self.desc_set_layout_camera,
                 self.images.len(),
             )?;
         self.ubufs = ubufs;
@@ -2595,7 +3084,8 @@ impl VkRenderer {
                 self.format,
                 self.depth_format, // ensure dynamic rendering knows the depth format
                 self.extent,
-                self.desc_set_layout, // pipeline layout includes set 0 = camera UBO
+                self.desc_set_layout_camera,
+                self.desc_set_layout_material,
             )?;
             unsafe { self.device.destroy_pipeline(self.pipeline, None) };
             unsafe {
@@ -2806,8 +3296,12 @@ impl Renderer for VkRenderer {
         let img = image_index as usize;
         let f_img = &self.frames[img];
         let cmd = self.cmd_bufs[img];
-        let mvp = Self::make_identity_mvp();
-
+        let aspect = self.extent.width as f32 / self.extent.height as f32;
+        let fovy = std::f32::consts::FRAC_PI_3; // 60°
+        let near = 0.1_f32; // 0.05–0.5 is a good range
+        let flip_y = false; // you're using a negative viewport height right now
+        let proj = VkRenderer::perspective_rh_zo_reverse_infinite(fovy, aspect, near, flip_y);
+        let mvp = CameraUbo { mvp: proj };
         self.update_camera_ubo_for_image(img, &mvp)?;
 
         // 2) Submit (wait on acquire sem; signal render-finished; bump timeline)
