@@ -7,3 +7,4 @@ debug
 *.idea
 *.pdb
 **/mutants.out*/
+vk_pipeline_cache_*.bin

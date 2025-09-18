@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: CEPL-1.0
 use anyhow::Result;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 

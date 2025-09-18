@@ -8,5 +8,6 @@ layout(set = 1, binding = 0) uniform sampler2D tex0;
 layout(location = 0) out vec4 outColor;
 
 void main() {
-    outColor = texture(tex0, v_uv);
+    vec4 texel = texture(tex0, v_uv);
+    outColor = texel * vec4(v_color, 1.0);
 }

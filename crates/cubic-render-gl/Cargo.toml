@@ -2,6 +2,8 @@
 name = "cubic-render-gl"
 version = "0.1.0"
 edition = "2021"
+publish = false
+
 
 [dependencies]
 cubic-render = { path = "../cubic-render" }

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: CEPL-1.0
 use anyhow::{anyhow, Context, Result};
 use cubic_render::{RenderSize, Renderer};
 use glow::HasContext as _;

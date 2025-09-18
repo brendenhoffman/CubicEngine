@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
 use anyhow::{anyhow, Context, Result};
 #[cfg(debug_assertions)]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: CEPL-1.0
 pub fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let _ = fmt()
