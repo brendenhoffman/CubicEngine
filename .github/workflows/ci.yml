@@ -58,41 +58,13 @@ jobs:
           # If you want to skip advisory fetches on forks/offline, add:
           # arguments: --disable-fetch
   unsafe-lint:
-    name: check #![deny(unsafe_op_in_unsafe_fn)]
+    name: check headers
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
       - name: Ensure crate roots deny unsafe_op_in_unsafe_fn
         shell: bash
-        run: |
-          set -euo pipefail
-
-          # find all potential crate roots (src/lib.rs or src/main.rs)
-          mapfile -t roots < <(git ls-files | grep -E '(^|/)src/(lib|main)\.rs$')
-
-          if [ ${#roots[@]} -eq 0 ]; then
-            echo "No crate roots found (src/lib.rs or src/main.rs)."
-            exit 0
-          fi
-
-          missing=()
-          for f in "${roots[@]}"; do
-            if ! grep -q '^\s*#!\[\s*deny\s*\(\s*unsafe_op_in_unsafe_fn\s*\)\s*\]\s*$' "$f"; then
-              missing+=("$f")
-            fi
-          done
-
-          if [ ${#missing[@]} -ne 0 ]; then
-            echo "::error::The following crate roots are missing \`#![deny(unsafe_op_in_unsafe_fn)]\`:"
-            printf ' - %s\n' "${missing[@]}"
-            echo ""
-            echo "Add this at the very top of each listed file:"
-            echo '    #![deny(unsafe_op_in_unsafe_fn)]'
-            exit 1
-          fi
-
-          echo "All crate roots contain #![deny(unsafe_op_in_unsafe_fn)]. ✅"
+        run: tools/check-headers.sh
   # Gate merges on everything passing
   ci-ok:
     name: all checks
