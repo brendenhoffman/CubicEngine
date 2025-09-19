@@ -409,7 +409,7 @@ impl RuntimeConfig {
     }
 
     /// Convert to the swapchain’s creation config for a given target size.
-    fn to_swapchain_config(&self, hint: RenderSize) -> SwapchainConfig {
+    fn to_swapchain_config(self, hint: RenderSize) -> SwapchainConfig {
         SwapchainConfig {
             hint,
             vsync: self.vsync,
@@ -419,6 +419,47 @@ impl RuntimeConfig {
             hdr_flavor: self.hdr_flavor,
         }
     }
+}
+
+struct SwapchainInitInput<'a> {
+    device: &'a ash::Device,
+    instance: &'a ash::Instance,
+    surf_i: &'a surface::Instance,
+    swap_d: &'a swapchain::Device,
+    phys: vk::PhysicalDevice,
+    surface: vk::SurfaceKHR,
+    cfg: SwapchainConfig,
+    queue_family: u32,
+    has_hdr_meta: bool,
+    pipeline_cache: vk::PipelineCache,
+    depth_format: vk::Format,
+    desc_set_layout_camera: vk::DescriptorSetLayout,
+    desc_set_layout_material: vk::DescriptorSetLayout,
+}
+
+struct DeviceCtx<'a> {
+    instance: &'a ash::Instance,
+    device: &'a ash::Device,
+    phys: vk::PhysicalDevice,
+}
+
+struct ImageAllocInfo {
+    extent: vk::Extent2D,
+    mip_levels: u32,
+    format: vk::Format,
+    usage: vk::ImageUsageFlags,
+    tiling: vk::ImageTiling,
+}
+
+struct LayoutTransition {
+    image: vk::Image,
+    sub: vk::ImageSubresourceRange,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    old_layout: vk::ImageLayout,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+    new_layout: vk::ImageLayout,
 }
 // END Structs
 
@@ -439,6 +480,22 @@ type InitRet = (
     vk::SurfaceKHR,
     Option<DebugState>,
     bool,
+);
+type FrameUniforms = (
+    Vec<vk::Buffer>,
+    Vec<vk::DeviceMemory>,
+    Vec<*mut std::ffi::c_void>,
+    vk::DeviceSize,
+    vk::DescriptorPool,
+    Vec<vk::DescriptorSet>,
+);
+
+type SwapchainInit = (
+    SwapchainBundle,
+    CommandResources,
+    (vk::PipelineLayout, vk::Pipeline),
+    Vec<AcquireSlot>,
+    Vec<FrameSync>,
 );
 // END Types
 
@@ -651,14 +708,16 @@ fn transition_color_to_transfer_dst(
     transition_image_layout2(
         device,
         cmd,
-        image,
-        sub,
-        vk::PipelineStageFlags2::TOP_OF_PIPE,
-        vk::AccessFlags2::empty(),
-        vk::ImageLayout::UNDEFINED,
-        vk::PipelineStageFlags2::TRANSFER,
-        vk::AccessFlags2::TRANSFER_WRITE,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &LayoutTransition {
+            image,
+            sub,
+            src_stage: vk::PipelineStageFlags2::TOP_OF_PIPE,
+            src_access: vk::AccessFlags2::empty(),
+            old_layout: vk::ImageLayout::UNDEFINED,
+            dst_stage: vk::PipelineStageFlags2::TRANSFER,
+            dst_access: vk::AccessFlags2::TRANSFER_WRITE,
+            new_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        },
     );
 }
 
@@ -679,14 +738,16 @@ fn transition_color_to_shader_read(
     transition_image_layout2(
         device,
         cmd,
-        image,
-        sub,
-        vk::PipelineStageFlags2::TRANSFER,
-        vk::AccessFlags2::TRANSFER_WRITE,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        vk::PipelineStageFlags2::FRAGMENT_SHADER,
-        vk::AccessFlags2::SHADER_READ,
-        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        &LayoutTransition {
+            image,
+            sub,
+            src_stage: vk::PipelineStageFlags2::TRANSFER,
+            src_access: vk::AccessFlags2::TRANSFER_WRITE,
+            old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            dst_stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            dst_access: vk::AccessFlags2::SHADER_READ,
+            new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        },
     );
 }
 // END Inline helper functions
@@ -1251,17 +1312,11 @@ fn create_frame_uniforms_and_sets(
     phys: vk::PhysicalDevice,
     set_layout: vk::DescriptorSetLayout,
     image_count: usize,
-) -> Result<(
-    Vec<vk::Buffer>,
-    Vec<vk::DeviceMemory>,
-    Vec<*mut std::ffi::c_void>,
-    vk::DeviceSize,
-    vk::DescriptorPool,
-    Vec<vk::DescriptorSet>,
-)> {
+) -> Result<FrameUniforms> {
     let limits = unsafe { instance.get_physical_device_properties(phys).limits };
     let a = limits.min_uniform_buffer_offset_alignment.max(1);
-    let ubo_size = ((std::mem::size_of::<CameraUbo>() as u64 + a - 1) / a) * a;
+    let sz = std::mem::size_of::<CameraUbo>() as u64;
+    let ubo_size = sz.div_ceil(a) * a;
 
     let mut ubufs = Vec::with_capacity(image_count);
     let mut umems = Vec::with_capacity(image_count);
@@ -1339,57 +1394,37 @@ fn recreate_surface(
     Ok(new_surface)
 }
 
-fn make_initial_swapchain_resources(
-    device: &ash::Device,
-    instance: &ash::Instance,
-    surf_i: &surface::Instance,
-    swap_d: &swapchain::Device,
-    phys: vk::PhysicalDevice,
-    surface: vk::SurfaceKHR,
-    cfg: SwapchainConfig,
-    queue_family: u32,
-    has_hdr_meta: bool,
-    pipeline_cache: vk::PipelineCache,
-    depth_format: vk::Format,
-    desc_set_layout_camera: vk::DescriptorSetLayout,
-    desc_set_layout_material: vk::DescriptorSetLayout,
-) -> Result<(
-    SwapchainBundle,
-    CommandResources,
-    (vk::PipelineLayout, vk::Pipeline),
-    Vec<AcquireSlot>,
-    Vec<FrameSync>,
-)> {
+fn make_initial_swapchain_resources(inp: &SwapchainInitInput) -> Result<SwapchainInit> {
     let bundle = create_swapchain_bundle(
-        device,
-        surf_i,
-        swap_d,
-        phys,
-        surface,
+        inp.device,
+        inp.surf_i,
+        inp.swap_d,
+        inp.phys,
+        inp.surface,
         vk::SwapchainKHR::null(),
-        cfg,
+        inp.cfg,
     )?;
 
     create_hdr_metadata_if_needed(
-        instance,
-        device,
-        has_hdr_meta,
+        inp.instance,
+        inp.device,
+        inp.has_hdr_meta,
         bundle.color_space,
         bundle.swapchain,
     );
 
     let image_count = bundle.image_views.len();
-    let cmds = create_command_resources(device, queue_family, image_count)?;
+    let cmds = create_command_resources(inp.device, inp.queue_family, image_count)?;
     let pipe = create_pipeline(
-        device,
-        pipeline_cache,
+        inp.device,
+        inp.pipeline_cache,
         bundle.format,
-        depth_format,
+        inp.depth_format,
         bundle.extent,
-        desc_set_layout_camera,
-        desc_set_layout_material,
+        inp.desc_set_layout_camera,
+        inp.desc_set_layout_material,
     )?;
-    let (acq, frames) = create_sync_objects(device, image_count)?;
+    let (acq, frames) = create_sync_objects(inp.device, image_count)?;
     Ok((bundle, cmds, pipe, acq, frames))
 }
 
@@ -1524,39 +1559,37 @@ fn create_material_desc_set_layout(device: &ash::Device) -> Result<vk::Descripto
 }
 
 fn create_image_and_memory(
-    instance: &ash::Instance,
-    device: &ash::Device,
-    phys: vk::PhysicalDevice,
-    extent: vk::Extent2D,
-    mip_levels: u32,
-    format: vk::Format,
-    usage: vk::ImageUsageFlags, // e.g. TRANSFER_DST | SAMPLED
-    tiling: vk::ImageTiling,    // usually OPTIMAL
+    ctx: &DeviceCtx,
+    info: &ImageAllocInfo,
 ) -> Result<(vk::Image, vk::DeviceMemory)> {
     let ci = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
         image_type: vk::ImageType::TYPE_2D,
-        format,
+        format: info.format,
         extent: vk::Extent3D {
-            width: extent.width,
-            height: extent.height,
+            width: info.extent.width,
+            height: info.extent.height,
             depth: 1,
         },
-        mip_levels,
+        mip_levels: info.mip_levels,
         array_layers: 1,
         samples: vk::SampleCountFlags::TYPE_1,
-        tiling,
-        usage,
+        tiling: info.tiling,
+        usage: info.usage,
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         ..Default::default()
     };
-    let image = unsafe { device.create_image(&ci, None) }
-        .with_context(|| format!("create_image fmt={format:?} extent={:?}", extent))?;
+    let image = unsafe { ctx.device.create_image(&ci, None) }.with_context(|| {
+        format!(
+            "create_image fmt={:?} extent={:?}",
+            info.format, info.extent
+        )
+    })?;
 
-    let req = unsafe { device.get_image_memory_requirements(image) };
+    let req = unsafe { ctx.device.get_image_memory_requirements(image) };
     let mem_type_idx = find_memory_type(
-        instance,
-        phys,
+        ctx.instance,
+        ctx.phys,
         req.memory_type_bits,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
@@ -1566,9 +1599,9 @@ fn create_image_and_memory(
         memory_type_index: mem_type_idx,
         ..Default::default()
     };
-    let mem = unsafe { device.allocate_memory(&ai, None) }
+    let mem = unsafe { ctx.device.allocate_memory(&ai, None) }
         .with_context(|| format!("allocate_memory (image) size={}", req.size))?;
-    unsafe { device.bind_image_memory(image, mem, 0) }?;
+    unsafe { ctx.device.bind_image_memory(image, mem, 0) }?;
     Ok((image, mem))
 }
 
@@ -1599,28 +1632,17 @@ fn make_image_view_2d_color(
 }
 
 // sync2 layout transition (generic helper)
-fn transition_image_layout2(
-    device: &ash::Device,
-    cmd: vk::CommandBuffer,
-    image: vk::Image,
-    sub: vk::ImageSubresourceRange,
-    src_stage: vk::PipelineStageFlags2,
-    src_access: vk::AccessFlags2,
-    old_layout: vk::ImageLayout,
-    dst_stage: vk::PipelineStageFlags2,
-    dst_access: vk::AccessFlags2,
-    new_layout: vk::ImageLayout,
-) {
+fn transition_image_layout2(device: &ash::Device, cmd: vk::CommandBuffer, t: &LayoutTransition) {
     let b = vk::ImageMemoryBarrier2 {
         s_type: vk::StructureType::IMAGE_MEMORY_BARRIER_2,
-        src_stage_mask: src_stage,
-        src_access_mask: src_access,
-        dst_stage_mask: dst_stage,
-        dst_access_mask: dst_access,
-        old_layout,
-        new_layout,
-        image,
-        subresource_range: sub,
+        src_stage_mask: t.src_stage,
+        src_access_mask: t.src_access,
+        dst_stage_mask: t.dst_stage,
+        dst_access_mask: t.dst_access,
+        old_layout: t.old_layout,
+        new_layout: t.new_layout,
+        image: t.image,
+        subresource_range: t.sub,
         ..Default::default()
     };
     let dep = vk::DependencyInfo {
@@ -1753,16 +1775,19 @@ fn create_dummy_texture_and_sampler(
     ];
 
     // Create device-local image
-    let (image, memory) = create_image_and_memory(
+    let ctx = DeviceCtx {
         instance,
         device,
         phys,
+    };
+    let info = ImageAllocInfo {
         extent,
-        1,
-        vk::Format::R8G8B8A8_UNORM,
-        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-        vk::ImageTiling::OPTIMAL,
-    )?;
+        mip_levels: 1,
+        format: vk::Format::R8G8B8A8_UNORM,
+        usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        tiling: vk::ImageTiling::OPTIMAL,
+    };
+    let (image, memory) = create_image_and_memory(&ctx, &info)?;
 
     // Create staging buffer and copy pixels into it
     let size = pixels.len() as vk::DeviceSize;
@@ -2395,22 +2420,23 @@ fn build_renderer(
     let desc_set_layout_material = create_material_desc_set_layout(&device)?;
 
     // 6) Build all swapchain-scoped resources in one place
+    let init_inp = SwapchainInitInput {
+        device: &device,
+        instance: &instance,
+        surf_i: &surface_loader,
+        swap_d: &swapchain_loader,
+        phys,
+        surface,
+        cfg,
+        queue_family,
+        has_hdr_meta,
+        pipeline_cache,
+        depth_format,
+        desc_set_layout_camera,
+        desc_set_layout_material,
+    };
     let (sc, cmd, (pipeline_layout, pipeline), acq_slots, frames) =
-        make_initial_swapchain_resources(
-            &device,
-            &instance,
-            &surface_loader,
-            &swapchain_loader,
-            phys,
-            surface,
-            cfg,
-            queue_family,
-            has_hdr_meta,
-            pipeline_cache,
-            depth_format,
-            desc_set_layout_camera,
-            desc_set_layout_material,
-        )?;
+        make_initial_swapchain_resources(&init_inp)?;
     let (depth_image, depth_mem, depth_view) =
         create_depth_resources(&instance, &device, phys, sc.extent, depth_format)?;
 
@@ -2432,8 +2458,8 @@ fn build_renderer(
     )?;
 
     // --- Create device-local vertex/index buffers and upload data ---
-    let vsize = (std::mem::size_of::<Vertex>() * TRI_VERTS.len()) as vk::DeviceSize;
-    let isize = (std::mem::size_of::<u32>() * TRI_IDXS.len()) as vk::DeviceSize;
+    let vsize = std::mem::size_of_val(TRI_VERTS) as vk::DeviceSize;
+    let isize = std::mem::size_of_val(TRI_IDXS) as vk::DeviceSize;
 
     // Create destination (device-local) buffers
     let (vbuf, vmem) = create_buffer_and_memory(
@@ -2502,9 +2528,9 @@ fn build_renderer(
         depth_mem,
         depth_view,
         depth_format,
-        vbuf: vbuf,
+        vbuf,
         vbuf_mem: vmem,
-        ibuf: ibuf,
+        ibuf,
         ibuf_mem: imem,
         index_count: TRI_IDXS.len() as u32,
         desc_pool,
@@ -3272,14 +3298,16 @@ impl Renderer for VkRenderer {
             Err(e) if is_surface_lost(e) => {
                 self.backoff_frames = 2;
                 let entry = Entry::linked();
-                if let Ok(_) = recreate_surface(
+                if recreate_surface(
                     &entry,
                     &self.instance,
                     &self.surface_loader,
                     &mut self.surface,
                     self.display_raw,
                     self.window_raw,
-                ) {
+                )
+                .is_ok()
+                {
                     let want = RenderSize {
                         width: caps.current_extent.width,
                         height: caps.current_extent.height,
@@ -3385,14 +3413,16 @@ impl Renderer for VkRenderer {
             Err(e) if is_surface_lost(e) => {
                 self.backoff_frames = 2;
                 let entry = Entry::linked();
-                if let Ok(_) = recreate_surface(
+                if recreate_surface(
                     &entry,
                     &self.instance,
                     &self.surface_loader,
                     &mut self.surface,
                     self.display_raw,
                     self.window_raw,
-                ) {
+                )
+                .is_ok()
+                {
                     let want = RenderSize {
                         width: caps.current_extent.width,
                         height: caps.current_extent.height,

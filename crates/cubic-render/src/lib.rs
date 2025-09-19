@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
 use anyhow::Result;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
