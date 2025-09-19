@@ -151,8 +151,11 @@ impl Renderer for GlRenderer {
             .map_err(|e| anyhow::anyhow!("{e}"))?
             .as_raw();
 
-        let display =
-            unsafe { Display::new(dh, DisplayApiPreference::Egl) }.context("Display::new")?;
+        #[cfg(target_os = "macos")]
+        let api_pref = DisplayApiPreference::Cgl;
+        #[cfg(not(target_os = "macos"))]
+        let api_pref = DisplayApiPreference::Egl;
+        let display = unsafe { Display::new(dh, api_pref) }.context("Display::new")?;
 
         let (context, surface, gl) = Self::make_current(&display, wh, size)?;
         let program = compile_program(&gl)?;

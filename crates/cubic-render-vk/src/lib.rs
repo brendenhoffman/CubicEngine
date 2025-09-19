@@ -9,6 +9,7 @@ use ash::{vk, Entry, Instance};
 use bytemuck::{Pod, Zeroable};
 use cubic_render::{RenderSize, Renderer};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+use std::ffi::c_char;
 use std::io::Cursor;
 #[cfg(debug_assertions)]
 use std::time::SystemTime;
@@ -79,7 +80,7 @@ unsafe extern "system" fn debug_callback(
     _severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _types: vk::DebugUtilsMessageTypeFlagsEXT,
     data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-    _user: *mut std::os::raw::c_void,
+    _user: *mut std::ffi::c_void,
 ) -> vk::Bool32 {
     if !data.is_null() {
         let msg = unsafe { std::ffi::CStr::from_ptr((*data).p_message) };
@@ -981,15 +982,16 @@ fn create_instance(entry: &Entry, display_raw: RawDisplayHandle) -> Result<(Inst
 
     #[cfg(debug_assertions)]
     let layers = [std::ffi::CString::new("VK_LAYER_KHRONOS_validation").unwrap()];
-
+    #[cfg(debug_assertions)]
+    let layer_ptrs: [*const c_char; 1] = [layers[0].as_ptr()];
     let (enabled_layer_count, pp_enabled_layer_names) = {
         #[cfg(debug_assertions)]
         {
-            (layers.len() as u32, layers.as_ptr() as *const *const i8)
+            (layer_ptrs.len() as u32, layer_ptrs.as_ptr())
         }
         #[cfg(not(debug_assertions))]
         {
-            (0u32, std::ptr::null())
+            (0u32, std::ptr::null::<*const c_char>())
         }
     };
 
@@ -1892,7 +1894,7 @@ fn decide_path_and_create_device(
         }
     };
 
-    let mut device_exts: Vec<*const i8> = vec![swapchain::NAME.as_ptr()];
+    let mut device_exts: Vec<*const c_char> = vec![swapchain::NAME.as_ptr()];
     let has_sync2_khr = has(ash::khr::synchronization2::NAME);
     let has_dynren_khr = has(ash::khr::dynamic_rendering::NAME);
     let has_hdr_meta = has(ash::ext::hdr_metadata::NAME);
