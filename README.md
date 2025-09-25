@@ -1,3 +1,5 @@
+<img width="150" height="150" alt="cubicengine" src="assets/icons/cubicengine.png" />
+
 # CubicEngine
 
 A free and open-source voxel game engine written in Rust with Vulkan. Designed to be fast, extensible, and portable across hardware.
