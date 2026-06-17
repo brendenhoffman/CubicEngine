@@ -8,3 +8,7 @@ debug
 *.pdb
 **/mutants.out*/
 vk_pipeline_cache_*.bin
+.claude
+CLAUDE.md
+AUDIT_LOG.md
+context.md
