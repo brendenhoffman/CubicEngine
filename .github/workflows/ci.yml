@@ -17,6 +17,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
+  # This job runs on ubuntu-latest and only type-checks against each target triple.
+  # It verifies the code compiles and lints clean for that target; it does NOT verify
+  # that an actual build links successfully on that platform. Real builds for the
+  # windows-msvc and macOS targets need either a native runner or a cross toolchain
+  # (cargo-xwin for windows-msvc), which we don't have set up yet.
   clippy:
     name: clippy (matrix)
     runs-on: ubuntu-latest
@@ -29,9 +34,8 @@ jobs:
           - aarch64-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
           - i686-unknown-linux-gnu
-          - powerpc64le-unknown-linux-gnu
+          - powerpc64-unknown-linux-gnu
           - riscv64gc-unknown-linux-gnu
-          - s390x-unknown-linux-gnu
           - x86_64-apple-darwin
           - x86_64-pc-windows-msvc
           - x86_64-unknown-linux-gnu

@@ -15,7 +15,8 @@ We welcome contributions of code, assets, and mods!
   - Use `cargo-deny` to verify Rust specific dependencies.
 - Code should be formatted to common standards, such as with tools like `rustfmt`, `stylua`, and `taplo`.
 - Rust files should contain `#![deny(unsafe_op_in_unsafe_fn)]`.
-  - Pull requests will be checked with `clippy`, but you can ease the process by running it yourself with the following targets: `aarch64-apple-darwin`, `aarch64-pc-windows-msvc`, `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`, `i686-unknown-linux-gnu`, `powerpc64le-unknown-linux-gnu`, `riscv64gc-unknown-linux-gnu`, `s390x-unknown-linux-gnu`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`.
+  - Pull requests will be checked with `clippy` across the following targets: `aarch64-apple-darwin`, `aarch64-pc-windows-msvc`, `aarch64-unknown-linux-gnu`, `armv7-unknown-linux-gnueabihf`, `i686-unknown-linux-gnu`, `powerpc64-unknown-linux-gnu`, `riscv64gc-unknown-linux-gnu`, `x86_64-apple-darwin`, `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-gnu`. You can run this locally with `tools/runclippy.sh`.
+  - Note: the clippy job runs on `ubuntu-latest` and only type-checks against each target. It verifies the code compiles and lints clean for that target; it does not verify that an actual build links successfully on that platform. Real builds for the `windows-msvc` and macOS targets require either a native runner or a cross toolchain (`cargo-xwin` for `windows-msvc`), which CI does not have set up yet.
 - Code with warnings will not be accepted.
 - Once merged, your code becomes part of the Project and cannot be relicensed.
 - By contributing, you grant an irrevocable, perpetual, non-exclusive, worldwide, royalty-free patent license under any patents you control that would otherwise be infringed by your contribution.
