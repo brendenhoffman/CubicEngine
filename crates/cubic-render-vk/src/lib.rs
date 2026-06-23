@@ -1350,28 +1350,6 @@ impl Renderer for VkRenderer {
         #[cfg(debug_assertions)]
         self.hot_reload_shaders_if_changed()?;
 
-        // Query caps
-        let caps = match unsafe {
-            self.surface_loader
-                .get_physical_device_surface_capabilities(self.phys, self.surface)
-        } {
-            Ok(caps) => caps,
-            Err(e) => {
-                if !self.paused {
-                    self.paused = true;
-                    info!("vk: surface caps error {:?} → paused=true", e);
-                }
-                return Ok(());
-            }
-        };
-        if caps.current_extent.width == 0 || caps.current_extent.height == 0 {
-            if !self.paused {
-                self.paused = true;
-                info!("vk: current_extent is 0x0 → paused=true");
-            }
-            return Ok(());
-        }
-
         // 1) Acquire
         let s = &self.acq_slots[self.acq_index];
         if s.last_signal_value > 0 {
@@ -1396,13 +1374,12 @@ impl Renderer for VkRenderer {
                 vk::Fence::null(),
             )
         } {
-            // same match arms…
             Ok(pair) => pair,
             Err(e) if is_swapchain_out_of_date(e) => {
                 self.backoff_frames = 2;
                 let want = RenderSize {
-                    width: caps.current_extent.width,
-                    height: caps.current_extent.height,
+                    width: self.extent.width,
+                    height: self.extent.height,
                 };
                 let _ = self.recreate_swapchain(want);
                 return Ok(());
@@ -1421,8 +1398,8 @@ impl Renderer for VkRenderer {
                 .is_ok()
                 {
                     let want = RenderSize {
-                        width: caps.current_extent.width,
-                        height: caps.current_extent.height,
+                        width: self.extent.width,
+                        height: self.extent.height,
                     };
                     let _ = self.recreate_swapchain(want);
                 } else {
@@ -1516,8 +1493,8 @@ impl Renderer for VkRenderer {
             Err(e) if is_swapchain_out_of_date(e) => {
                 self.backoff_frames = 2;
                 let want = RenderSize {
-                    width: caps.current_extent.width,
-                    height: caps.current_extent.height,
+                    width: self.extent.width,
+                    height: self.extent.height,
                 };
                 let _ = self.recreate_swapchain(want);
                 return Ok(());
@@ -1536,8 +1513,8 @@ impl Renderer for VkRenderer {
                 .is_ok()
                 {
                     let want = RenderSize {
-                        width: caps.current_extent.width,
-                        height: caps.current_extent.height,
+                        width: self.extent.width,
+                        height: self.extent.height,
                     };
                     let _ = self.recreate_swapchain(want);
                 } else {
