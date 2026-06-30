@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
+mod loader;
+
 use anyhow::Result;
 use clap::Parser;
 use cubic_core::init_tracing;
 use cubic_math::{Camera, Vec3};
 use cubic_render::{RenderSize, Renderer};
 use cubic_render_gl::GlRenderer;
-use cubic_render_vk::{MeshHandle, VkRenderer};
+use cubic_render_vk::{MeshHandle, PushData, VkRenderer};
 use tracing::{error, info};
 
 use cubic_platform::winit::{
@@ -109,71 +111,17 @@ fn load_cfg() -> AppCfg {
     }
 }
 
-// Temporary test scene: the same two-triangle test geometry that used to be
-// hardcoded inside cubic-render-vk, now supplied by the app through the
-// upload_mesh/draw_mesh API.
-mod test_scene {
-    use cubic_render_vk::{PushData, Vertex};
-
-    const UV_TILE: f32 = 1.0;
-
-    pub const TRI_VERTS: &[Vertex] = &[
-        // FRONT triangle (closer)
-        Vertex {
-            pos: [0.0, 0.5, -0.988],
-            color: [1.0, 0.2, 0.2],
-            uv: [0.5 * UV_TILE, 1.0 * UV_TILE], // top
-            normal: [0.0, 0.0, 1.0],
-        },
-        Vertex {
-            pos: [-0.3, -0.4, -0.788],
-            color: [1.0, 0.2, 0.2],
-            uv: [0.0 * UV_TILE, 0.0 * UV_TILE], // bottom-left
-            normal: [0.0, 0.0, 1.0],
-        },
-        Vertex {
-            pos: [0.3, -0.4, -0.788],
-            color: [1.0, 0.2, 0.2],
-            uv: [1.0 * UV_TILE, 0.0 * UV_TILE], // bottom-right
-            normal: [0.0, 0.0, 1.0],
-        },
-        // BACK triangle (farther)
-        Vertex {
-            pos: [0.0, 0.4, -0.888],
-            color: [0.2, 0.8, 1.0],
-            uv: [0.5 * UV_TILE, 1.0 * UV_TILE], // top
-            normal: [0.0, 0.0, 1.0],
-        },
-        Vertex {
-            pos: [-0.5, -0.4, -0.888],
-            color: [0.2, 0.8, 1.0],
-            uv: [0.0 * UV_TILE, 0.0 * UV_TILE], // bottom-left
-            normal: [0.0, 0.0, 1.0],
-        },
-        Vertex {
-            pos: [0.5, -0.4, -0.888],
-            color: [0.2, 0.8, 1.0],
-            uv: [1.0 * UV_TILE, 0.0 * UV_TILE], // bottom-right
-            normal: [0.0, 0.0, 1.0],
-        },
-    ];
-
-    pub const TRI_IDXS: &[u32] = &[0, 1, 2, 3, 4, 5];
-
-    pub const IDENTITY_PUSH: PushData = PushData {
-        model: [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ],
-        tint: [1.0, 1.0, 1.0, 1.0],
-        // 0 = the renderer's built-in dummy texture; there's no real
-        // texture-loading API yet for anything else to reference.
-        tex_index: 0,
-        _pad: [0; 3],
-    };
-}
+const IDENTITY_PUSH: PushData = PushData {
+    model: [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    tint: [1.0, 1.0, 1.0, 1.0],
+    tex_index: 0,
+    _pad: [0; 3],
+};
 
 const MOVE_SPEED: f32 = 3.0; // units/sec
 const MOUSE_SENSITIVITY: f32 = 0.0025; // radians/pixel
@@ -291,12 +239,11 @@ impl ApplicationHandler for App {
                     };
                     r.as_mut().set_hdr_flavor(flavor);
 
-                    match r
-                        .as_mut()
-                        .upload_mesh(test_scene::TRI_VERTS, test_scene::TRI_IDXS)
+                    match loader::load_obj_mesh(std::path::Path::new("assets/models/cube.obj"))
+                        .and_then(|(verts, idxs)| r.as_mut().upload_mesh(&verts, &idxs))
                     {
                         Ok(handle) => self.vk_mesh = Some(handle),
-                        Err(e) => error!("upload_mesh failed: {e}"),
+                        Err(e) => error!("model load/upload failed: {e}"),
                     }
                 }
             }
@@ -474,7 +421,7 @@ impl ApplicationHandler for App {
                         r.set_camera(self.camera);
                     }
                     if let (Backend::Vk(r), Some(handle)) = (&mut *backend, self.vk_mesh) {
-                        r.draw_mesh(handle, test_scene::IDENTITY_PUSH);
+                        r.draw_mesh(handle, IDENTITY_PUSH);
                     }
 
                     let res = match backend {
