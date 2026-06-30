@@ -22,11 +22,12 @@ use device::{decide_path_and_create_device, select_device_and_queue, RenderPath}
 #[cfg(debug_assertions)]
 use instance::destroy_debug_messenger;
 use instance::{init_instance_and_surface, recreate_surface};
-use pipeline::{
-    create_or_load_pipeline_cache, create_pipeline, pipeline_cache_path, save_pipeline_cache,
-};
 #[cfg(debug_assertions)]
-use pipeline::{shader_dir, ShaderDev};
+use pipeline::ShaderDev;
+use pipeline::{
+    create_compute_pipeline, create_or_load_pipeline_cache, create_pipeline, load_spv_file,
+    pipeline_cache_path, save_pipeline_cache, shader_dir,
+};
 use resources::{
     create_buffer_and_memory, create_camera_desc_set_layout, create_depth_resources,
     create_dummy_texture_and_sampler, create_frame_uniforms_and_sets,
@@ -40,8 +41,8 @@ use swapchain::{
 };
 pub use swapchain::{HdrFlavor, VkVsyncMode};
 use sync::{
-    create_command_resources, create_sync_objects, create_timeline_semaphore, AcquireSlot,
-    CommandResources, FrameSync,
+    barrier_compute_to_graphics, barrier_graphics_to_compute, create_command_resources,
+    create_sync_objects, create_timeline_semaphore, AcquireSlot, CommandResources, FrameSync,
 };
 
 // 1) Public api / constants
@@ -102,6 +103,10 @@ pub struct VkRenderer {
     image_views: Vec<vk::ImageView>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    // No-op dispatch validating the compute pipeline path; not tied to
+    // swapchain format/extent, so created once and never recreated.
+    compute_pipeline_layout: vk::PipelineLayout,
+    compute_pipeline: vk::Pipeline,
 
     cmd_pool: vk::CommandPool,
     cmd_bufs: Vec<vk::CommandBuffer>,
@@ -204,6 +209,8 @@ impl Drop for VkRenderer {
             // 3) PIPELINE & LAYOUTS BEFORE SWAPCHAIN (pipelines can depend on sc format)
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_pipeline_layout(self.pipeline_layout, None);
+            d.destroy_pipeline(self.compute_pipeline, None);
+            d.destroy_pipeline_layout(self.compute_pipeline_layout, None);
 
             // 4) IMAGE VIEWS BEFORE SWAPCHAIN (views are created from sc images)
             for &iv in &self.image_views {
@@ -501,6 +508,20 @@ fn build_renderer(
     let cache_path = pipeline_cache_path(&props);
     let pipeline_cache = create_or_load_pipeline_cache(&device, &cache_path)?;
 
+    // 3a) No-op compute pipeline, to validate the compute path before any
+    // real compute shader exists. Empty layout: the shader reads/writes
+    // nothing. Reuses the graphics queue/queue family — any queue family
+    // supporting GRAPHICS is spec-guaranteed to also support COMPUTE.
+    let compute_pipeline_layout =
+        unsafe { device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)? };
+    let noop_comp_words = load_spv_file(&shader_dir().join("noop.comp.spv"))?;
+    let compute_pipeline = create_compute_pipeline(
+        &device,
+        pipeline_cache,
+        compute_pipeline_layout,
+        &noop_comp_words,
+    )?;
+
     // 3b) GPU memory sub-allocator, replaces raw vkAllocateMemory/vkFreeMemory
     let mut allocator = Allocator::new(&AllocatorCreateDesc {
         instance: instance.clone(),
@@ -611,6 +632,8 @@ fn build_renderer(
 
         pipeline,
         pipeline_layout,
+        compute_pipeline,
+        compute_pipeline_layout,
         cmd_pool: cmd.pool,
         cmd_bufs: cmd.bufs,
 
@@ -1069,6 +1092,25 @@ impl VkRenderer {
         unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep_post) };
     }
 
+    /// Dispatches the no-op compute pipeline, bracketed by compute<->graphics
+    /// barriers, purely to validate the compute pipeline/dispatch/sync path
+    /// (see "Add compute pipeline infrastructure"). Does no real work yet;
+    /// real compute passes (culling, meshing, terrain gen) will follow this
+    /// same bind/dispatch/barrier shape once they exist.
+    #[inline]
+    fn record_noop_compute_dispatch(&self, cmd: vk::CommandBuffer) {
+        barrier_graphics_to_compute(&self.device, cmd);
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.compute_pipeline,
+            );
+            self.device.cmd_dispatch(cmd, 1, 1, 1);
+        }
+        barrier_compute_to_graphics(&self.device, cmd);
+    }
+
     #[inline]
     // Records draws queued via draw_mesh() into the given image's command
     // buffer. Called fresh every frame for the just-acquired image (see
@@ -1093,6 +1135,7 @@ impl VkRenderer {
         unsafe { self.device.begin_command_buffer(cmd, &begin)? };
 
         // body
+        self.record_noop_compute_dispatch(cmd);
         self.transition_to_color(cmd, image);
         self.transition_depth_to_attachment(cmd, self.depth_image);
         self.begin_rendering(cmd, image_view);

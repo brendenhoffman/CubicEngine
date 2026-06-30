@@ -58,6 +58,64 @@ pub(crate) fn create_timeline_semaphore(
     Ok(unsafe { device.create_semaphore(&sem_ci, None)? })
 }
 
+/// Generic sync2 execution/memory barrier, with no buffer or image tied to
+/// it. Suitable for compute<->graphics ordering around dispatches that
+/// don't (yet) read/write a specific resource; barriers scoped to an
+/// actual buffer or image should use VkBufferMemoryBarrier2 /
+/// VkImageMemoryBarrier2 instead once there's a real resource to name.
+fn memory_barrier2(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    src_stage: vk::PipelineStageFlags2,
+    src_access: vk::AccessFlags2,
+    dst_stage: vk::PipelineStageFlags2,
+    dst_access: vk::AccessFlags2,
+) {
+    let barrier = vk::MemoryBarrier2 {
+        s_type: vk::StructureType::MEMORY_BARRIER_2,
+        src_stage_mask: src_stage,
+        src_access_mask: src_access,
+        dst_stage_mask: dst_stage,
+        dst_access_mask: dst_access,
+        ..Default::default()
+    };
+    let dep = vk::DependencyInfo {
+        s_type: vk::StructureType::DEPENDENCY_INFO,
+        memory_barrier_count: 1,
+        p_memory_barriers: &barrier,
+        ..Default::default()
+    };
+    unsafe { device.cmd_pipeline_barrier2(cmd, &dep) };
+}
+
+/// Ensures compute shader writes are visible to subsequent vertex/fragment
+/// shader reads (e.g. a compute pass writing chunk/culling data that the
+/// graphics pipeline then reads).
+pub(crate) fn barrier_compute_to_graphics(device: &ash::Device, cmd: vk::CommandBuffer) {
+    memory_barrier2(
+        device,
+        cmd,
+        vk::PipelineStageFlags2::COMPUTE_SHADER,
+        vk::AccessFlags2::SHADER_WRITE,
+        vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_READ,
+    );
+}
+
+/// Ensures vertex/fragment shader writes are visible to a subsequent
+/// compute dispatch's reads (the reverse direction of
+/// `barrier_compute_to_graphics`).
+pub(crate) fn barrier_graphics_to_compute(device: &ash::Device, cmd: vk::CommandBuffer) {
+    memory_barrier2(
+        device,
+        cmd,
+        vk::PipelineStageFlags2::VERTEX_SHADER | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+        vk::AccessFlags2::SHADER_WRITE,
+        vk::PipelineStageFlags2::COMPUTE_SHADER,
+        vk::AccessFlags2::SHADER_READ,
+    );
+}
+
 pub(crate) fn create_sync_objects(
     device: &ash::Device,
     image_count: usize,

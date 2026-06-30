@@ -16,7 +16,7 @@ pub(crate) struct ShaderDev {
     pub(crate) frag_mtime: SystemTime,
 }
 
-fn load_spv_file(path: &Path) -> Result<Vec<u32>> {
+pub(crate) fn load_spv_file(path: &Path) -> Result<Vec<u32>> {
     let bytes = fs::read(path).with_context(|| format!("read {:?}", path))?;
     read_spv(&mut Cursor::new(&bytes[..])).with_context(|| format!("read_spv {:?}", path))
 }
@@ -303,4 +303,48 @@ pub(crate) fn create_pipeline(
     }
 
     Ok((layout, pipelines[0]))
+}
+
+/// Build a compute pipeline from SPIR-V words and a caller-supplied layout
+/// (a real compute shader's descriptor/push-constant bindings are specific
+/// to what it does, so unlike `create_pipeline` there's no fixed layout to
+/// assume here).
+pub(crate) fn create_compute_pipeline(
+    device: &ash::Device,
+    cache: vk::PipelineCache,
+    layout: vk::PipelineLayout,
+    shader_words: &[u32],
+) -> Result<vk::Pipeline> {
+    let module_ci = vk::ShaderModuleCreateInfo {
+        s_type: vk::StructureType::SHADER_MODULE_CREATE_INFO,
+        p_code: shader_words.as_ptr(),
+        code_size: shader_words.len() * 4,
+        ..Default::default()
+    };
+    let module = unsafe { device.create_shader_module(&module_ci, None)? };
+    let entry = std::ffi::CString::new("main").unwrap();
+
+    let stage = vk::PipelineShaderStageCreateInfo {
+        s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+        stage: vk::ShaderStageFlags::COMPUTE,
+        module,
+        p_name: entry.as_ptr(),
+        ..Default::default()
+    };
+
+    let pipeline_info = vk::ComputePipelineCreateInfo {
+        s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+        stage,
+        layout,
+        ..Default::default()
+    };
+
+    let pipelines = unsafe {
+        device.create_compute_pipelines(cache, std::slice::from_ref(&pipeline_info), None)
+    }
+    .map_err(|(_, err)| anyhow!("create_compute_pipelines failed: {:?}", err))?;
+
+    unsafe { device.destroy_shader_module(module, None) };
+
+    Ok(pipelines[0])
 }
