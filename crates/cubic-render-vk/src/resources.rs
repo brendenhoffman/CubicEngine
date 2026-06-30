@@ -29,7 +29,15 @@ pub struct Vertex {
 pub struct PushData {
     pub model: [[f32; 4]; 4],
     pub tint: [f32; 4],
+    /// Index into the bindless texture array (see `MAX_TEXTURES`).
+    pub tex_index: u32,
+    pub _pad: [u32; 3],
 }
+
+/// Upper bound on the bindless texture array's descriptor count. Most
+/// slots can stay unwritten (the layout binding is PARTIALLY_BOUND); this
+/// just caps how many distinct textures can ever be registered at once.
+pub(crate) const MAX_TEXTURES: u32 = 256;
 
 struct ImageAllocInfo {
     extent: vk::Extent2D,
@@ -247,19 +255,33 @@ pub(crate) fn create_camera_desc_set_layout(
     Ok(unsafe { device.create_descriptor_set_layout(&ci, None)? })
 }
 
+/// Bindless texture array: set = 1, binding = 0 (convention; set index is
+/// decided by pipeline layout order). A single global set of MAX_TEXTURES
+/// combined image samplers, indexed in the shader via a push constant
+/// rather than rebinding a different descriptor set per draw.
 pub(crate) fn create_material_desc_set_layout(
     device: &ash::Device,
 ) -> Result<vk::DescriptorSetLayout> {
-    // set = 1, binding = 0  (convention; set index is decided by pipeline layout order)
     let binding = vk::DescriptorSetLayoutBinding {
         binding: 0,
         descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        descriptor_count: 1,
+        descriptor_count: MAX_TEXTURES,
         stage_flags: vk::ShaderStageFlags::FRAGMENT,
+        ..Default::default()
+    };
+    // PARTIALLY_BOUND: slots we never write (i.e. almost all of them,
+    // until more textures are loaded) don't need to hold valid descriptors
+    // as long as the shader never indexes them.
+    let binding_flags = vk::DescriptorBindingFlags::PARTIALLY_BOUND;
+    let mut binding_flags_ci = vk::DescriptorSetLayoutBindingFlagsCreateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO,
+        binding_count: 1,
+        p_binding_flags: &binding_flags,
         ..Default::default()
     };
     let ci = vk::DescriptorSetLayoutCreateInfo {
         s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        p_next: (&mut binding_flags_ci) as *mut _ as *mut std::ffi::c_void,
         binding_count: 1,
         p_bindings: &binding,
         ..Default::default()
@@ -479,7 +501,7 @@ pub(crate) fn create_material_desc_pool_and_set(
 ) -> Result<(vk::DescriptorPool, vk::DescriptorSet)> {
     let pool_sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        descriptor_count: 1,
+        descriptor_count: MAX_TEXTURES,
     }];
     let pool_ci = vk::DescriptorPoolCreateInfo {
         s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
@@ -501,9 +523,12 @@ pub(crate) fn create_material_desc_pool_and_set(
     Ok((pool, set))
 }
 
+/// Register a texture into the bindless array at `index` (see
+/// `PushData::tex_index`).
 pub(crate) fn write_material_descriptors(
     device: &ash::Device,
     set: vk::DescriptorSet,
+    index: u32,
     view: vk::ImageView,
     sampler: vk::Sampler,
 ) {
@@ -516,6 +541,7 @@ pub(crate) fn write_material_descriptors(
         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
         dst_set: set,
         dst_binding: 0,
+        dst_array_element: index,
         descriptor_count: 1,
         descriptor_type: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
         p_image_info: &image_info,

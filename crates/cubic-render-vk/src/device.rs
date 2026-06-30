@@ -126,6 +126,14 @@ pub(crate) fn decide_path_and_create_device(
     // ray tracing / bindless buffer patterns don't require a device
     // recreation later.
     feats12.buffer_device_address = vk::TRUE;
+    // Enable descriptor indexing (VK_EXT_descriptor_indexing, core in 1.2)
+    // for the bindless texture array: PARTIALLY_BOUND lets the array have
+    // unwritten slots, runtime_descriptor_array lets the shader declare an
+    // unsized sampler array, and the non-uniform-indexing feature lets it
+    // index that array with a push-constant value.
+    feats12.descriptor_binding_partially_bound = vk::TRUE;
+    feats12.runtime_descriptor_array = vk::TRUE;
+    feats12.shader_sampled_image_array_non_uniform_indexing = vk::TRUE;
 
     let (path, pnext): (RenderPath, *const std::ffi::c_void) = if !force_khr {
         let dev_api = unsafe { instance.get_physical_device_properties(phys).api_version };

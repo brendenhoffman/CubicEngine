@@ -250,7 +250,7 @@ pub(crate) fn create_pipeline(
     // --- Pipeline layout ---
     let layouts = [set_layout_camera, set_layout_material];
     let push_range = vk::PushConstantRange {
-        stage_flags: vk::ShaderStageFlags::VERTEX,
+        stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
         offset: 0,
         size: std::mem::size_of::<super::resources::PushData>() as u32,
     };

@@ -575,10 +575,11 @@ fn build_renderer(
     let (material_desc_pool, material_desc_set) =
         create_material_desc_pool_and_set(&device, desc_set_layout_material)?;
 
-    // Tiny 2×2 texture and sampler, then write the descriptor
+    // Tiny 2×2 texture and sampler, registered at bindless index 0 (the
+    // fallback every draw uses until real texture loading exists).
     let (tex_image, tex_alloc, tex_view, tex_sampler) =
         create_dummy_texture_and_sampler(&device, &mut allocator, queue, cmd.pool)?;
-    write_material_descriptors(&device, material_desc_set, tex_view, tex_sampler);
+    write_material_descriptors(&device, material_desc_set, 0, tex_view, tex_sampler);
 
     let (ubufs, umems, ubo_ptrs, ubo_size, desc_pool, desc_sets) = create_frame_uniforms_and_sets(
         &instance,
@@ -1017,7 +1018,7 @@ impl VkRenderer {
                 self.device.cmd_push_constants(
                     cmd,
                     self.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     0,
                     bytemuck::bytes_of(push),
                 );

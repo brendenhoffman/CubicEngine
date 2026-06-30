@@ -168,6 +168,10 @@ mod test_scene {
             [0.0, 0.0, 0.0, 1.0],
         ],
         tint: [1.0, 1.0, 1.0, 1.0],
+        // 0 = the renderer's built-in dummy texture; there's no real
+        // texture-loading API yet for anything else to reference.
+        tex_index: 0,
+        _pad: [0; 3],
     };
 }
 
