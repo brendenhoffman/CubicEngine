@@ -513,6 +513,7 @@ dependencies = [
  "ash-window",
  "bytemuck",
  "cubic-render",
+ "gpu-allocator",
  "raw-window-handle",
  "shaderc",
  "tracing",
@@ -716,6 +717,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c4ee00b289aba7a9e5306d57c2d05499b2e5dc427f84ac708bd2c090212cf3e"
 dependencies = [
  "gl_generator",
+]
+
+[[package]]
+name = "gpu-allocator"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c151a2a5ef800297b4e79efa4f4bec035c5f51d5ae587287c9b952bdf734cacd"
+dependencies = [
+ "ash",
+ "log",
+ "presser",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1296,6 +1309,12 @@ dependencies = [
  "rustix 1.1.2",
  "windows-sys 0.60.2",
 ]
+
+[[package]]
+name = "presser"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8cf8e6a8aa66ce33f63993ffc4ea4271eb5b0530a9002db8455ea6050c77bfa"
 
 [[package]]
 name = "proc-macro-crate"

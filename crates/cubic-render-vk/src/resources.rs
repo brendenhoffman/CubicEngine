@@ -3,6 +3,8 @@
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
+use gpu_allocator::MemoryLocation;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Zeroable, Pod)]
@@ -23,12 +25,6 @@ pub(crate) struct Vertex {
 pub(crate) struct PushData {
     pub(crate) model: [[f32; 4]; 4],
     pub(crate) tint: [f32; 4],
-}
-
-struct DeviceCtx<'a> {
-    instance: &'a ash::Instance,
-    device: &'a ash::Device,
-    phys: vk::PhysicalDevice,
 }
 
 struct ImageAllocInfo {
@@ -52,34 +48,12 @@ struct LayoutTransition {
 
 pub(crate) type FrameUniforms = (
     Vec<vk::Buffer>,
-    Vec<vk::DeviceMemory>,
+    Vec<Allocation>,
     Vec<*mut std::ffi::c_void>,
     vk::DeviceSize,
     vk::DescriptorPool,
     Vec<vk::DescriptorSet>,
 );
-
-#[inline]
-pub(crate) fn find_memory_type(
-    instance: &ash::Instance,
-    phys: vk::PhysicalDevice,
-    type_bits: u32,
-    req: vk::MemoryPropertyFlags,
-) -> anyhow::Result<u32> {
-    let mem = unsafe { instance.get_physical_device_memory_properties(phys) };
-
-    for i in 0..mem.memory_type_count {
-        let type_ok = (type_bits & (1 << i)) != 0;
-        let props_ok = mem.memory_types[i as usize].property_flags.contains(req);
-        if type_ok && props_ok {
-            return Ok(i);
-        }
-    }
-
-    Err(anyhow!(
-        "no suitable memory type: type_bits=0x{type_bits:08x}, required_flags={req:?}"
-    ))
-}
 
 fn has_stencil(format: vk::Format) -> bool {
     matches!(
@@ -149,12 +123,11 @@ fn make_depth_view(
 }
 
 pub(crate) fn create_depth_resources(
-    instance: &ash::Instance,
     device: &ash::Device,
-    phys: vk::PhysicalDevice,
+    allocator: &mut Allocator,
     extent: vk::Extent2D,
     depth_format: vk::Format,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
+) -> Result<(vk::Image, Allocation, vk::ImageView)> {
     let img_ci = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
         image_type: vk::ImageType::TYPE_2D,
@@ -180,47 +153,35 @@ pub(crate) fn create_depth_resources(
     })?;
 
     let mem_req = unsafe { device.get_image_memory_requirements(image) };
-    let mem_type_idx = find_memory_type(
-        instance,
-        phys,
-        mem_req.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )
-    .with_context(|| {
-        format!(
-            "depth image memory selection: req_bits=0x{:08x}, size={}",
-            mem_req.memory_type_bits, mem_req.size
-        )
-    })?;
+    let allocation = allocator
+        .allocate(&AllocationCreateDesc {
+            name: "depth image",
+            requirements: mem_req,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::DedicatedImage(image),
+        })
+        .with_context(|| format!("allocate (depth) size={}", mem_req.size))?;
 
-    let alloc = vk::MemoryAllocateInfo {
-        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
-        allocation_size: mem_req.size,
-        memory_type_index: mem_type_idx,
-        ..Default::default()
-    };
-    let memory = unsafe { device.allocate_memory(&alloc, None) }.with_context(|| {
-        format!(
-            "allocate_memory (depth) size={} mem_type_index={}",
-            mem_req.size, mem_type_idx
-        )
-    })?;
-
-    unsafe { device.bind_image_memory(image, memory, 0) }
+    unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) }
         .with_context(|| "bind_image_memory (depth)")?;
 
     let depth_view = make_depth_view(device, image, depth_format)?;
-    Ok((image, memory, depth_view))
+    Ok((image, allocation, depth_view))
 }
 
+// Buffers are sub-allocated (GpuAllocatorManaged) rather than given a
+// dedicated VkDeviceMemory each: many short-lived/small buffers (UBOs,
+// staging, mesh data) would otherwise burn through the driver's discrete
+// allocation cap (~4096) fast.
 pub(crate) fn create_buffer_and_memory(
-    instance: &ash::Instance,
     device: &ash::Device,
-    phys: vk::PhysicalDevice,
+    allocator: &mut Allocator,
     size: vk::DeviceSize,
     usage: vk::BufferUsageFlags,
-    props: vk::MemoryPropertyFlags,
-) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+    location: MemoryLocation,
+    name: &str,
+) -> Result<(vk::Buffer, Allocation)> {
     let bci = vk::BufferCreateInfo {
         s_type: vk::StructureType::BUFFER_CREATE_INFO,
         size,
@@ -232,40 +193,34 @@ pub(crate) fn create_buffer_and_memory(
         .with_context(|| format!("create_buffer usage={usage:?} size={size}"))?;
 
     let req = unsafe { device.get_buffer_memory_requirements(buf) };
-    let mem_type = find_memory_type(instance, phys, req.memory_type_bits, props)
-        .with_context(|| format!("buffer memory selection for usage={usage:?}, props={props:?}, size={size}, req_bits=0x{:08x}", req.memory_type_bits))?;
+    let allocation = allocator
+        .allocate(&AllocationCreateDesc {
+            name,
+            requirements: req,
+            location,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })
+        .with_context(|| format!("allocate buffer name={name} usage={usage:?} size={size}"))?;
 
-    let mai = vk::MemoryAllocateInfo {
-        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
-        allocation_size: req.size,
-        memory_type_index: mem_type,
-        ..Default::default()
-    };
-    let mem = unsafe { device.allocate_memory(&mai, None) }.with_context(|| {
-        format!(
-            "allocate_memory size={} mem_type_index={}",
-            req.size, mem_type
-        )
-    })?;
+    unsafe { device.bind_buffer_memory(buf, allocation.memory(), allocation.offset()) }
+        .with_context(|| "bind_buffer_memory")?;
 
-    unsafe { device.bind_buffer_memory(buf, mem, 0) }.with_context(|| "bind_buffer_memory")?;
-
-    Ok((buf, mem))
+    Ok((buf, allocation))
 }
 
 fn create_host_visible_ubo(
-    instance: &ash::Instance,
     device: &ash::Device,
-    phys: vk::PhysicalDevice,
+    allocator: &mut Allocator,
     size: vk::DeviceSize,
-) -> Result<(vk::Buffer, vk::DeviceMemory)> {
+) -> Result<(vk::Buffer, Allocation)> {
     create_buffer_and_memory(
-        instance,
         device,
-        phys,
+        allocator,
         size,
         vk::BufferUsageFlags::UNIFORM_BUFFER,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        MemoryLocation::CpuToGpu,
+        "camera ubo",
     )
 }
 
@@ -309,9 +264,11 @@ pub(crate) fn create_material_desc_set_layout(
 }
 
 fn create_image_and_memory(
-    ctx: &DeviceCtx,
+    device: &ash::Device,
+    allocator: &mut Allocator,
     info: &ImageAllocInfo,
-) -> Result<(vk::Image, vk::DeviceMemory)> {
+    name: &str,
+) -> Result<(vk::Image, Allocation)> {
     let ci = vk::ImageCreateInfo {
         s_type: vk::StructureType::IMAGE_CREATE_INFO,
         image_type: vk::ImageType::TYPE_2D,
@@ -329,30 +286,25 @@ fn create_image_and_memory(
         sharing_mode: vk::SharingMode::EXCLUSIVE,
         ..Default::default()
     };
-    let image = unsafe { ctx.device.create_image(&ci, None) }.with_context(|| {
+    let image = unsafe { device.create_image(&ci, None) }.with_context(|| {
         format!(
             "create_image fmt={:?} extent={:?}",
             info.format, info.extent
         )
     })?;
 
-    let req = unsafe { ctx.device.get_image_memory_requirements(image) };
-    let mem_type_idx = find_memory_type(
-        ctx.instance,
-        ctx.phys,
-        req.memory_type_bits,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
-    let ai = vk::MemoryAllocateInfo {
-        s_type: vk::StructureType::MEMORY_ALLOCATE_INFO,
-        allocation_size: req.size,
-        memory_type_index: mem_type_idx,
-        ..Default::default()
-    };
-    let mem = unsafe { ctx.device.allocate_memory(&ai, None) }
-        .with_context(|| format!("allocate_memory (image) size={}", req.size))?;
-    unsafe { ctx.device.bind_image_memory(image, mem, 0) }?;
-    Ok((image, mem))
+    let req = unsafe { device.get_image_memory_requirements(image) };
+    let allocation = allocator
+        .allocate(&AllocationCreateDesc {
+            name,
+            requirements: req,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::DedicatedImage(image),
+        })
+        .with_context(|| format!("allocate (image) name={name} size={}", req.size))?;
+    unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset()) }?;
+    Ok((image, allocation))
 }
 
 fn make_image_view_2d_color(
@@ -569,12 +521,11 @@ pub(crate) fn write_material_descriptors(
 }
 
 pub(crate) fn create_dummy_texture_and_sampler(
-    instance: &ash::Instance,
     device: &ash::Device,
-    phys: vk::PhysicalDevice,
+    allocator: &mut Allocator,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::Sampler)> {
+) -> Result<(vk::Image, Allocation, vk::ImageView, vk::Sampler)> {
     // 2x2 checkerboard RGBA
     let extent = vk::Extent2D {
         width: 2,
@@ -585,11 +536,6 @@ pub(crate) fn create_dummy_texture_and_sampler(
     ];
 
     // Create device-local image
-    let ctx = DeviceCtx {
-        instance,
-        device,
-        phys,
-    };
     let info = ImageAllocInfo {
         extent,
         mip_levels: 1,
@@ -597,23 +543,23 @@ pub(crate) fn create_dummy_texture_and_sampler(
         usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
         tiling: vk::ImageTiling::OPTIMAL,
     };
-    let (image, memory) = create_image_and_memory(&ctx, &info)?;
+    let (image, memory) = create_image_and_memory(device, allocator, &info, "dummy texture")?;
 
     // Create staging buffer and copy pixels into it
     let size = pixels.len() as vk::DeviceSize;
-    let (staging, staging_mem) = create_buffer_and_memory(
-        instance,
+    let (staging, mut staging_alloc) = create_buffer_and_memory(
         device,
-        phys,
+        allocator,
         size,
         vk::BufferUsageFlags::TRANSFER_SRC,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        MemoryLocation::CpuToGpu,
+        "dummy texture staging",
     )?;
-    unsafe {
-        let mapped =
-            device.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
-        std::ptr::copy_nonoverlapping(pixels.as_ptr(), mapped, pixels.len());
-        device.unmap_memory(staging_mem);
+    {
+        let mapped = staging_alloc
+            .mapped_slice_mut()
+            .ok_or_else(|| anyhow!("dummy texture staging allocation not host-mapped"))?;
+        mapped[..pixels.len()].copy_from_slice(&pixels);
     }
 
     // One-time command buffer to do the transitions + copy
@@ -650,8 +596,8 @@ pub(crate) fn create_dummy_texture_and_sampler(
         device.destroy_fence(fence, None);
         device.free_command_buffers(cmd_pool, std::slice::from_ref(&cmd));
         device.destroy_buffer(staging, None);
-        device.free_memory(staging_mem, None);
     }
+    allocator.free(staging_alloc)?;
 
     let view = make_image_view_2d_color(device, image, vk::Format::R8G8B8A8_UNORM, 0, 1)?;
     let sampler = create_sampler(device, 1)?;
@@ -662,34 +608,29 @@ pub(crate) fn create_dummy_texture_and_sampler(
 /// One-shot staging upload: host->staging, then staging->dst (device-local).
 /// Uses the graphics queue and a one-time command buffer; waits until done.
 pub(crate) fn upload_via_staging(
-    instance: &ash::Instance,
     device: &ash::Device,
-    phys: vk::PhysicalDevice,
+    allocator: &mut Allocator,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
     dst: vk::Buffer,
     src_data: &[u8],
 ) -> Result<()> {
-    // 1) Create HOST_VISIBLE|COHERENT staging buffer
+    // 1) Create CPU-to-GPU staging buffer
     let size = src_data.len() as vk::DeviceSize;
-    let (staging, staging_mem) = create_buffer_and_memory(
-        instance,
+    let (staging, mut staging_alloc) = create_buffer_and_memory(
         device,
-        phys,
+        allocator,
         size,
         vk::BufferUsageFlags::TRANSFER_SRC,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        MemoryLocation::CpuToGpu,
+        "upload staging",
     )?;
 
     // Map + copy into staging
-    let mapped = unsafe {
-        std::slice::from_raw_parts_mut(
-            device.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())? as *mut u8,
-            src_data.len(),
-        )
-    };
-    mapped.copy_from_slice(src_data);
-    unsafe { device.unmap_memory(staging_mem) };
+    let mapped = staging_alloc
+        .mapped_slice_mut()
+        .ok_or_else(|| anyhow!("upload staging allocation not host-mapped"))?;
+    mapped[..src_data.len()].copy_from_slice(src_data);
 
     // 2) One-time copy staging -> dst
     let ai = vk::CommandBufferAllocateInfo {
@@ -729,7 +670,7 @@ pub(crate) fn upload_via_staging(
     // 4) Cleanup
     unsafe { device.free_command_buffers(cmd_pool, std::slice::from_ref(&cmd)) };
     unsafe { device.destroy_buffer(staging, None) };
-    unsafe { device.free_memory(staging_mem, None) };
+    allocator.free(staging_alloc)?;
     Ok(())
 }
 
@@ -737,6 +678,7 @@ pub(crate) fn create_frame_uniforms_and_sets(
     instance: &ash::Instance,
     device: &ash::Device,
     phys: vk::PhysicalDevice,
+    allocator: &mut Allocator,
     set_layout: vk::DescriptorSetLayout,
     image_count: usize,
 ) -> Result<FrameUniforms> {
@@ -746,14 +688,17 @@ pub(crate) fn create_frame_uniforms_and_sets(
     let ubo_size = sz.div_ceil(a) * a;
 
     let mut ubufs = Vec::with_capacity(image_count);
-    let mut umems = Vec::with_capacity(image_count);
+    let mut uallocs = Vec::with_capacity(image_count);
     let mut ubo_ptrs = Vec::with_capacity(image_count);
 
     for _ in 0..image_count {
-        let (b, m) = create_host_visible_ubo(instance, device, phys, ubo_size)?;
-        let ptr = unsafe { device.map_memory(m, 0, ubo_size, vk::MemoryMapFlags::empty())? };
+        let (b, alloc) = create_host_visible_ubo(device, allocator, ubo_size)?;
+        let ptr = alloc
+            .mapped_ptr()
+            .ok_or_else(|| anyhow!("UBO allocation not host-mapped"))?
+            .as_ptr();
         ubufs.push(b);
-        umems.push(m);
+        uallocs.push(alloc);
         ubo_ptrs.push(ptr);
     }
 
@@ -800,5 +745,5 @@ pub(crate) fn create_frame_uniforms_and_sets(
     }
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 
-    Ok((ubufs, umems, ubo_ptrs, ubo_size, pool, sets))
+    Ok((ubufs, uallocs, ubo_ptrs, ubo_size, pool, sets))
 }

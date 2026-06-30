@@ -12,6 +12,8 @@ use anyhow::{anyhow, Result};
 use ash::khr::surface;
 use ash::{vk, Entry};
 use cubic_render::{RenderSize, Renderer};
+use gpu_allocator::vulkan::{Allocation, Allocator, AllocatorCreateDesc};
+use gpu_allocator::MemoryLocation;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use tracing::info;
 
@@ -89,6 +91,10 @@ pub struct VkRenderer {
     phys: vk::PhysicalDevice,
     device: ash::Device,
     queue: vk::Queue,
+    // Option so Drop can `.take()` it and drop it explicitly before the
+    // device is destroyed (Allocator::drop frees any remaining cached
+    // memory blocks via its own device handle).
+    allocator: Option<Allocator>,
 
     swapchain_loader: ash::khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
@@ -117,20 +123,20 @@ pub struct VkRenderer {
     cfg: RuntimeConfig,
 
     depth_image: vk::Image,
-    depth_mem: vk::DeviceMemory,
+    depth_alloc: Allocation,
     depth_view: vk::ImageView,
     depth_format: vk::Format,
     vbuf: vk::Buffer,
-    vbuf_mem: vk::DeviceMemory,
+    vbuf_alloc: Allocation,
     ibuf: vk::Buffer,
-    ibuf_mem: vk::DeviceMemory,
+    ibuf_alloc: Allocation,
     index_count: u32,
     desc_pool: vk::DescriptorPool,
     desc_set_layout_camera: vk::DescriptorSetLayout,
     desc_set_layout_material: vk::DescriptorSetLayout,
     desc_sets: Vec<vk::DescriptorSet>,
     ubufs: Vec<vk::Buffer>,
-    umems: Vec<vk::DeviceMemory>,
+    umems: Vec<Allocation>,
     ubo_ptrs: Vec<*mut std::ffi::c_void>,
     ubo_size: vk::DeviceSize,
     pipeline_cache: vk::PipelineCache,
@@ -144,7 +150,7 @@ pub struct VkRenderer {
     material_desc_pool: vk::DescriptorPool,
     material_desc_set: vk::DescriptorSet,
     tex_image: vk::Image,
-    tex_mem: vk::DeviceMemory,
+    tex_alloc: Allocation,
     tex_view: vk::ImageView,
     tex_sampler: vk::Sampler,
 }
@@ -217,36 +223,33 @@ impl Drop for VkRenderer {
             // Destroy timeline semaphore
             d.destroy_semaphore(self.timeline, None);
 
+            // Take ownership of the allocator so every allocation can be
+            // freed below, and so it can be explicitly dropped before the
+            // device is destroyed (Allocator::drop frees any remaining
+            // cached memory blocks via its own device handle, which must
+            // still be valid at that point).
+            let mut allocator = self.allocator.take().expect("allocator missing in Drop");
+
             // Destroy depth
             d.destroy_image_view(self.depth_view, None);
             d.destroy_image(self.depth_image, None);
-            d.free_memory(self.depth_mem, None);
+            let _ = allocator.free(std::mem::take(&mut self.depth_alloc));
 
             // Destroy vertex/image buffers
             d.destroy_buffer(self.vbuf, None);
-            d.free_memory(self.vbuf_mem, None);
+            let _ = allocator.free(std::mem::take(&mut self.vbuf_alloc));
             d.destroy_buffer(self.ibuf, None);
-            d.free_memory(self.ibuf_mem, None);
+            let _ = allocator.free(std::mem::take(&mut self.ibuf_alloc));
 
-            // Destroy frame resources
-            for (i, &m) in self.umems.iter().enumerate() {
-                let p = self
-                    .ubo_ptrs
-                    .get(i)
-                    .copied()
-                    .unwrap_or(std::ptr::null_mut());
-                if !p.is_null() {
-                    self.device.unmap_memory(m);
-                }
-            }
+            // Destroy frame resources (gpu-allocator persistently maps
+            // CpuToGpu allocations, so no explicit unmap is needed)
             for &b in &self.ubufs {
                 self.device.destroy_buffer(b, None);
             }
-            for &m in &self.umems {
-                self.device.free_memory(m, None);
+            for alloc in self.umems.drain(..) {
+                let _ = allocator.free(alloc);
             }
             self.ubufs.clear();
-            self.umems.clear();
             self.ubo_ptrs.clear();
             self.ubo_size = 0;
             if self.desc_pool != vk::DescriptorPool::null() {
@@ -266,13 +269,17 @@ impl Drop for VkRenderer {
             d.destroy_sampler(self.tex_sampler, None);
             d.destroy_image_view(self.tex_view, None);
             d.destroy_image(self.tex_image, None);
-            d.free_memory(self.tex_mem, None);
+            let _ = allocator.free(std::mem::take(&mut self.tex_alloc));
 
             // Save and destroy pipeline cache
             let props = self.instance.get_physical_device_properties(self.phys);
             let cache_path = pipeline_cache_path(&props);
             let _ = save_pipeline_cache(d, self.pipeline_cache, &cache_path);
             d.destroy_pipeline_cache(self.pipeline_cache, None);
+
+            // Explicitly drop the allocator now, while the device is still
+            // alive, and before destroying the device.
+            drop(allocator);
 
             // 8) DESTROY DEVICE, THEN SURFACE, THEN INSTANCE
             d.destroy_device(None);
@@ -484,6 +491,16 @@ fn build_renderer(
     let cache_path = pipeline_cache_path(&props);
     let pipeline_cache = create_or_load_pipeline_cache(&device, &cache_path)?;
 
+    // 3b) GPU memory sub-allocator, replaces raw vkAllocateMemory/vkFreeMemory
+    let mut allocator = Allocator::new(&AllocatorCreateDesc {
+        instance: instance.clone(),
+        device: device.clone(),
+        physical_device: phys,
+        debug_settings: Default::default(),
+        buffer_device_address: false,
+        allocation_sizes: Default::default(),
+    })?;
+
     // Create timeline semaphore
     let timeline = create_timeline_semaphore(&device, 0)?;
     let timeline_value: u64 = 0;
@@ -545,22 +562,23 @@ fn build_renderer(
     };
     let (sc, cmd, (pipeline_layout, pipeline), acq_slots, frames) =
         make_initial_swapchain_resources(&init_inp)?;
-    let (depth_image, depth_mem, depth_view) =
-        create_depth_resources(&instance, &device, phys, sc.extent, depth_format)?;
+    let (depth_image, depth_alloc, depth_view) =
+        create_depth_resources(&device, &mut allocator, sc.extent, depth_format)?;
 
     // Global material set (swapchain-invariant)
     let (material_desc_pool, material_desc_set) =
         create_material_desc_pool_and_set(&device, desc_set_layout_material)?;
 
     // Tiny 2×2 texture and sampler, then write the descriptor
-    let (tex_image, tex_mem, tex_view, tex_sampler) =
-        create_dummy_texture_and_sampler(&instance, &device, phys, queue, cmd.pool)?;
+    let (tex_image, tex_alloc, tex_view, tex_sampler) =
+        create_dummy_texture_and_sampler(&device, &mut allocator, queue, cmd.pool)?;
     write_material_descriptors(&device, material_desc_set, tex_view, tex_sampler);
 
     let (ubufs, umems, ubo_ptrs, ubo_size, desc_pool, desc_sets) = create_frame_uniforms_and_sets(
         &instance,
         &device,
         phys,
+        &mut allocator,
         desc_set_layout_camera,
         sc.image_views.len(),
     )?;
@@ -570,29 +588,29 @@ fn build_renderer(
     let isize = std::mem::size_of_val(TRI_IDXS) as vk::DeviceSize;
 
     // Create destination (device-local) buffers
-    let (vbuf, vmem) = create_buffer_and_memory(
-        &instance,
+    let (vbuf, vbuf_alloc) = create_buffer_and_memory(
         &device,
-        phys,
+        &mut allocator,
         vsize,
         vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        MemoryLocation::GpuOnly,
+        "vertex buffer",
     )?;
-    let (ibuf, imem) = create_buffer_and_memory(
-        &instance,
+    let (ibuf, ibuf_alloc) = create_buffer_and_memory(
         &device,
-        phys,
+        &mut allocator,
         isize,
         vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        MemoryLocation::GpuOnly,
+        "index buffer",
     )?;
 
     // Upload via staging
     let vbytes = bytemuck::cast_slice(TRI_VERTS);
     let ibytes = bytemuck::cast_slice(TRI_IDXS);
 
-    upload_via_staging(&instance, &device, phys, queue, cmd.pool, vbuf, vbytes)?;
-    upload_via_staging(&instance, &device, phys, queue, cmd.pool, ibuf, ibytes)?;
+    upload_via_staging(&device, &mut allocator, queue, cmd.pool, vbuf, vbytes)?;
+    upload_via_staging(&device, &mut allocator, queue, cmd.pool, ibuf, ibytes)?;
 
     // 7) Assemble VkRenderer
     let mut r = VkRenderer {
@@ -603,6 +621,7 @@ fn build_renderer(
         phys,
         device,
         queue,
+        allocator: Some(allocator),
 
         swapchain_loader,
         swapchain: sc.swapchain,
@@ -633,13 +652,13 @@ fn build_renderer(
         has_hdr_metadata_ext: has_hdr_meta,
         cfg: initial_cfg,
         depth_image,
-        depth_mem,
+        depth_alloc,
         depth_view,
         depth_format,
         vbuf,
-        vbuf_mem: vmem,
+        vbuf_alloc,
         ibuf,
-        ibuf_mem: imem,
+        ibuf_alloc,
         index_count: TRI_IDXS.len() as u32,
         desc_pool,
         desc_set_layout_camera,
@@ -660,7 +679,7 @@ fn build_renderer(
         material_desc_pool,
         material_desc_set,
         tex_image,
-        tex_mem,
+        tex_alloc,
         tex_view,
         tex_sampler,
     };
@@ -1118,24 +1137,18 @@ impl VkRenderer {
         self.frames.clear();
 
         // 3b) Destroy per-image UBOs + descriptor pool tied to OLD swapchain
-        for (i, &m) in self.umems.iter().enumerate() {
-            let p = self
-                .ubo_ptrs
-                .get(i)
-                .copied()
-                .unwrap_or(std::ptr::null_mut());
-            if !p.is_null() {
-                unsafe { self.device.unmap_memory(m) };
-            }
-        }
+        // (gpu-allocator persistently maps CpuToGpu allocations, so no
+        // explicit unmap is needed)
         for &b in &self.ubufs {
             unsafe { self.device.destroy_buffer(b, None) };
         }
-        for &m in &self.umems {
-            unsafe { self.device.free_memory(m, None) };
+        {
+            let allocator = self.allocator.as_mut().expect("allocator missing");
+            for alloc in self.umems.drain(..) {
+                let _ = allocator.free(alloc);
+            }
         }
         self.ubufs.clear();
-        self.umems.clear();
         self.ubo_ptrs.clear();
         self.ubo_size = 0;
 
@@ -1195,18 +1208,22 @@ impl VkRenderer {
         if self.depth_image != vk::Image::null() {
             unsafe { self.device.destroy_image(self.depth_image, None) };
         }
-        if self.depth_mem != vk::DeviceMemory::null() {
-            unsafe { self.device.free_memory(self.depth_mem, None) };
+        {
+            let old_alloc = std::mem::take(&mut self.depth_alloc);
+            let _ = self
+                .allocator
+                .as_mut()
+                .expect("allocator missing")
+                .free(old_alloc);
         }
-        let (dimg, dmem, dview) = create_depth_resources(
-            &self.instance,
+        let (dimg, dalloc, dview) = create_depth_resources(
             &self.device,
-            self.phys,
+            self.allocator.as_mut().expect("allocator missing"),
             self.extent,
             self.depth_format,
         )?;
         self.depth_image = dimg;
-        self.depth_mem = dmem;
+        self.depth_alloc = dalloc;
         self.depth_view = dview;
 
         // 5) Recreate per-image UBOs + descriptor sets
@@ -1215,6 +1232,7 @@ impl VkRenderer {
                 &self.instance,
                 &self.device,
                 self.phys,
+                self.allocator.as_mut().expect("allocator missing"),
                 self.desc_set_layout_camera,
                 self.images.len(),
             )?;

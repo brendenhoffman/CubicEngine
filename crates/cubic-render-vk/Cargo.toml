@@ -12,6 +12,7 @@ raw-window-handle = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 bytemuck = { workspace = true }
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
 
 [build-dependencies]
 shaderc = { workspace = true }
