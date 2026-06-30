@@ -134,6 +134,8 @@ pub(crate) fn decide_path_and_create_device(
     feats12.descriptor_binding_partially_bound = vk::TRUE;
     feats12.runtime_descriptor_array = vk::TRUE;
     feats12.shader_sampled_image_array_non_uniform_indexing = vk::TRUE;
+    // Required by cmd_draw_indexed_indirect_count (GPU-driven indirect draw).
+    feats12.draw_indirect_count = vk::TRUE;
 
     let (path, pnext): (RenderPath, *const std::ffi::c_void) = if !force_khr {
         let dev_api = unsafe { instance.get_physical_device_properties(phys).api_version };

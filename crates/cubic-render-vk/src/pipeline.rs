@@ -91,14 +91,22 @@ pub(crate) fn save_pipeline_cache(
     Ok(())
 }
 
+/// Configuration for graphics pipeline creation. Expected to grow as more
+/// rendering features (MSAA, stencil, additional descriptor sets, etc.) are
+/// added; bundled here to avoid the function growing past the arg-count lint.
+#[derive(Clone, Copy)]
+pub(crate) struct PipelineConfig {
+    pub(crate) color_format: vk::Format,
+    pub(crate) depth_format: vk::Format,
+    pub(crate) set_layout_camera: vk::DescriptorSetLayout,
+    pub(crate) set_layout_material: vk::DescriptorSetLayout,
+    pub(crate) set_layout_indirect_graphics: vk::DescriptorSetLayout,
+}
+
 pub(crate) fn create_pipeline(
     device: &ash::Device,
     cache: vk::PipelineCache,
-    color_format: vk::Format,
-    depth_format: vk::Format,
-    _extent: vk::Extent2D,
-    set_layout_camera: vk::DescriptorSetLayout,
-    set_layout_material: vk::DescriptorSetLayout,
+    cfg: &PipelineConfig,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
     // STRICT: color_attachment_formats MUST match current swapchain image format.
     // On swapchain format change, pipeline must be rebuilt before recording.
@@ -248,18 +256,18 @@ pub(crate) fn create_pipeline(
     };
 
     // --- Pipeline layout ---
-    let layouts = [set_layout_camera, set_layout_material];
-    let push_range = vk::PushConstantRange {
-        stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-        offset: 0,
-        size: std::mem::size_of::<super::resources::PushData>() as u32,
-    };
+    // No push constants: indirect draws can't vary them per-entry, so
+    // per-object data (model/tint/tex_index) comes from the candidates
+    // SSBO (set 2) instead, indexed by gl_InstanceIndex.
+    let layouts = [
+        cfg.set_layout_camera,
+        cfg.set_layout_material,
+        cfg.set_layout_indirect_graphics,
+    ];
     let layout_info = vk::PipelineLayoutCreateInfo {
         s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
         set_layout_count: layouts.len() as u32,
         p_set_layouts: layouts.as_ptr(),
-        push_constant_range_count: 1,
-        p_push_constant_ranges: &push_range,
         ..Default::default()
     };
     let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
@@ -268,8 +276,8 @@ pub(crate) fn create_pipeline(
     let rendering = vk::PipelineRenderingCreateInfo {
         s_type: vk::StructureType::PIPELINE_RENDERING_CREATE_INFO,
         color_attachment_count: 1,
-        p_color_attachment_formats: &color_format,
-        depth_attachment_format: depth_format,
+        p_color_attachment_formats: &cfg.color_format,
+        depth_attachment_format: cfg.depth_format,
         ..Default::default()
     };
 

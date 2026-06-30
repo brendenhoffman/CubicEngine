@@ -1,13 +1,24 @@
 #version 460
 
 layout(set = 0, binding = 0) uniform Camera {
-    mat4 mvp;
+    mat4 view_proj;
 } ubo;
 
-layout(push_constant) uniform Push {
+// Per-draw data from the GPU-driven indirect cull compute shader, indexed
+// by gl_InstanceIndex which equals first_instance set by that shader (the
+// original candidate index). This replaces push constants, which can't vary
+// per indirect-draw-buffer entry.
+struct Candidate {
     mat4 model;
     vec4 tint;
-} push;
+    uint first_vertex; // unused in vertex shader (draw handles buffer offset)
+    uint first_index;
+    uint index_count;
+    uint tex_index;
+};
+layout(std430, set = 2, binding = 0) readonly buffer Candidates {
+    Candidate candidates[];
+};
 
 layout(location = 0) in vec3 in_pos;
 layout(location = 1) in vec3 in_color;
@@ -17,6 +28,7 @@ layout(location = 3) in vec3 in_normal;
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out vec2 v_uv;
 layout(location = 2) out vec3 v_normal;
+layout(location = 3) flat out uint v_tex_index;
 
 // Optional compile-time knobs:
 #ifndef UV_TILE
@@ -27,9 +39,11 @@ layout(location = 2) out vec3 v_normal;
 #endif
 
 void main() {
-    gl_Position = ubo.mvp * push.model * vec4(in_pos, 1.0);
+    Candidate c = candidates[gl_InstanceIndex];
 
-    v_color = in_color * push.tint.rgb;
+    gl_Position = ubo.view_proj * c.model * vec4(in_pos, 1.0);
+
+    v_color = in_color * c.tint.rgb;
 
     vec2 uv = in_uv * UV_TILE;
 #if FLIP_V
@@ -40,5 +54,7 @@ void main() {
     // World-space normal. Assumes uniform scale; revisit with a proper
     // normal matrix (inverse-transpose) once non-uniform scaling or real
     // lighting shows up. Unused downstream for now.
-    v_normal = mat3(push.model) * in_normal;
+    v_normal = mat3(c.model) * in_normal;
+
+    v_tex_index = c.tex_index;
 }

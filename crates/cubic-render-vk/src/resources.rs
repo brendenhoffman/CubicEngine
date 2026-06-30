@@ -39,6 +39,33 @@ pub struct PushData {
 /// just caps how many distinct textures can ever be registered at once.
 pub(crate) const MAX_TEXTURES: u32 = 256;
 
+/// Per-draw data for the GPU-driven indirect path: one entry per candidate
+/// in `VkRenderer::pending_draws`, written by the CPU each frame and read
+/// both by the indirect-cull compute shader (to build
+/// VkDrawIndexedIndirectCommand entries) and by the vertex shader (indexed
+/// by gl_InstanceIndex, since indirect draws can't carry push constants).
+/// Layout must match the `Candidate` struct in indirect_cull.comp/tri.vert.
+#[repr(C)]
+#[derive(Clone, Copy, Zeroable, Pod)]
+pub(crate) struct DrawCandidate {
+    pub(crate) model: [[f32; 4]; 4],
+    pub(crate) tint: [f32; 4],
+    pub(crate) first_vertex: u32,
+    pub(crate) first_index: u32,
+    pub(crate) index_count: u32,
+    pub(crate) tex_index: u32,
+}
+
+/// Fixed capacity of the shared mesh vertex/index buffers all `upload_mesh`
+/// calls bump-allocate from. There's no mesh-freeing API yet (matching
+/// `VkRenderer::meshes`, which also only ever grows), so this is sized
+/// generously for early-stage testing rather than computed dynamically.
+pub(crate) const MAX_SHARED_VERTICES: u64 = 65_536;
+pub(crate) const MAX_SHARED_INDICES: u64 = 196_608;
+
+/// Max draws the indirect-cull compute shader can emit in one dispatch.
+pub(crate) const MAX_INDIRECT_DRAWS: u32 = 1024;
+
 struct ImageAllocInfo {
     extent: vk::Extent2D,
     mip_levels: u32,
@@ -635,14 +662,16 @@ pub(crate) fn create_dummy_texture_and_sampler(
     Ok((image, memory, view, sampler))
 }
 
-/// One-shot staging upload: host->staging, then staging->dst (device-local).
-/// Uses the graphics queue and a one-time command buffer; waits until done.
+/// One-shot staging upload: host->staging, then staging->dst (device-local)
+/// at `dst_offset`. Uses the graphics queue and a one-time command buffer;
+/// waits until done.
 pub(crate) fn upload_via_staging(
     device: &ash::Device,
     allocator: &mut Allocator,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
     dst: vk::Buffer,
+    dst_offset: vk::DeviceSize,
     src_data: &[u8],
 ) -> Result<()> {
     // 1) Create CPU-to-GPU staging buffer
@@ -679,7 +708,7 @@ pub(crate) fn upload_via_staging(
     unsafe { device.begin_command_buffer(cmd, &bi)? };
     let region = vk::BufferCopy {
         src_offset: 0,
-        dst_offset: 0,
+        dst_offset,
         size,
     };
     unsafe { device.cmd_copy_buffer(cmd, staging, dst, std::slice::from_ref(&region)) };
@@ -776,4 +805,255 @@ pub(crate) fn create_frame_uniforms_and_sets(
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 
     Ok((ubufs, uallocs, ubo_ptrs, ubo_size, pool, sets))
+}
+
+/// Descriptor set layout for the indirect-cull compute shader: read-only
+/// candidates, write-only indirect commands, read-write atomic draw count.
+pub(crate) fn create_indirect_compute_desc_set_layout(
+    device: &ash::Device,
+) -> Result<vk::DescriptorSetLayout> {
+    let bindings = [
+        vk::DescriptorSetLayoutBinding {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            ..Default::default()
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            ..Default::default()
+        },
+        vk::DescriptorSetLayoutBinding {
+            binding: 2,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            ..Default::default()
+        },
+    ];
+    let ci = vk::DescriptorSetLayoutCreateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        binding_count: bindings.len() as u32,
+        p_bindings: bindings.as_ptr(),
+        ..Default::default()
+    };
+    Ok(unsafe { device.create_descriptor_set_layout(&ci, None)? })
+}
+
+/// Descriptor set layout for the graphics pipeline's read-only view of the
+/// same candidates buffer the compute shader populated, indexed by
+/// gl_InstanceIndex in the vertex shader (set = 2, binding = 0).
+pub(crate) fn create_indirect_graphics_desc_set_layout(
+    device: &ash::Device,
+) -> Result<vk::DescriptorSetLayout> {
+    let binding = vk::DescriptorSetLayoutBinding {
+        binding: 0,
+        descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: 1,
+        stage_flags: vk::ShaderStageFlags::VERTEX,
+        ..Default::default()
+    };
+    let ci = vk::DescriptorSetLayoutCreateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        binding_count: 1,
+        p_bindings: &binding,
+        ..Default::default()
+    };
+    Ok(unsafe { device.create_descriptor_set_layout(&ci, None)? })
+}
+
+pub(crate) struct IndirectDrawResources {
+    pub(crate) candidate_bufs: Vec<vk::Buffer>,
+    pub(crate) candidate_allocs: Vec<Allocation>,
+    pub(crate) candidate_ptrs: Vec<*mut std::ffi::c_void>,
+    pub(crate) indirect_bufs: Vec<vk::Buffer>,
+    pub(crate) indirect_allocs: Vec<Allocation>,
+    pub(crate) draw_count_bufs: Vec<vk::Buffer>,
+    pub(crate) draw_count_allocs: Vec<Allocation>,
+    pub(crate) desc_pool: vk::DescriptorPool,
+    pub(crate) compute_desc_sets: Vec<vk::DescriptorSet>,
+    pub(crate) graphics_desc_sets: Vec<vk::DescriptorSet>,
+}
+
+/// Per-swapchain-image buffers + descriptor sets for the GPU-driven
+/// indirect draw path. candidate_bufs are host-visible and persistently
+/// mapped (CPU writes this frame's draw candidates directly, like the
+/// camera UBOs); indirect_bufs/draw_count_bufs are GPU-only, written by
+/// the indirect-cull compute dispatch and consumed by
+/// cmd_draw_indexed_indirect_count later in the same command buffer.
+pub(crate) fn create_indirect_draw_resources(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    compute_set_layout: vk::DescriptorSetLayout,
+    graphics_set_layout: vk::DescriptorSetLayout,
+    image_count: usize,
+) -> Result<IndirectDrawResources> {
+    let candidates_size = MAX_INDIRECT_DRAWS as u64 * std::mem::size_of::<DrawCandidate>() as u64;
+    let indirect_size =
+        MAX_INDIRECT_DRAWS as u64 * std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u64;
+    let count_size = std::mem::size_of::<u32>() as u64;
+
+    let mut candidate_bufs = Vec::with_capacity(image_count);
+    let mut candidate_allocs = Vec::with_capacity(image_count);
+    let mut candidate_ptrs = Vec::with_capacity(image_count);
+    let mut indirect_bufs = Vec::with_capacity(image_count);
+    let mut indirect_allocs = Vec::with_capacity(image_count);
+    let mut draw_count_bufs = Vec::with_capacity(image_count);
+    let mut draw_count_allocs = Vec::with_capacity(image_count);
+
+    for _ in 0..image_count {
+        let (cbuf, calloc) = create_buffer_and_memory(
+            device,
+            allocator,
+            candidates_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+            MemoryLocation::CpuToGpu,
+            "indirect candidates",
+        )?;
+        let cptr = calloc
+            .mapped_ptr()
+            .ok_or_else(|| anyhow!("candidate buffer not host-mapped"))?
+            .as_ptr();
+        candidate_bufs.push(cbuf);
+        candidate_allocs.push(calloc);
+        candidate_ptrs.push(cptr);
+
+        let (ibuf, ialloc) = create_buffer_and_memory(
+            device,
+            allocator,
+            indirect_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
+            MemoryLocation::GpuOnly,
+            "indirect commands",
+        )?;
+        indirect_bufs.push(ibuf);
+        indirect_allocs.push(ialloc);
+
+        let (dbuf, dalloc) = create_buffer_and_memory(
+            device,
+            allocator,
+            count_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+            "indirect draw count",
+        )?;
+        draw_count_bufs.push(dbuf);
+        draw_count_allocs.push(dalloc);
+    }
+
+    // One compute set (3 storage buffers) + one graphics set (1 storage
+    // buffer) per image.
+    let pool_sizes = [vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: (image_count * 4) as u32,
+    }];
+    let pool_ci = vk::DescriptorPoolCreateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
+        max_sets: (image_count * 2) as u32,
+        pool_size_count: 1,
+        p_pool_sizes: pool_sizes.as_ptr(),
+        ..Default::default()
+    };
+    let desc_pool = unsafe { device.create_descriptor_pool(&pool_ci, None)? };
+
+    let compute_layouts = vec![compute_set_layout; image_count];
+    let compute_alloc_info = vk::DescriptorSetAllocateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
+        descriptor_pool: desc_pool,
+        descriptor_set_count: image_count as u32,
+        p_set_layouts: compute_layouts.as_ptr(),
+        ..Default::default()
+    };
+    let compute_desc_sets = unsafe { device.allocate_descriptor_sets(&compute_alloc_info)? };
+
+    let graphics_layouts = vec![graphics_set_layout; image_count];
+    let graphics_alloc_info = vk::DescriptorSetAllocateInfo {
+        s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
+        descriptor_pool: desc_pool,
+        descriptor_set_count: image_count as u32,
+        p_set_layouts: graphics_layouts.as_ptr(),
+        ..Default::default()
+    };
+    let graphics_desc_sets = unsafe { device.allocate_descriptor_sets(&graphics_alloc_info)? };
+
+    let mut cand_infos = Vec::with_capacity(image_count);
+    let mut indirect_infos = Vec::with_capacity(image_count);
+    let mut count_infos = Vec::with_capacity(image_count);
+    for i in 0..image_count {
+        cand_infos.push(vk::DescriptorBufferInfo {
+            buffer: candidate_bufs[i],
+            offset: 0,
+            range: candidates_size,
+        });
+        indirect_infos.push(vk::DescriptorBufferInfo {
+            buffer: indirect_bufs[i],
+            offset: 0,
+            range: indirect_size,
+        });
+        count_infos.push(vk::DescriptorBufferInfo {
+            buffer: draw_count_bufs[i],
+            offset: 0,
+            range: count_size,
+        });
+    }
+
+    let mut writes = Vec::with_capacity(image_count * 4);
+    for i in 0..image_count {
+        writes.push(vk::WriteDescriptorSet {
+            s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+            dst_set: compute_desc_sets[i],
+            dst_binding: 0,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            p_buffer_info: &cand_infos[i],
+            ..Default::default()
+        });
+        writes.push(vk::WriteDescriptorSet {
+            s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+            dst_set: compute_desc_sets[i],
+            dst_binding: 1,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            p_buffer_info: &indirect_infos[i],
+            ..Default::default()
+        });
+        writes.push(vk::WriteDescriptorSet {
+            s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+            dst_set: compute_desc_sets[i],
+            dst_binding: 2,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            p_buffer_info: &count_infos[i],
+            ..Default::default()
+        });
+        writes.push(vk::WriteDescriptorSet {
+            s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+            dst_set: graphics_desc_sets[i],
+            dst_binding: 0,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            p_buffer_info: &cand_infos[i],
+            ..Default::default()
+        });
+    }
+    unsafe { device.update_descriptor_sets(&writes, &[]) };
+
+    Ok(IndirectDrawResources {
+        candidate_bufs,
+        candidate_allocs,
+        candidate_ptrs,
+        indirect_bufs,
+        indirect_allocs,
+        draw_count_bufs,
+        draw_count_allocs,
+        desc_pool,
+        compute_desc_sets,
+        graphics_desc_sets,
+    })
 }

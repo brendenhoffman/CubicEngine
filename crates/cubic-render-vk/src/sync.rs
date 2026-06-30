@@ -63,6 +63,7 @@ pub(crate) fn create_timeline_semaphore(
 /// don't (yet) read/write a specific resource; barriers scoped to an
 /// actual buffer or image should use VkBufferMemoryBarrier2 /
 /// VkImageMemoryBarrier2 instead once there's a real resource to name.
+#[allow(dead_code)]
 fn memory_barrier2(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
@@ -91,6 +92,7 @@ fn memory_barrier2(
 /// Ensures compute shader writes are visible to subsequent vertex/fragment
 /// shader reads (e.g. a compute pass writing chunk/culling data that the
 /// graphics pipeline then reads).
+#[allow(dead_code)]
 pub(crate) fn barrier_compute_to_graphics(device: &ash::Device, cmd: vk::CommandBuffer) {
     memory_barrier2(
         device,
@@ -105,6 +107,7 @@ pub(crate) fn barrier_compute_to_graphics(device: &ash::Device, cmd: vk::Command
 /// Ensures vertex/fragment shader writes are visible to a subsequent
 /// compute dispatch's reads (the reverse direction of
 /// `barrier_compute_to_graphics`).
+#[allow(dead_code)]
 pub(crate) fn barrier_graphics_to_compute(device: &ash::Device, cmd: vk::CommandBuffer) {
     memory_barrier2(
         device,

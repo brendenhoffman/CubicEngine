@@ -1,0 +1,59 @@
+#version 460
+
+// Per-draw data from the CPU (one entry per draw_mesh() call this frame).
+// Layout must match resources::DrawCandidate exactly (std430, 96 bytes).
+struct Candidate {
+    mat4 model;
+    vec4 tint;
+    uint first_vertex;
+    uint first_index;
+    uint index_count;
+    uint tex_index;
+};
+
+// Matches vk::DrawIndexedIndirectCommand (20 bytes, std430).
+struct IndirectCommand {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int  vertex_offset;
+    uint first_instance; // used as candidate index by the vertex shader
+};
+
+layout(local_size_x = 64) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Candidates {
+    Candidate candidates[];
+};
+layout(std430, set = 0, binding = 1) writeonly buffer IndirectCommands {
+    IndirectCommand commands[];
+};
+layout(std430, set = 0, binding = 2) buffer DrawCount {
+    uint draw_count;
+};
+
+layout(push_constant) uniform Push {
+    uint candidate_count;
+} push;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= push.candidate_count) return;
+
+    // No real visibility or LOD system exists yet, so every candidate is
+    // trivially visible. The GPU-side count and indirect command writes are
+    // real, so this infrastructure is ready for actual culling logic later.
+    bool visible = true;
+    if (!visible) return;
+
+    uint slot = atomicAdd(draw_count, 1u);
+    commands[slot].index_count    = candidates[i].index_count;
+    commands[slot].instance_count = 1u;
+    commands[slot].first_index    = candidates[i].first_index;
+    commands[slot].vertex_offset  = int(candidates[i].first_vertex);
+    // Pass the ORIGINAL candidate index so the vertex shader can read
+    // candidates[gl_InstanceIndex] for model/tint/tex_index. Using the
+    // original index (not the compacted slot) means the candidate array
+    // doubles as the per-draw object-data SSBO with no extra copy.
+    commands[slot].first_instance = i;
+}

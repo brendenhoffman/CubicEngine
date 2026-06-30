@@ -26,14 +26,16 @@ use instance::{init_instance_and_surface, recreate_surface};
 use pipeline::ShaderDev;
 use pipeline::{
     create_compute_pipeline, create_or_load_pipeline_cache, create_pipeline, load_spv_file,
-    pipeline_cache_path, save_pipeline_cache, shader_dir,
+    pipeline_cache_path, save_pipeline_cache, shader_dir, PipelineConfig,
 };
 use resources::{
     create_buffer_and_memory, create_camera_desc_set_layout, create_depth_resources,
     create_dummy_texture_and_sampler, create_frame_uniforms_and_sets,
-    create_material_desc_pool_and_set, create_material_desc_set_layout, depth_aspect_mask,
-    depth_attachment_layout, pick_depth_format, upload_via_staging, write_material_descriptors,
-    CameraUbo,
+    create_indirect_compute_desc_set_layout, create_indirect_draw_resources,
+    create_indirect_graphics_desc_set_layout, create_material_desc_pool_and_set,
+    create_material_desc_set_layout, depth_aspect_mask, depth_attachment_layout, pick_depth_format,
+    upload_via_staging, write_material_descriptors, CameraUbo, DrawCandidate, MAX_INDIRECT_DRAWS,
+    MAX_SHARED_INDICES, MAX_SHARED_VERTICES,
 };
 pub use resources::{PushData, Vertex};
 use swapchain::{
@@ -41,8 +43,8 @@ use swapchain::{
 };
 pub use swapchain::{HdrFlavor, VkVsyncMode};
 use sync::{
-    barrier_compute_to_graphics, barrier_graphics_to_compute, create_command_resources,
-    create_sync_objects, create_timeline_semaphore, AcquireSlot, CommandResources, FrameSync,
+    create_command_resources, create_sync_objects, create_timeline_semaphore, AcquireSlot,
+    CommandResources, FrameSync,
 };
 
 // 1) Public api / constants
@@ -51,11 +53,14 @@ use sync::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MeshHandle(u32);
 
+/// Offsets into the shared vertex/index buffers (see
+/// `MAX_SHARED_VERTICES`/`MAX_SHARED_INDICES`) rather than owning dedicated
+/// buffers: one `cmd_draw_indexed_indirect_count` call can only bind a
+/// single vertex/index buffer pair, so every mesh that might be drawn
+/// together in one indirect call has to live in the same buffers.
 struct GpuMesh {
-    vbuf: vk::Buffer,
-    vbuf_alloc: Allocation,
-    ibuf: vk::Buffer,
-    ibuf_alloc: Allocation,
+    first_vertex: i32,
+    first_index: u32,
     index_count: u32,
 }
 
@@ -103,10 +108,6 @@ pub struct VkRenderer {
     image_views: Vec<vk::ImageView>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
-    // No-op dispatch validating the compute pipeline path; not tied to
-    // swapchain format/extent, so created once and never recreated.
-    compute_pipeline_layout: vk::PipelineLayout,
-    compute_pipeline: vk::Pipeline,
 
     cmd_pool: vk::CommandPool,
     cmd_bufs: Vec<vk::CommandBuffer>,
@@ -129,6 +130,14 @@ pub struct VkRenderer {
     depth_alloc: Allocation,
     depth_view: vk::ImageView,
     depth_format: vk::Format,
+    // Shared by every mesh (see GpuMesh); bump-allocated, never freed
+    // individually since there's no free_mesh API yet.
+    shared_vbuf: vk::Buffer,
+    shared_vbuf_alloc: Allocation,
+    shared_ibuf: vk::Buffer,
+    shared_ibuf_alloc: Allocation,
+    vertex_cursor: u32,
+    index_cursor: u32,
     meshes: Vec<GpuMesh>,
     // Draws queued by draw_mesh() for the next render() call; consumed and
     // cleared each time a frame's command buffer is recorded.
@@ -139,11 +148,29 @@ pub struct VkRenderer {
     desc_pool: vk::DescriptorPool,
     desc_set_layout_camera: vk::DescriptorSetLayout,
     desc_set_layout_material: vk::DescriptorSetLayout,
+    // Graphics-side read-only view of the candidates buffer (set = 2); see
+    // indirect_compute_desc_set_layout for the compute-side write access.
+    desc_set_layout_indirect_graphics: vk::DescriptorSetLayout,
+    desc_set_layout_indirect_compute: vk::DescriptorSetLayout,
     desc_sets: Vec<vk::DescriptorSet>,
     ubufs: Vec<vk::Buffer>,
     umems: Vec<Allocation>,
     ubo_ptrs: Vec<*mut std::ffi::c_void>,
     ubo_size: vk::DeviceSize,
+    // GPU-driven indirect draw path: per-image candidate/indirect-command/
+    // draw-count buffers + descriptor sets (see resources::IndirectDrawResources).
+    indirect_cull_pipeline: vk::Pipeline,
+    indirect_cull_pipeline_layout: vk::PipelineLayout,
+    candidate_bufs: Vec<vk::Buffer>,
+    candidate_allocs: Vec<Allocation>,
+    candidate_ptrs: Vec<*mut std::ffi::c_void>,
+    indirect_bufs: Vec<vk::Buffer>,
+    indirect_allocs: Vec<Allocation>,
+    draw_count_bufs: Vec<vk::Buffer>,
+    draw_count_allocs: Vec<Allocation>,
+    indirect_desc_pool: vk::DescriptorPool,
+    indirect_compute_desc_sets: Vec<vk::DescriptorSet>,
+    indirect_graphics_desc_sets: Vec<vk::DescriptorSet>,
     pipeline_cache: vk::PipelineCache,
     timeline: vk::Semaphore,
     timeline_value: u64,
@@ -209,8 +236,8 @@ impl Drop for VkRenderer {
             // 3) PIPELINE & LAYOUTS BEFORE SWAPCHAIN (pipelines can depend on sc format)
             d.destroy_pipeline(self.pipeline, None);
             d.destroy_pipeline_layout(self.pipeline_layout, None);
-            d.destroy_pipeline(self.compute_pipeline, None);
-            d.destroy_pipeline_layout(self.compute_pipeline_layout, None);
+            d.destroy_pipeline(self.indirect_cull_pipeline, None);
+            d.destroy_pipeline_layout(self.indirect_cull_pipeline_layout, None);
 
             // 4) IMAGE VIEWS BEFORE SWAPCHAIN (views are created from sc images)
             for &iv in &self.image_views {
@@ -250,13 +277,36 @@ impl Drop for VkRenderer {
             d.destroy_image(self.depth_image, None);
             let _ = allocator.free(std::mem::take(&mut self.depth_alloc));
 
-            // Destroy meshes uploaded via upload_mesh
-            for mesh in self.meshes.drain(..) {
-                d.destroy_buffer(mesh.vbuf, None);
-                d.destroy_buffer(mesh.ibuf, None);
-                let _ = allocator.free(mesh.vbuf_alloc);
-                let _ = allocator.free(mesh.ibuf_alloc);
+            // Destroy the shared vertex/index buffers every upload_mesh call
+            // bump-allocates from (meshes themselves own no buffers).
+            self.meshes.clear();
+            d.destroy_buffer(self.shared_vbuf, None);
+            d.destroy_buffer(self.shared_ibuf, None);
+            let _ = allocator.free(std::mem::take(&mut self.shared_vbuf_alloc));
+            let _ = allocator.free(std::mem::take(&mut self.shared_ibuf_alloc));
+
+            // Destroy GPU-driven indirect draw resources
+            for &b in &self.candidate_bufs {
+                d.destroy_buffer(b, None);
             }
+            for alloc in self.candidate_allocs.drain(..) {
+                let _ = allocator.free(alloc);
+            }
+            for &b in &self.indirect_bufs {
+                d.destroy_buffer(b, None);
+            }
+            for alloc in self.indirect_allocs.drain(..) {
+                let _ = allocator.free(alloc);
+            }
+            for &b in &self.draw_count_bufs {
+                d.destroy_buffer(b, None);
+            }
+            for alloc in self.draw_count_allocs.drain(..) {
+                let _ = allocator.free(alloc);
+            }
+            d.destroy_descriptor_pool(self.indirect_desc_pool, None);
+            d.destroy_descriptor_set_layout(self.desc_set_layout_indirect_compute, None);
+            d.destroy_descriptor_set_layout(self.desc_set_layout_indirect_graphics, None);
 
             // Destroy frame resources (gpu-allocator persistently maps
             // CpuToGpu allocations, so no explicit unmap is needed)
@@ -319,9 +369,7 @@ struct SwapchainInitInput<'a> {
     queue_family: u32,
     has_hdr_meta: bool,
     pipeline_cache: vk::PipelineCache,
-    depth_format: vk::Format,
-    desc_set_layout_camera: vk::DescriptorSetLayout,
-    desc_set_layout_material: vk::DescriptorSetLayout,
+    pipeline_cfg: PipelineConfig,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -469,11 +517,10 @@ fn make_initial_swapchain_resources(inp: &SwapchainInitInput) -> Result<Swapchai
     let pipe = create_pipeline(
         inp.device,
         inp.pipeline_cache,
-        bundle.format,
-        inp.depth_format,
-        bundle.extent,
-        inp.desc_set_layout_camera,
-        inp.desc_set_layout_material,
+        &PipelineConfig {
+            color_format: bundle.format,
+            ..inp.pipeline_cfg
+        },
     )?;
     let (acq, frames) = create_sync_objects(inp.device, image_count)?;
     Ok((bundle, cmds, pipe, acq, frames))
@@ -507,20 +554,6 @@ fn build_renderer(
     let props = unsafe { instance.get_physical_device_properties(phys) };
     let cache_path = pipeline_cache_path(&props);
     let pipeline_cache = create_or_load_pipeline_cache(&device, &cache_path)?;
-
-    // 3a) No-op compute pipeline, to validate the compute path before any
-    // real compute shader exists. Empty layout: the shader reads/writes
-    // nothing. Reuses the graphics queue/queue family — any queue family
-    // supporting GRAPHICS is spec-guaranteed to also support COMPUTE.
-    let compute_pipeline_layout =
-        unsafe { device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default(), None)? };
-    let noop_comp_words = load_spv_file(&shader_dir().join("noop.comp.spv"))?;
-    let compute_pipeline = create_compute_pipeline(
-        &device,
-        pipeline_cache,
-        compute_pipeline_layout,
-        &noop_comp_words,
-    )?;
 
     // 3b) GPU memory sub-allocator, replaces raw vkAllocateMemory/vkFreeMemory
     let mut allocator = Allocator::new(&AllocatorCreateDesc {
@@ -570,6 +603,36 @@ fn build_renderer(
     let depth_format = pick_depth_format(&instance, phys);
     let desc_set_layout_camera = create_camera_desc_set_layout(&device)?;
     let desc_set_layout_material = create_material_desc_set_layout(&device)?;
+    let desc_set_layout_indirect_compute = create_indirect_compute_desc_set_layout(&device)?;
+    let desc_set_layout_indirect_graphics = create_indirect_graphics_desc_set_layout(&device)?;
+
+    // GPU-driven indirect draw: a no-real-culling-yet compute shader that
+    // expands this frame's candidate list into VkDrawIndexedIndirectCommand
+    // entries (see indirect_cull.comp).
+    let indirect_cull_pipeline_layout = unsafe {
+        let push_range = vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            offset: 0,
+            size: std::mem::size_of::<u32>() as u32, // candidate_count
+        };
+        let layouts = [desc_set_layout_indirect_compute];
+        let ci = vk::PipelineLayoutCreateInfo {
+            s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+            set_layout_count: layouts.len() as u32,
+            p_set_layouts: layouts.as_ptr(),
+            push_constant_range_count: 1,
+            p_push_constant_ranges: &push_range,
+            ..Default::default()
+        };
+        device.create_pipeline_layout(&ci, None)?
+    };
+    let indirect_cull_words = load_spv_file(&shader_dir().join("indirect_cull.comp.spv"))?;
+    let indirect_cull_pipeline = create_compute_pipeline(
+        &device,
+        pipeline_cache,
+        indirect_cull_pipeline_layout,
+        &indirect_cull_words,
+    )?;
 
     // 6) Build all swapchain-scoped resources in one place
     let init_inp = SwapchainInitInput {
@@ -583,14 +646,37 @@ fn build_renderer(
         queue_family,
         has_hdr_meta,
         pipeline_cache,
-        depth_format,
-        desc_set_layout_camera,
-        desc_set_layout_material,
+        pipeline_cfg: PipelineConfig {
+            color_format: vk::Format::UNDEFINED, // filled in from swapchain in make_initial_swapchain_resources
+            depth_format,
+            set_layout_camera: desc_set_layout_camera,
+            set_layout_material: desc_set_layout_material,
+            set_layout_indirect_graphics: desc_set_layout_indirect_graphics,
+        },
     };
     let (sc, cmd, (pipeline_layout, pipeline), acq_slots, frames) =
         make_initial_swapchain_resources(&init_inp)?;
     let (depth_image, depth_alloc, depth_view) =
         create_depth_resources(&device, &mut allocator, sc.extent, depth_format)?;
+
+    // Shared vertex/index buffers every upload_mesh call bump-allocates
+    // from (see GpuMesh).
+    let (shared_vbuf, shared_vbuf_alloc) = create_buffer_and_memory(
+        &device,
+        &mut allocator,
+        MAX_SHARED_VERTICES * std::mem::size_of::<Vertex>() as u64,
+        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::GpuOnly,
+        "shared mesh vertex buffer",
+    )?;
+    let (shared_ibuf, shared_ibuf_alloc) = create_buffer_and_memory(
+        &device,
+        &mut allocator,
+        MAX_SHARED_INDICES * std::mem::size_of::<u32>() as u64,
+        vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::GpuOnly,
+        "shared mesh index buffer",
+    )?;
 
     // Global material set (swapchain-invariant)
     let (material_desc_pool, material_desc_set) =
@@ -608,6 +694,14 @@ fn build_renderer(
         phys,
         &mut allocator,
         desc_set_layout_camera,
+        sc.image_views.len(),
+    )?;
+
+    let indirect = create_indirect_draw_resources(
+        &device,
+        &mut allocator,
+        desc_set_layout_indirect_compute,
+        desc_set_layout_indirect_graphics,
         sc.image_views.len(),
     )?;
 
@@ -632,8 +726,6 @@ fn build_renderer(
 
         pipeline,
         pipeline_layout,
-        compute_pipeline,
-        compute_pipeline_layout,
         cmd_pool: cmd.pool,
         cmd_bufs: cmd.bufs,
 
@@ -657,17 +749,37 @@ fn build_renderer(
         depth_alloc,
         depth_view,
         depth_format,
+        shared_vbuf,
+        shared_vbuf_alloc,
+        shared_ibuf,
+        shared_ibuf_alloc,
+        vertex_cursor: 0,
+        index_cursor: 0,
         meshes: Vec::new(),
         pending_draws: Vec::new(),
         trash: Vec::new(),
         desc_pool,
         desc_set_layout_camera,
         desc_set_layout_material,
+        desc_set_layout_indirect_graphics,
+        desc_set_layout_indirect_compute,
         desc_sets,
         ubufs,
         umems,
         ubo_ptrs,
         ubo_size,
+        indirect_cull_pipeline,
+        indirect_cull_pipeline_layout,
+        candidate_bufs: indirect.candidate_bufs,
+        candidate_allocs: indirect.candidate_allocs,
+        candidate_ptrs: indirect.candidate_ptrs,
+        indirect_bufs: indirect.indirect_bufs,
+        indirect_allocs: indirect.indirect_allocs,
+        draw_count_bufs: indirect.draw_count_bufs,
+        draw_count_allocs: indirect.draw_count_allocs,
+        indirect_desc_pool: indirect.desc_pool,
+        indirect_compute_desc_sets: indirect.compute_desc_sets,
+        indirect_graphics_desc_sets: indirect.graphics_desc_sets,
         pipeline_cache,
         timeline,
         timeline_value,
@@ -826,11 +938,13 @@ impl VkRenderer {
         let (new_layout, new_pipeline) = create_pipeline(
             &self.device,
             self.pipeline_cache,
-            self.format,
-            self.depth_format,
-            self.extent,
-            self.desc_set_layout_camera,
-            self.desc_set_layout_material,
+            &PipelineConfig {
+                color_format: self.format,
+                depth_format: self.depth_format,
+                set_layout_camera: self.desc_set_layout_camera,
+                set_layout_material: self.desc_set_layout_material,
+                set_layout_indirect_graphics: self.desc_set_layout_indirect_graphics,
+            },
         )?;
 
         self.trash.push(DeferredDrop {
@@ -983,79 +1097,160 @@ impl VkRenderer {
         unsafe { self.device.cmd_begin_rendering(cmd, &rendering_info) };
     }
 
-    #[inline]
-    fn bind_draw_geometry(&self, cmd: vk::CommandBuffer, image_index: usize) -> Result<()> {
+    /// Phase 1 of the GPU-driven draw: write candidates, dispatch indirect-cull
+    /// compute, and leave the indirect/count buffers ready for the draw call.
+    /// Must run OUTSIDE the render pass (before vkCmdBeginRendering).
+    fn cull_compute_prepass(&self, cmd: vk::CommandBuffer, image_index: usize) {
+        let candidate_count = self.pending_draws.len() as u32;
+
+        // Write this frame's DrawCandidate array to the host-mapped buffer.
+        if candidate_count > 0 {
+            let ptr = self.candidate_ptrs[image_index] as *mut DrawCandidate;
+            for (i, (handle, push)) in self.pending_draws.iter().enumerate() {
+                let mesh = match self.meshes.get(handle.0 as usize) {
+                    Some(m) => m,
+                    None => continue,
+                };
+                unsafe {
+                    std::ptr::write(
+                        ptr.add(i),
+                        DrawCandidate {
+                            model: push.model,
+                            tint: push.tint,
+                            first_vertex: mesh.first_vertex as u32,
+                            first_index: mesh.first_index,
+                            index_count: mesh.index_count,
+                            tex_index: push.tex_index,
+                        },
+                    );
+                }
+            }
+        }
+
+        // --- Compute dispatch: expand candidates → indirect commands ---
+        // Zero the draw-count atomics before the compute shader writes them.
+        // TRANSFER_DST ensures vkCmdFillBuffer completes before COMPUTE reads.
+        let fill_to_compute = vk::MemoryBarrier2 {
+            s_type: vk::StructureType::MEMORY_BARRIER_2,
+            src_stage_mask: vk::PipelineStageFlags2::TRANSFER,
+            src_access_mask: vk::AccessFlags2::TRANSFER_WRITE,
+            dst_stage_mask: vk::PipelineStageFlags2::COMPUTE_SHADER,
+            dst_access_mask: vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+            ..Default::default()
+        };
+        let compute_to_indirect = vk::MemoryBarrier2 {
+            s_type: vk::StructureType::MEMORY_BARRIER_2,
+            src_stage_mask: vk::PipelineStageFlags2::COMPUTE_SHADER,
+            src_access_mask: vk::AccessFlags2::SHADER_WRITE,
+            dst_stage_mask: vk::PipelineStageFlags2::DRAW_INDIRECT
+                | vk::PipelineStageFlags2::VERTEX_SHADER,
+            dst_access_mask: vk::AccessFlags2::INDIRECT_COMMAND_READ
+                | vk::AccessFlags2::SHADER_READ,
+            ..Default::default()
+        };
+        unsafe {
+            self.device
+                .cmd_fill_buffer(cmd, self.draw_count_bufs[image_index], 0, 4, 0);
+            let dep = vk::DependencyInfo {
+                s_type: vk::StructureType::DEPENDENCY_INFO,
+                memory_barrier_count: 1,
+                p_memory_barriers: &fill_to_compute,
+                ..Default::default()
+            };
+            self.device.cmd_pipeline_barrier2(cmd, &dep);
+
+            self.device.cmd_bind_pipeline(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.indirect_cull_pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.indirect_cull_pipeline_layout,
+                0,
+                std::slice::from_ref(&self.indirect_compute_desc_sets[image_index]),
+                &[],
+            );
+            self.device.cmd_push_constants(
+                cmd,
+                self.indirect_cull_pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&candidate_count),
+            );
+            let groups = candidate_count.div_ceil(64).max(1);
+            self.device.cmd_dispatch(cmd, groups, 1, 1);
+
+            let dep2 = vk::DependencyInfo {
+                s_type: vk::StructureType::DEPENDENCY_INFO,
+                memory_barrier_count: 1,
+                p_memory_barriers: &compute_to_indirect,
+                ..Default::default()
+            };
+            self.device.cmd_pipeline_barrier2(cmd, &dep2);
+        }
+    }
+
+    /// Phase 2: the actual indirect draw call. Must run INSIDE the render pass
+    /// (between vkCmdBeginRendering and vkCmdEndRendering).
+    fn record_indirect_draws(&self, cmd: vk::CommandBuffer, image_index: usize) -> Result<()> {
         if self.pipeline == vk::Pipeline::null() {
             return Err(anyhow!("pipeline is VK_NULL_HANDLE at record time"));
         }
-
-        unsafe {
-            self.device
-                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline)
-        };
-
-        // dynamic viewport/scissor
         let vp = vk::Viewport {
-            // Try positive flip for 3D
             x: 0.0,
-            y: self.extent.height as f32, //0
+            y: self.extent.height as f32,
             width: self.extent.width as f32,
-            height: -(self.extent.height as f32), //self.extent.height as f32
+            height: -(self.extent.height as f32),
             min_depth: 0.0,
             max_depth: 1.0,
-        };
-        unsafe {
-            self.device
-                .cmd_set_viewport(cmd, 0, std::slice::from_ref(&vp))
         };
         let sc = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: self.extent,
         };
+        let sets = [
+            self.desc_sets[image_index],                   // set 0: camera
+            self.material_desc_set,                        // set 1: bindless textures
+            self.indirect_graphics_desc_sets[image_index], // set 2: candidates
+        ];
+        let offsets = [0_u64];
         unsafe {
             self.device
-                .cmd_set_scissor(cmd, 0, std::slice::from_ref(&sc))
-        };
-
-        // Bind per-image descriptor set (set = 0)
-        let set = [self.desc_sets[image_index], self.material_desc_set];
-        unsafe {
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+            self.device
+                .cmd_set_viewport(cmd, 0, std::slice::from_ref(&vp));
+            self.device
+                .cmd_set_scissor(cmd, 0, std::slice::from_ref(&sc));
             self.device.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
-                0, // firstSet -> set 0 = camera, set 1 = material
-                &set,
-                &[], // no dynamic offsets
+                0,
+                &sets,
+                &[],
             );
-        }
-
-        // Draw every mesh queued via draw_mesh() for this frame. The
-        // renderer has no built-in geometry of its own.
-        let offsets = [0_u64];
-        for (handle, push) in &self.pending_draws {
-            let Some(mesh) = self.meshes.get(handle.0 as usize) else {
-                continue;
-            };
-            unsafe {
-                self.device.cmd_push_constants(
-                    cmd,
-                    self.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    bytemuck::bytes_of(push),
-                );
-                self.device.cmd_bind_vertex_buffers(
-                    cmd,
-                    0,
-                    std::slice::from_ref(&mesh.vbuf),
-                    &offsets,
-                );
-                self.device
-                    .cmd_bind_index_buffer(cmd, mesh.ibuf, 0, vk::IndexType::UINT32);
-                self.device
-                    .cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
-            }
+            // One shared vertex/index buffer pair for all meshes.
+            self.device.cmd_bind_vertex_buffers(
+                cmd,
+                0,
+                std::slice::from_ref(&self.shared_vbuf),
+                &offsets,
+            );
+            self.device
+                .cmd_bind_index_buffer(cmd, self.shared_ibuf, 0, vk::IndexType::UINT32);
+            // GPU populates the indirect buffer and count; CPU has no per-draw
+            // involvement beyond writing the candidate array above.
+            self.device.cmd_draw_indexed_indirect_count(
+                cmd,
+                self.indirect_bufs[image_index],
+                0,
+                self.draw_count_bufs[image_index],
+                0,
+                MAX_INDIRECT_DRAWS,
+                std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32,
+            );
         }
         Ok(())
     }
@@ -1095,22 +1290,6 @@ impl VkRenderer {
     /// Dispatches the no-op compute pipeline, bracketed by compute<->graphics
     /// barriers, purely to validate the compute pipeline/dispatch/sync path
     /// (see "Add compute pipeline infrastructure"). Does no real work yet;
-    /// real compute passes (culling, meshing, terrain gen) will follow this
-    /// same bind/dispatch/barrier shape once they exist.
-    #[inline]
-    fn record_noop_compute_dispatch(&self, cmd: vk::CommandBuffer) {
-        barrier_graphics_to_compute(&self.device, cmd);
-        unsafe {
-            self.device.cmd_bind_pipeline(
-                cmd,
-                vk::PipelineBindPoint::COMPUTE,
-                self.compute_pipeline,
-            );
-            self.device.cmd_dispatch(cmd, 1, 1, 1);
-        }
-        barrier_compute_to_graphics(&self.device, cmd);
-    }
-
     #[inline]
     // Records draws queued via draw_mesh() into the given image's command
     // buffer. Called fresh every frame for the just-acquired image (see
@@ -1135,11 +1314,13 @@ impl VkRenderer {
         unsafe { self.device.begin_command_buffer(cmd, &begin)? };
 
         // body
-        self.record_noop_compute_dispatch(cmd);
+        // Phase 1: compute cull — MUST happen outside the render pass.
+        self.cull_compute_prepass(cmd, image_index);
         self.transition_to_color(cmd, image);
         self.transition_depth_to_attachment(cmd, self.depth_image);
         self.begin_rendering(cmd, image_view);
-        self.bind_draw_geometry(cmd, image_index)?;
+        // Phase 2: indirect draw — inside the render pass.
+        self.record_indirect_draws(cmd, image_index)?;
         unsafe { self.device.cmd_end_rendering(cmd) };
         self.transition_to_present(cmd, image);
 
@@ -1148,35 +1329,38 @@ impl VkRenderer {
         Ok(())
     }
 
-    /// Upload vertex/index data as a device-local mesh and return a handle
-    /// to it. The mesh lives until the renderer is dropped.
+    /// Upload vertex/index data into the shared buffers via bump allocation
+    /// and return an opaque handle. All meshes share one vertex buffer and
+    /// one index buffer so the entire scene can be drawn with one
+    /// cmd_draw_indexed_indirect_count call (GPU-driven indirect path).
     pub fn upload_mesh(&mut self, vertices: &[Vertex], indices: &[u32]) -> Result<MeshHandle> {
-        let vsize = std::mem::size_of_val(vertices) as vk::DeviceSize;
-        let isize = std::mem::size_of_val(indices) as vk::DeviceSize;
+        let new_vc = self.vertex_cursor + vertices.len() as u32;
+        let new_ic = self.index_cursor + indices.len() as u32;
+        if new_vc > MAX_SHARED_VERTICES as u32 {
+            return Err(anyhow!(
+                "upload_mesh: shared vertex buffer full ({} / {})",
+                new_vc,
+                MAX_SHARED_VERTICES
+            ));
+        }
+        if new_ic > MAX_SHARED_INDICES as u32 {
+            return Err(anyhow!(
+                "upload_mesh: shared index buffer full ({} / {})",
+                new_ic,
+                MAX_SHARED_INDICES
+            ));
+        }
 
-        let (vbuf, vbuf_alloc) = create_buffer_and_memory(
-            &self.device,
-            self.allocator.as_mut().expect("allocator missing"),
-            vsize,
-            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            MemoryLocation::GpuOnly,
-            "mesh vertex buffer",
-        )?;
-        let (ibuf, ibuf_alloc) = create_buffer_and_memory(
-            &self.device,
-            self.allocator.as_mut().expect("allocator missing"),
-            isize,
-            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            MemoryLocation::GpuOnly,
-            "mesh index buffer",
-        )?;
+        let vbyte_offset = self.vertex_cursor as u64 * std::mem::size_of::<Vertex>() as u64;
+        let ibyte_offset = self.index_cursor as u64 * std::mem::size_of::<u32>() as u64;
 
         upload_via_staging(
             &self.device,
             self.allocator.as_mut().expect("allocator missing"),
             self.queue,
             self.cmd_pool,
-            vbuf,
+            self.shared_vbuf,
+            vbyte_offset,
             bytemuck::cast_slice(vertices),
         )?;
         upload_via_staging(
@@ -1184,18 +1368,19 @@ impl VkRenderer {
             self.allocator.as_mut().expect("allocator missing"),
             self.queue,
             self.cmd_pool,
-            ibuf,
+            self.shared_ibuf,
+            ibyte_offset,
             bytemuck::cast_slice(indices),
         )?;
 
         let handle = MeshHandle(self.meshes.len() as u32);
         self.meshes.push(GpuMesh {
-            vbuf,
-            vbuf_alloc,
-            ibuf,
-            ibuf_alloc,
+            first_vertex: self.vertex_cursor as i32,
+            first_index: self.index_cursor,
             index_count: indices.len() as u32,
         });
+        self.vertex_cursor = new_vc;
+        self.index_cursor = new_ic;
         Ok(handle)
     }
 
@@ -1268,6 +1453,48 @@ impl VkRenderer {
             self.desc_pool = vk::DescriptorPool::null();
         }
         self.desc_sets.clear();
+
+        // 3c) Retire per-image indirect draw buffers.
+        for (buffer, alloc) in self
+            .candidate_bufs
+            .drain(..)
+            .zip(self.candidate_allocs.drain(..))
+        {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Buffer { buffer, alloc },
+            });
+        }
+        self.candidate_ptrs.clear();
+        for (buffer, alloc) in self
+            .indirect_bufs
+            .drain(..)
+            .zip(self.indirect_allocs.drain(..))
+        {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Buffer { buffer, alloc },
+            });
+        }
+        for (buffer, alloc) in self
+            .draw_count_bufs
+            .drain(..)
+            .zip(self.draw_count_allocs.drain(..))
+        {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Buffer { buffer, alloc },
+            });
+        }
+        if self.indirect_desc_pool != vk::DescriptorPool::null() {
+            unsafe {
+                self.device
+                    .destroy_descriptor_pool(self.indirect_desc_pool, None)
+            };
+            self.indirect_desc_pool = vk::DescriptorPool::null();
+        }
+        self.indirect_compute_desc_sets.clear();
+        self.indirect_graphics_desc_sets.clear();
 
         // 4a) cfg for new swapchain (hdr/vsync/flavor/extent)
         let cfg = self.cfg.to_swapchain_config(size);
@@ -1365,7 +1592,26 @@ impl VkRenderer {
         self.desc_pool = desc_pool;
         self.desc_sets = desc_sets;
 
-        // 5b) Recreate per-image sync
+        // 5b) Recreate per-image indirect draw resources.
+        let indirect = create_indirect_draw_resources(
+            &self.device,
+            self.allocator.as_mut().expect("allocator missing"),
+            self.desc_set_layout_indirect_compute,
+            self.desc_set_layout_indirect_graphics,
+            self.images.len(),
+        )?;
+        self.candidate_bufs = indirect.candidate_bufs;
+        self.candidate_allocs = indirect.candidate_allocs;
+        self.candidate_ptrs = indirect.candidate_ptrs;
+        self.indirect_bufs = indirect.indirect_bufs;
+        self.indirect_allocs = indirect.indirect_allocs;
+        self.draw_count_bufs = indirect.draw_count_bufs;
+        self.draw_count_allocs = indirect.draw_count_allocs;
+        self.indirect_desc_pool = indirect.desc_pool;
+        self.indirect_compute_desc_sets = indirect.compute_desc_sets;
+        self.indirect_graphics_desc_sets = indirect.graphics_desc_sets;
+
+        // 5c) Recreate per-image sync
         let image_count = self.images.len();
         let sem_info = vk::SemaphoreCreateInfo::default();
         for _ in 0..image_count {
@@ -1380,11 +1626,13 @@ impl VkRenderer {
             let (new_layout, new_pipeline) = create_pipeline(
                 &self.device,
                 self.pipeline_cache,
-                self.format,
-                self.depth_format, // ensure dynamic rendering knows the depth format
-                self.extent,
-                self.desc_set_layout_camera,
-                self.desc_set_layout_material,
+                &PipelineConfig {
+                    color_format: self.format,
+                    depth_format: self.depth_format,
+                    set_layout_camera: self.desc_set_layout_camera,
+                    set_layout_material: self.desc_set_layout_material,
+                    set_layout_indirect_graphics: self.desc_set_layout_indirect_graphics,
+                },
             )?;
             self.trash.push(DeferredDrop {
                 value: self.timeline_value,
