@@ -3,6 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 use cubic_core::init_tracing;
+use cubic_math::Camera;
 use cubic_render::{RenderSize, Renderer};
 use cubic_render_gl::GlRenderer;
 use cubic_render_vk::{MeshHandle, VkRenderer};
@@ -189,6 +190,7 @@ struct App {
     next_frame_deadline: Option<std::time::Instant>,
 
     vk_mesh: Option<MeshHandle>,
+    camera: Camera,
 }
 
 impl ApplicationHandler for App {
@@ -395,6 +397,9 @@ impl ApplicationHandler for App {
                 }
 
                 if let Some(backend) = &mut self.backend {
+                    if let Backend::Vk(r) = &mut *backend {
+                        r.set_camera(self.camera);
+                    }
                     if let (Backend::Vk(r), Some(handle)) = (&mut *backend, self.vk_mesh) {
                         r.draw_mesh(handle, test_scene::IDENTITY_PUSH);
                     }
@@ -525,6 +530,7 @@ fn main() -> Result<()> {
         focused: true,
         next_frame_deadline: None,
         vk_mesh: None,
+        camera: Camera::default(),
     };
 
     event_loop.run_app(&mut app)?;

@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 cubic-render = { path = "../cubic-render" }
+cubic-math = { path = "../cubic-math" }
 ash = { workspace = true, features = ["linked"] }
 ash-window = { workspace = true }
 raw-window-handle = { workspace = true }

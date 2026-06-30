@@ -6,10 +6,13 @@ use bytemuck::{Pod, Zeroable};
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 use gpu_allocator::MemoryLocation;
 
+// Convention: this holds the combined view*proj matrix only; the model
+// transform is supplied separately via PushData and applied in the vertex
+// shader, so this is not a true "MVP" matrix.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Zeroable, Pod)]
 pub(crate) struct CameraUbo {
-    pub(crate) mvp: [[f32; 4]; 4],
+    pub(crate) view_proj: [[f32; 4]; 4],
 }
 
 #[repr(C)]

@@ -11,6 +11,7 @@ mod sync;
 use anyhow::{anyhow, Result};
 use ash::khr::surface;
 use ash::{vk, Entry};
+use cubic_math::Camera;
 use cubic_render::{RenderSize, Renderer};
 use gpu_allocator::vulkan::{Allocation, Allocator, AllocatorCreateDesc};
 use gpu_allocator::MemoryLocation;
@@ -96,6 +97,7 @@ pub struct VkRenderer {
     acq_index: usize,
     has_hdr_metadata_ext: bool,
     cfg: RuntimeConfig,
+    camera: Camera,
 
     depth_image: vk::Image,
     depth_alloc: Allocation,
@@ -594,6 +596,7 @@ fn build_renderer(
         acq_index: 0,
         has_hdr_metadata_ext: has_hdr_meta,
         cfg: initial_cfg,
+        camera: Camera::default(),
         depth_image,
         depth_alloc,
         depth_view,
@@ -628,25 +631,6 @@ fn build_renderer(
 }
 
 impl VkRenderer {
-    /// RH camera, forward = -Z, Vulkan ZO (0..1), reverse-Z, infinite far plane.
-    /// `flip_y` should be false while you're using a negative viewport height.
-    fn perspective_rh_zo_reverse_infinite(
-        fovy: f32,
-        aspect: f32,
-        near: f32,
-        flip_y: bool,
-    ) -> [[f32; 4]; 4] {
-        let f = 1.0 / (0.5 * fovy).tan();
-        let c0 = [f / aspect, 0.0, 0.0, 0.0];
-        let mut c1 = [0.0, f, 0.0, 0.0];
-        let c2 = [0.0, 0.0, 0.0, -1.0];
-        let c3 = [0.0, 0.0, near, 0.0];
-        if flip_y {
-            c1[1] = -c1[1];
-        }
-        [c0, c1, c2, c3] // columns
-    }
-
     // Set cfg options
     pub fn set_vsync_mode(&mut self, mode: VkVsyncMode) {
         if self.cfg.vsync_mode as u8 == mode as u8 {
@@ -680,6 +664,10 @@ impl VkRenderer {
             height: self.extent.height,
         };
         let _ = self.recreate_swapchain(want);
+    }
+
+    pub fn set_camera(&mut self, camera: Camera) {
+        self.camera = camera;
     }
 
     #[inline]
@@ -755,13 +743,19 @@ impl VkRenderer {
     fn update_camera_ubo_for_image(
         &self,
         image_index: usize,
-        data: &CameraUbo,
+        camera: &Camera,
+        aspect: f32,
     ) -> anyhow::Result<()> {
+        let view_proj = camera.projection_matrix(aspect) * camera.view_matrix();
+        let data = CameraUbo {
+            view_proj: view_proj.to_cols_array_2d(),
+        };
+
         let dst = self.ubo_ptrs[image_index];
         if dst.is_null() {
             return Err(anyhow::anyhow!("UBO memory not mapped"));
         }
-        let src = bytemuck::bytes_of(data);
+        let src = bytemuck::bytes_of(&data);
 
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len());
@@ -1442,12 +1436,7 @@ impl Renderer for VkRenderer {
         let f_img = &self.frames[img];
         let cmd = self.cmd_bufs[img];
         let aspect = self.extent.width as f32 / self.extent.height as f32;
-        let fovy = std::f32::consts::FRAC_PI_3; // 60°
-        let near = 0.1_f32; // 0.05–0.5 is a good range
-        let flip_y = false; // you're using a negative viewport height right now
-        let proj = VkRenderer::perspective_rh_zo_reverse_infinite(fovy, aspect, near, flip_y);
-        let mvp = CameraUbo { mvp: proj };
-        self.update_camera_ubo_for_image(img, &mvp)?;
+        self.update_camera_ubo_for_image(img, &self.camera, aspect)?;
 
         // Record this frame's draws (queued via draw_mesh()) into the
         // image we just acquired, then clear the queue for the next frame.
