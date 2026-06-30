@@ -14,17 +14,17 @@ pub(crate) struct CameraUbo {
 
 #[repr(C)]
 #[derive(Clone, Copy, Zeroable, Pod)]
-pub(crate) struct Vertex {
-    pub(crate) pos: [f32; 3],
-    pub(crate) color: [f32; 3],
-    pub(crate) uv: [f32; 2],
+pub struct Vertex {
+    pub pos: [f32; 3],
+    pub color: [f32; 3],
+    pub uv: [f32; 2],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Zeroable, Pod)]
-pub(crate) struct PushData {
-    pub(crate) model: [[f32; 4]; 4],
-    pub(crate) tint: [f32; 4],
+pub struct PushData {
+    pub model: [[f32; 4]; 4],
+    pub tint: [f32; 4],
 }
 
 struct ImageAllocInfo {

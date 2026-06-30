@@ -31,8 +31,9 @@ use resources::{
     create_dummy_texture_and_sampler, create_frame_uniforms_and_sets,
     create_material_desc_pool_and_set, create_material_desc_set_layout, depth_aspect_mask,
     depth_attachment_layout, pick_depth_format, upload_via_staging, write_material_descriptors,
-    CameraUbo, PushData, Vertex,
+    CameraUbo,
 };
+pub use resources::{PushData, Vertex};
 use swapchain::{
     create_hdr_metadata_if_needed, create_swapchain_bundle, SwapchainBundle, SwapchainConfig,
 };
@@ -81,6 +82,18 @@ const TRI_VERTS: &[Vertex] = &[
 ];
 
 const TRI_IDXS: &[u32] = &[0, 1, 2, 3, 4, 5];
+
+/// Opaque handle to a mesh uploaded via [`VkRenderer::upload_mesh`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MeshHandle(u32);
+
+struct GpuMesh {
+    vbuf: vk::Buffer,
+    vbuf_alloc: Allocation,
+    ibuf: vk::Buffer,
+    ibuf_alloc: Allocation,
+    index_count: u32,
+}
 
 // 3) Renderer data model
 pub struct VkRenderer {
@@ -131,6 +144,10 @@ pub struct VkRenderer {
     ibuf: vk::Buffer,
     ibuf_alloc: Allocation,
     index_count: u32,
+    meshes: Vec<GpuMesh>,
+    // Command buffer currently open for recording (set for the duration of
+    // record_one_command), so draw_mesh knows where to record draws into.
+    recording_cmd: Option<vk::CommandBuffer>,
     desc_pool: vk::DescriptorPool,
     desc_set_layout_camera: vk::DescriptorSetLayout,
     desc_set_layout_material: vk::DescriptorSetLayout,
@@ -240,6 +257,14 @@ impl Drop for VkRenderer {
             let _ = allocator.free(std::mem::take(&mut self.vbuf_alloc));
             d.destroy_buffer(self.ibuf, None);
             let _ = allocator.free(std::mem::take(&mut self.ibuf_alloc));
+
+            // Destroy meshes uploaded via upload_mesh
+            for mesh in self.meshes.drain(..) {
+                d.destroy_buffer(mesh.vbuf, None);
+                d.destroy_buffer(mesh.ibuf, None);
+                let _ = allocator.free(mesh.vbuf_alloc);
+                let _ = allocator.free(mesh.ibuf_alloc);
+            }
 
             // Destroy frame resources (gpu-allocator persistently maps
             // CpuToGpu allocations, so no explicit unmap is needed)
@@ -660,6 +685,8 @@ fn build_renderer(
         ibuf,
         ibuf_alloc,
         index_count: TRI_IDXS.len() as u32,
+        meshes: Vec::new(),
+        recording_cmd: None,
         desc_pool,
         desc_set_layout_camera,
         desc_set_layout_material,
@@ -1057,7 +1084,7 @@ impl VkRenderer {
 
     #[inline]
     fn record_one_command(
-        &self,
+        &mut self,
         cmd: vk::CommandBuffer,
         image: vk::Image,
         image_view: vk::ImageView,
@@ -1073,6 +1100,7 @@ impl VkRenderer {
             ..Default::default()
         };
         unsafe { self.device.begin_command_buffer(cmd, &begin)? };
+        self.recording_cmd = Some(cmd);
 
         // body
         self.transition_to_color(cmd, image);
@@ -1083,16 +1111,100 @@ impl VkRenderer {
         self.transition_to_present(cmd, image);
 
         // end
+        self.recording_cmd = None;
         unsafe { self.device.end_command_buffer(cmd)? };
         Ok(())
     }
 
     // --- Record all per-swapchain-image CBs ----------------------
     fn record_commands(&mut self) -> Result<()> {
-        for (i, &cmd) in self.cmd_bufs.iter().enumerate() {
+        let cmd_bufs = self.cmd_bufs.clone();
+        for (i, cmd) in cmd_bufs.into_iter().enumerate() {
             self.record_one_command(cmd, self.images[i], self.image_views[i], i)?;
         }
         Ok(())
+    }
+
+    /// Upload vertex/index data as a device-local mesh and return a handle
+    /// to it. The mesh lives until the renderer is dropped.
+    pub fn upload_mesh(&mut self, vertices: &[Vertex], indices: &[u32]) -> Result<MeshHandle> {
+        let vsize = std::mem::size_of_val(vertices) as vk::DeviceSize;
+        let isize = std::mem::size_of_val(indices) as vk::DeviceSize;
+
+        let (vbuf, vbuf_alloc) = create_buffer_and_memory(
+            &self.device,
+            self.allocator.as_mut().expect("allocator missing"),
+            vsize,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+            "mesh vertex buffer",
+        )?;
+        let (ibuf, ibuf_alloc) = create_buffer_and_memory(
+            &self.device,
+            self.allocator.as_mut().expect("allocator missing"),
+            isize,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryLocation::GpuOnly,
+            "mesh index buffer",
+        )?;
+
+        upload_via_staging(
+            &self.device,
+            self.allocator.as_mut().expect("allocator missing"),
+            self.queue,
+            self.cmd_pool,
+            vbuf,
+            bytemuck::cast_slice(vertices),
+        )?;
+        upload_via_staging(
+            &self.device,
+            self.allocator.as_mut().expect("allocator missing"),
+            self.queue,
+            self.cmd_pool,
+            ibuf,
+            bytemuck::cast_slice(indices),
+        )?;
+
+        let handle = MeshHandle(self.meshes.len() as u32);
+        self.meshes.push(GpuMesh {
+            vbuf,
+            vbuf_alloc,
+            ibuf,
+            ibuf_alloc,
+            index_count: indices.len() as u32,
+        });
+        Ok(handle)
+    }
+
+    /// Record a draw of a previously uploaded mesh into the command buffer
+    /// currently being recorded, with the given per-object push constants.
+    /// A no-op if called outside of command buffer recording or with an
+    /// unknown handle.
+    pub fn draw_mesh(&mut self, handle: MeshHandle, push: PushData) {
+        let Some(cmd) = self.recording_cmd else {
+            return;
+        };
+        let Some(mesh) = self.meshes.get(handle.0 as usize) else {
+            return;
+        };
+
+        unsafe {
+            self.device.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                bytemuck::bytes_of(&push),
+            );
+
+            let offsets = [0_u64];
+            self.device
+                .cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&mesh.vbuf), &offsets);
+            self.device
+                .cmd_bind_index_buffer(cmd, mesh.ibuf, 0, vk::IndexType::UINT32);
+            self.device
+                .cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
+        }
     }
 
     // STRICT ORDER (recreate):
