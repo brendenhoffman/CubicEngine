@@ -44,44 +44,6 @@ use sync::{
 };
 
 // 1) Public api / constants
-const UV_TILE: f32 = 1.0;
-
-const TRI_VERTS: &[Vertex] = &[
-    // FRONT triangle (closer)
-    Vertex {
-        pos: [0.0, 0.5, -0.988],
-        color: [1.0, 0.2, 0.2],
-        uv: [0.5 * UV_TILE, 1.0 * UV_TILE], // top
-    },
-    Vertex {
-        pos: [-0.3, -0.4, -0.788],
-        color: [1.0, 0.2, 0.2],
-        uv: [0.0 * UV_TILE, 0.0 * UV_TILE], // bottom-left
-    },
-    Vertex {
-        pos: [0.3, -0.4, -0.788],
-        color: [1.0, 0.2, 0.2],
-        uv: [1.0 * UV_TILE, 0.0 * UV_TILE], // bottom-right
-    },
-    // BACK triangle (farther)
-    Vertex {
-        pos: [0.0, 0.4, -0.888],
-        color: [0.2, 0.8, 1.0],
-        uv: [0.5 * UV_TILE, 1.0 * UV_TILE], // top
-    },
-    Vertex {
-        pos: [-0.5, -0.4, -0.888],
-        color: [0.2, 0.8, 1.0],
-        uv: [0.0 * UV_TILE, 0.0 * UV_TILE], // bottom-left
-    },
-    Vertex {
-        pos: [0.5, -0.4, -0.888],
-        color: [0.2, 0.8, 1.0],
-        uv: [1.0 * UV_TILE, 0.0 * UV_TILE], // bottom-right
-    },
-];
-
-const TRI_IDXS: &[u32] = &[0, 1, 2, 3, 4, 5];
 
 /// Opaque handle to a mesh uploaded via [`VkRenderer::upload_mesh`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,15 +101,10 @@ pub struct VkRenderer {
     depth_alloc: Allocation,
     depth_view: vk::ImageView,
     depth_format: vk::Format,
-    vbuf: vk::Buffer,
-    vbuf_alloc: Allocation,
-    ibuf: vk::Buffer,
-    ibuf_alloc: Allocation,
-    index_count: u32,
     meshes: Vec<GpuMesh>,
-    // Command buffer currently open for recording (set for the duration of
-    // record_one_command), so draw_mesh knows where to record draws into.
-    recording_cmd: Option<vk::CommandBuffer>,
+    // Draws queued by draw_mesh() for the next render() call; consumed and
+    // cleared each time a frame's command buffer is recorded.
+    pending_draws: Vec<(MeshHandle, PushData)>,
     desc_pool: vk::DescriptorPool,
     desc_set_layout_camera: vk::DescriptorSetLayout,
     desc_set_layout_material: vk::DescriptorSetLayout,
@@ -251,12 +208,6 @@ impl Drop for VkRenderer {
             d.destroy_image_view(self.depth_view, None);
             d.destroy_image(self.depth_image, None);
             let _ = allocator.free(std::mem::take(&mut self.depth_alloc));
-
-            // Destroy vertex/image buffers
-            d.destroy_buffer(self.vbuf, None);
-            let _ = allocator.free(std::mem::take(&mut self.vbuf_alloc));
-            d.destroy_buffer(self.ibuf, None);
-            let _ = allocator.free(std::mem::take(&mut self.ibuf_alloc));
 
             // Destroy meshes uploaded via upload_mesh
             for mesh in self.meshes.drain(..) {
@@ -608,37 +559,8 @@ fn build_renderer(
         sc.image_views.len(),
     )?;
 
-    // --- Create device-local vertex/index buffers and upload data ---
-    let vsize = std::mem::size_of_val(TRI_VERTS) as vk::DeviceSize;
-    let isize = std::mem::size_of_val(TRI_IDXS) as vk::DeviceSize;
-
-    // Create destination (device-local) buffers
-    let (vbuf, vbuf_alloc) = create_buffer_and_memory(
-        &device,
-        &mut allocator,
-        vsize,
-        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-        MemoryLocation::GpuOnly,
-        "vertex buffer",
-    )?;
-    let (ibuf, ibuf_alloc) = create_buffer_and_memory(
-        &device,
-        &mut allocator,
-        isize,
-        vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-        MemoryLocation::GpuOnly,
-        "index buffer",
-    )?;
-
-    // Upload via staging
-    let vbytes = bytemuck::cast_slice(TRI_VERTS);
-    let ibytes = bytemuck::cast_slice(TRI_IDXS);
-
-    upload_via_staging(&device, &mut allocator, queue, cmd.pool, vbuf, vbytes)?;
-    upload_via_staging(&device, &mut allocator, queue, cmd.pool, ibuf, ibytes)?;
-
     // 7) Assemble VkRenderer
-    let mut r = VkRenderer {
+    let r = VkRenderer {
         instance,
         surface_loader,
         surface,
@@ -680,13 +602,8 @@ fn build_renderer(
         depth_alloc,
         depth_view,
         depth_format,
-        vbuf,
-        vbuf_alloc,
-        ibuf,
-        ibuf_alloc,
-        index_count: TRI_IDXS.len() as u32,
         meshes: Vec::new(),
-        recording_cmd: None,
+        pending_draws: Vec::new(),
         desc_pool,
         desc_set_layout_camera,
         desc_set_layout_material,
@@ -710,9 +627,6 @@ fn build_renderer(
         tex_view,
         tex_sampler,
     };
-
-    // 8) Record per-image command buffers once
-    r.record_commands()?;
 
     Ok(r)
 }
@@ -836,8 +750,8 @@ impl VkRenderer {
         self.pipeline_layout = new_layout;
         self.pipeline = new_pipeline;
 
-        // Re-record CBs because pipeline handle changed.
-        self.record_commands()?;
+        // No re-record needed here: render() records each frame's command
+        // buffer fresh against whatever self.pipeline currently is.
         Ok(())
     }
 
@@ -1016,37 +930,33 @@ impl VkRenderer {
             );
         }
 
-        // Push constants (per-object transform; identity model for now)
-        let push = PushData {
-            model: [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
-            tint: [1.0, 1.0, 1.0, 1.0],
-        };
-        unsafe {
-            self.device.cmd_push_constants(
-                cmd,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                bytemuck::bytes_of(&push),
-            );
-        }
-
-        // bind vertex + index buffers
+        // Draw every mesh queued via draw_mesh() for this frame. The
+        // renderer has no built-in geometry of its own.
         let offsets = [0_u64];
-        unsafe {
-            self.device
-                .cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&self.vbuf), &offsets);
-            self.device
-                .cmd_bind_index_buffer(cmd, self.ibuf, 0, vk::IndexType::UINT32);
-
-            self.device
-                .cmd_draw_indexed(cmd, self.index_count, 1, 0, 0, 0)
-        };
+        for (handle, push) in &self.pending_draws {
+            let Some(mesh) = self.meshes.get(handle.0 as usize) else {
+                continue;
+            };
+            unsafe {
+                self.device.cmd_push_constants(
+                    cmd,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::bytes_of(push),
+                );
+                self.device.cmd_bind_vertex_buffers(
+                    cmd,
+                    0,
+                    std::slice::from_ref(&mesh.vbuf),
+                    &offsets,
+                );
+                self.device
+                    .cmd_bind_index_buffer(cmd, mesh.ibuf, 0, vk::IndexType::UINT32);
+                self.device
+                    .cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
+            }
+        }
         Ok(())
     }
 
@@ -1083,8 +993,12 @@ impl VkRenderer {
     }
 
     #[inline]
+    // Records draws queued via draw_mesh() into the given image's command
+    // buffer. Called fresh every frame for the just-acquired image (see
+    // render()) — safe to reset because acquire_next_image only returns an
+    // image index once the GPU is done with its previous use.
     fn record_one_command(
-        &mut self,
+        &self,
         cmd: vk::CommandBuffer,
         image: vk::Image,
         image_view: vk::ImageView,
@@ -1100,7 +1014,6 @@ impl VkRenderer {
             ..Default::default()
         };
         unsafe { self.device.begin_command_buffer(cmd, &begin)? };
-        self.recording_cmd = Some(cmd);
 
         // body
         self.transition_to_color(cmd, image);
@@ -1111,17 +1024,7 @@ impl VkRenderer {
         self.transition_to_present(cmd, image);
 
         // end
-        self.recording_cmd = None;
         unsafe { self.device.end_command_buffer(cmd)? };
-        Ok(())
-    }
-
-    // --- Record all per-swapchain-image CBs ----------------------
-    fn record_commands(&mut self) -> Result<()> {
-        let cmd_bufs = self.cmd_bufs.clone();
-        for (i, cmd) in cmd_bufs.into_iter().enumerate() {
-            self.record_one_command(cmd, self.images[i], self.image_views[i], i)?;
-        }
         Ok(())
     }
 
@@ -1176,35 +1079,12 @@ impl VkRenderer {
         Ok(handle)
     }
 
-    /// Record a draw of a previously uploaded mesh into the command buffer
-    /// currently being recorded, with the given per-object push constants.
-    /// A no-op if called outside of command buffer recording or with an
-    /// unknown handle.
+    /// Queue a draw of a previously uploaded mesh for the next render()
+    /// call, with the given per-object push constants. Call once per frame
+    /// per object; the queue is consumed and cleared when that frame's
+    /// command buffer is recorded.
     pub fn draw_mesh(&mut self, handle: MeshHandle, push: PushData) {
-        let Some(cmd) = self.recording_cmd else {
-            return;
-        };
-        let Some(mesh) = self.meshes.get(handle.0 as usize) else {
-            return;
-        };
-
-        unsafe {
-            self.device.cmd_push_constants(
-                cmd,
-                self.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                bytemuck::bytes_of(&push),
-            );
-
-            let offsets = [0_u64];
-            self.device
-                .cmd_bind_vertex_buffers(cmd, 0, std::slice::from_ref(&mesh.vbuf), &offsets);
-            self.device
-                .cmd_bind_index_buffer(cmd, mesh.ibuf, 0, vk::IndexType::UINT32);
-            self.device
-                .cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
-        }
+        self.pending_draws.push((handle, push));
     }
 
     // STRICT ORDER (recreate):
@@ -1215,7 +1095,8 @@ impl VkRenderer {
     // 5) Recreate per-image sync objects
     // 6) Recreate pipeline ONLY if format changed
     // 7) Resize command buffers if image count changed
-    // 8) Re-record commands for ALL images
+    // (No re-record step here: render() records each frame's command
+    // buffer fresh for whichever image it just acquired.)
     // Any deviation can cause sporadic DEVICE_LOST or image-in-use errors.
     fn recreate_swapchain(&mut self, size: RenderSize) -> Result<()> {
         // Guard min size window
@@ -1401,9 +1282,7 @@ impl VkRenderer {
             self.cmd_bufs = unsafe { self.device.allocate_command_buffers(&alloc_info)? };
         }
 
-        // 8) Record
         self.acq_index = 0;
-        self.record_commands()?;
 
         Ok(())
     }
@@ -1479,14 +1358,15 @@ impl Renderer for VkRenderer {
         self.clear = vk::ClearValue {
             color: vk::ClearColorValue { float32: rgba },
         };
-
-        let _ = self.record_commands();
     }
 
     // STRICT PER-FRAME ORDER:
     // 1) acquire_next_image (waits on acquire semaphore)
-    // 2) queue_submit (signals render-finished for THIS image)
-    // 3) queue_present (waits on render-finished)
+    // 2) record this frame's draws into the acquired image's command buffer
+    //    (acquire_next_image only returns an image once the GPU is done
+    //    with its previous use, so resetting its command buffer here is safe)
+    // 3) queue_submit (signals render-finished for THIS image)
+    // 4) queue_present (waits on render-finished)
     // Each swapchain image has its own FrameSync; do not cross-use semaphores.
     fn render(&mut self) -> Result<()> {
         // Guard on pause
@@ -1571,6 +1451,11 @@ impl Renderer for VkRenderer {
         let proj = VkRenderer::perspective_rh_zo_reverse_infinite(fovy, aspect, near, flip_y);
         let mvp = CameraUbo { mvp: proj };
         self.update_camera_ubo_for_image(img, &mvp)?;
+
+        // Record this frame's draws (queued via draw_mesh()) into the
+        // image we just acquired, then clear the queue for the next frame.
+        self.record_one_command(cmd, self.images[img], self.image_views[img], img)?;
+        self.pending_draws.clear();
 
         // 2) Submit (wait on acquire sem; signal render-finished; bump timeline)
         let next_value = self.timeline_value.wrapping_add(1);

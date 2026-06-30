@@ -5,7 +5,7 @@ use clap::Parser;
 use cubic_core::init_tracing;
 use cubic_render::{RenderSize, Renderer};
 use cubic_render_gl::GlRenderer;
-use cubic_render_vk::VkRenderer;
+use cubic_render_vk::{MeshHandle, VkRenderer};
 use tracing::{error, info};
 
 use cubic_platform::winit::{
@@ -106,6 +106,62 @@ fn load_cfg() -> AppCfg {
     }
 }
 
+// Temporary test scene: the same two-triangle test geometry that used to be
+// hardcoded inside cubic-render-vk, now supplied by the app through the
+// upload_mesh/draw_mesh API.
+mod test_scene {
+    use cubic_render_vk::{PushData, Vertex};
+
+    const UV_TILE: f32 = 1.0;
+
+    pub const TRI_VERTS: &[Vertex] = &[
+        // FRONT triangle (closer)
+        Vertex {
+            pos: [0.0, 0.5, -0.988],
+            color: [1.0, 0.2, 0.2],
+            uv: [0.5 * UV_TILE, 1.0 * UV_TILE], // top
+        },
+        Vertex {
+            pos: [-0.3, -0.4, -0.788],
+            color: [1.0, 0.2, 0.2],
+            uv: [0.0 * UV_TILE, 0.0 * UV_TILE], // bottom-left
+        },
+        Vertex {
+            pos: [0.3, -0.4, -0.788],
+            color: [1.0, 0.2, 0.2],
+            uv: [1.0 * UV_TILE, 0.0 * UV_TILE], // bottom-right
+        },
+        // BACK triangle (farther)
+        Vertex {
+            pos: [0.0, 0.4, -0.888],
+            color: [0.2, 0.8, 1.0],
+            uv: [0.5 * UV_TILE, 1.0 * UV_TILE], // top
+        },
+        Vertex {
+            pos: [-0.5, -0.4, -0.888],
+            color: [0.2, 0.8, 1.0],
+            uv: [0.0 * UV_TILE, 0.0 * UV_TILE], // bottom-left
+        },
+        Vertex {
+            pos: [0.5, -0.4, -0.888],
+            color: [0.2, 0.8, 1.0],
+            uv: [1.0 * UV_TILE, 0.0 * UV_TILE], // bottom-right
+        },
+    ];
+
+    pub const TRI_IDXS: &[u32] = &[0, 1, 2, 3, 4, 5];
+
+    pub const IDENTITY_PUSH: PushData = PushData {
+        model: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        tint: [1.0, 1.0, 1.0, 1.0],
+    };
+}
+
 enum Backend {
     Gl(Box<GlRenderer>),
     Vk(Box<VkRenderer>),
@@ -125,6 +181,8 @@ struct App {
     paused: bool,
     focused: bool,
     next_frame_deadline: Option<std::time::Instant>,
+
+    vk_mesh: Option<MeshHandle>,
 }
 
 impl ApplicationHandler for App {
@@ -180,6 +238,14 @@ impl ApplicationHandler for App {
                         HdrFlavorCfg::PreferHdr10 => cubic_render_vk::HdrFlavor::PreferHdr10,
                     };
                     r.as_mut().set_hdr_flavor(flavor);
+
+                    match r
+                        .as_mut()
+                        .upload_mesh(test_scene::TRI_VERTS, test_scene::TRI_IDXS)
+                    {
+                        Ok(handle) => self.vk_mesh = Some(handle),
+                        Err(e) => error!("upload_mesh failed: {e}"),
+                    }
                 }
             }
 
@@ -323,6 +389,10 @@ impl ApplicationHandler for App {
                 }
 
                 if let Some(backend) = &mut self.backend {
+                    if let (Backend::Vk(r), Some(handle)) = (&mut *backend, self.vk_mesh) {
+                        r.draw_mesh(handle, test_scene::IDENTITY_PUSH);
+                    }
+
                     let res = match backend {
                         Backend::Gl(r) => r.render(),
                         Backend::Vk(r) => r.render(),
@@ -448,6 +518,7 @@ fn main() -> Result<()> {
         paused: false,
         focused: true,
         next_frame_deadline: None,
+        vk_mesh: None,
     };
 
     event_loop.run_app(&mut app)?;
