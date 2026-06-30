@@ -255,12 +255,19 @@ pub(crate) fn create_pipeline(
         ..Default::default()
     };
 
-    // --- Pipeline layout (no descriptors/push constants yet) ---
+    // --- Pipeline layout ---
     let layouts = [set_layout_camera, set_layout_material];
+    let push_range = vk::PushConstantRange {
+        stage_flags: vk::ShaderStageFlags::VERTEX,
+        offset: 0,
+        size: std::mem::size_of::<super::resources::PushData>() as u32,
+    };
     let layout_info = vk::PipelineLayoutCreateInfo {
         s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
         set_layout_count: layouts.len() as u32,
         p_set_layouts: layouts.as_ptr(),
+        push_constant_range_count: 1,
+        p_push_constant_ranges: &push_range,
         ..Default::default()
     };
     let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };

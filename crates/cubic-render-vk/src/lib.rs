@@ -29,7 +29,7 @@ use resources::{
     create_dummy_texture_and_sampler, create_frame_uniforms_and_sets,
     create_material_desc_pool_and_set, create_material_desc_set_layout, depth_aspect_mask,
     depth_attachment_layout, pick_depth_format, upload_via_staging, write_material_descriptors,
-    CameraUbo, Vertex,
+    CameraUbo, PushData, Vertex,
 };
 use swapchain::{
     create_hdr_metadata_if_needed, create_swapchain_bundle, SwapchainBundle, SwapchainConfig,
@@ -967,6 +967,26 @@ impl VkRenderer {
                 0, // firstSet -> set 0 = camera, set 1 = material
                 &set,
                 &[], // no dynamic offsets
+            );
+        }
+
+        // Push constants (per-object transform; identity model for now)
+        let push = PushData {
+            model: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            tint: [1.0, 1.0, 1.0, 1.0],
+        };
+        unsafe {
+            self.device.cmd_push_constants(
+                cmd,
+                self.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                bytemuck::bytes_of(&push),
             );
         }
 

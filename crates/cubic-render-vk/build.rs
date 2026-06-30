@@ -16,11 +16,15 @@ layout(location = 1) in vec3 inColor;
 
 layout(set = 0, binding = 0) uniform Camera { mat4 mvp; } u;
 
+layout(push_constant) uniform Push {
+    mat4 model;
+} push;
+
 layout(location = 0) out vec3 vColor;
 
 void main() {
     vColor = inColor;
-    gl_Position = u.mvp * vec4(inPos, 1.0);
+    gl_Position = u.mvp * push.model * vec4(inPos, 1.0);
 }
 "#;
 
