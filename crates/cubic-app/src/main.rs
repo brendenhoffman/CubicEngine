@@ -120,32 +120,38 @@ mod test_scene {
             pos: [0.0, 0.5, -0.988],
             color: [1.0, 0.2, 0.2],
             uv: [0.5 * UV_TILE, 1.0 * UV_TILE], // top
+            normal: [0.0, 0.0, 1.0],
         },
         Vertex {
             pos: [-0.3, -0.4, -0.788],
             color: [1.0, 0.2, 0.2],
             uv: [0.0 * UV_TILE, 0.0 * UV_TILE], // bottom-left
+            normal: [0.0, 0.0, 1.0],
         },
         Vertex {
             pos: [0.3, -0.4, -0.788],
             color: [1.0, 0.2, 0.2],
             uv: [1.0 * UV_TILE, 0.0 * UV_TILE], // bottom-right
+            normal: [0.0, 0.0, 1.0],
         },
         // BACK triangle (farther)
         Vertex {
             pos: [0.0, 0.4, -0.888],
             color: [0.2, 0.8, 1.0],
             uv: [0.5 * UV_TILE, 1.0 * UV_TILE], // top
+            normal: [0.0, 0.0, 1.0],
         },
         Vertex {
             pos: [-0.5, -0.4, -0.888],
             color: [0.2, 0.8, 1.0],
             uv: [0.0 * UV_TILE, 0.0 * UV_TILE], // bottom-left
+            normal: [0.0, 0.0, 1.0],
         },
         Vertex {
             pos: [0.5, -0.4, -0.888],
             color: [0.2, 0.8, 1.0],
             uv: [1.0 * UV_TILE, 0.0 * UV_TILE], // bottom-right
+            normal: [0.0, 0.0, 1.0],
         },
     ];
 

@@ -170,6 +170,12 @@ pub(crate) fn create_pipeline(
             format: vk::Format::R32G32_SFLOAT,
             offset: (std::mem::size_of::<[f32; 3]>() * 2) as u32,
         },
+        vk::VertexInputAttributeDescription {
+            location: 3,
+            binding: 0,
+            format: vk::Format::R32G32B32_SFLOAT,
+            offset: std::mem::offset_of!(super::resources::Vertex, normal) as u32,
+        },
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo {
         s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,

@@ -12,9 +12,11 @@ layout(push_constant) uniform Push {
 layout(location = 0) in vec3 in_pos;
 layout(location = 1) in vec3 in_color;
 layout(location = 2) in vec2 in_uv;
+layout(location = 3) in vec3 in_normal;
 
 layout(location = 0) out vec3 v_color;
 layout(location = 1) out vec2 v_uv;
+layout(location = 2) out vec3 v_normal;
 
 // Optional compile-time knobs:
 #ifndef UV_TILE
@@ -34,4 +36,9 @@ void main() {
     uv.y = 1.0 - uv.y;
 #endif
     v_uv = uv;
+
+    // World-space normal. Assumes uniform scale; revisit with a proper
+    // normal matrix (inverse-transpose) once non-uniform scaling or real
+    // lighting shows up. Unused downstream for now.
+    v_normal = mat3(push.model) * in_normal;
 }

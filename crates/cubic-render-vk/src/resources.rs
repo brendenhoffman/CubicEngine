@@ -18,6 +18,7 @@ pub struct Vertex {
     pub pos: [f32; 3],
     pub color: [f32; 3],
     pub uv: [f32; 2],
+    pub normal: [f32; 3],
 }
 
 #[repr(C)]
