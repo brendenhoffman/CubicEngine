@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Parser;
 use cubic_core::init_tracing;
-use cubic_math::Camera;
+use cubic_math::{Camera, Vec3};
 use cubic_render::{RenderSize, Renderer};
 use cubic_render_gl::GlRenderer;
 use cubic_render_vk::{MeshHandle, VkRenderer};
@@ -11,13 +11,15 @@ use tracing::{error, info};
 
 use cubic_platform::winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{DeviceEvent, DeviceId, ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
-    window::{Window, WindowId},
+    window::{CursorGrabMode, Window, WindowId},
 };
 
 use serde::Deserialize;
+use std::collections::HashSet;
 use std::fs;
 
 #[derive(Parser, Debug)]
@@ -169,6 +171,42 @@ mod test_scene {
     };
 }
 
+const MOVE_SPEED: f32 = 3.0; // units/sec
+const MOUSE_SENSITIVITY: f32 = 0.0025; // radians/pixel
+const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
+
+/// Held keys and accumulated mouse motion since the last time they were
+/// read, driven from WindowEvent::KeyboardInput and DeviceEvent::MouseMotion.
+#[derive(Default)]
+struct InputState {
+    held_keys: HashSet<KeyCode>,
+    mouse_delta: (f32, f32),
+}
+
+impl InputState {
+    fn set_key(&mut self, code: KeyCode, pressed: bool) {
+        if pressed {
+            self.held_keys.insert(code);
+        } else {
+            self.held_keys.remove(&code);
+        }
+    }
+
+    fn is_held(&self, code: KeyCode) -> bool {
+        self.held_keys.contains(&code)
+    }
+
+    fn accumulate_mouse_delta(&mut self, dx: f32, dy: f32) {
+        self.mouse_delta.0 += dx;
+        self.mouse_delta.1 += dy;
+    }
+
+    /// Returns the accumulated delta and resets it to zero.
+    fn take_mouse_delta(&mut self) -> (f32, f32) {
+        std::mem::take(&mut self.mouse_delta)
+    }
+}
+
 enum Backend {
     Gl(Box<GlRenderer>),
     Vk(Box<VkRenderer>),
@@ -191,6 +229,8 @@ struct App {
 
     vk_mesh: Option<MeshHandle>,
     camera: Camera,
+    input: InputState,
+    last_frame_instant: std::time::Instant,
 }
 
 impl ApplicationHandler for App {
@@ -385,9 +425,33 @@ impl ApplicationHandler for App {
                         }
                     }
 
+                    if let Some(window) = &self.window {
+                        if focused {
+                            let _ = window
+                                .set_cursor_grab(CursorGrabMode::Locked)
+                                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                            window.set_cursor_visible(false);
+                        } else {
+                            let _ = window.set_cursor_grab(CursorGrabMode::None);
+                            window.set_cursor_visible(true);
+                        }
+                    }
+
                     if focused {
                         self.next_frame_deadline = None;
+                    } else {
+                        // Can't reliably observe key-up events that happen
+                        // while the window isn't focused, so don't leave
+                        // movement keys stuck held across an alt-tab.
+                        self.input.held_keys.clear();
                     }
+                }
+            }
+
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    self.input
+                        .set_key(code, event.state == ElementState::Pressed);
                 }
             }
 
@@ -395,6 +459,11 @@ impl ApplicationHandler for App {
                 if self.exiting || self.paused {
                     return;
                 }
+
+                let now = std::time::Instant::now();
+                let dt = now.duration_since(self.last_frame_instant).as_secs_f32();
+                self.last_frame_instant = now;
+                self.apply_input(dt);
 
                 if let Some(backend) = &mut self.backend {
                     if let Backend::Vk(r) = &mut *backend {
@@ -422,6 +491,22 @@ impl ApplicationHandler for App {
             }
 
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            // Raw input is global, not window-scoped; only track it while
+            // we actually own the cursor.
+            if self.focused {
+                self.input
+                    .accumulate_mouse_delta(delta.0 as f32, delta.1 as f32);
+            }
         }
     }
 
@@ -509,6 +594,41 @@ impl ApplicationHandler for App {
     }
 }
 
+impl App {
+    /// Apply accumulated mouse look and held-key movement to the camera.
+    fn apply_input(&mut self, dt: f32) {
+        let (dx, dy) = self.input.take_mouse_delta();
+        self.camera.yaw -= dx * MOUSE_SENSITIVITY;
+        self.camera.pitch =
+            (self.camera.pitch - dy * MOUSE_SENSITIVITY).clamp(-MAX_PITCH, MAX_PITCH);
+
+        let forward = self.camera.forward();
+        let right = forward.cross(Vec3::Y).normalize_or_zero();
+
+        let mut movement = Vec3::ZERO;
+        if self.input.is_held(KeyCode::KeyW) {
+            movement += forward;
+        }
+        if self.input.is_held(KeyCode::KeyS) {
+            movement -= forward;
+        }
+        if self.input.is_held(KeyCode::KeyD) {
+            movement += right;
+        }
+        if self.input.is_held(KeyCode::KeyA) {
+            movement -= right;
+        }
+        if self.input.is_held(KeyCode::Space) {
+            movement += Vec3::Y;
+        }
+        if self.input.is_held(KeyCode::ShiftLeft) {
+            movement -= Vec3::Y;
+        }
+
+        self.camera.position += movement.normalize_or_zero() * MOVE_SPEED * dt;
+    }
+}
+
 fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
@@ -531,6 +651,8 @@ fn main() -> Result<()> {
         next_frame_deadline: None,
         vk_mesh: None,
         camera: Camera::default(),
+        input: InputState::default(),
+        last_frame_instant: std::time::Instant::now(),
     };
 
     event_loop.run_app(&mut app)?;
