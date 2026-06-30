@@ -21,11 +21,11 @@ use device::{decide_path_and_create_device, select_device_and_queue, RenderPath}
 #[cfg(debug_assertions)]
 use instance::destroy_debug_messenger;
 use instance::{init_instance_and_surface, recreate_surface};
-#[cfg(debug_assertions)]
-use pipeline::ShaderDev;
 use pipeline::{
     create_or_load_pipeline_cache, create_pipeline, pipeline_cache_path, save_pipeline_cache,
 };
+#[cfg(debug_assertions)]
+use pipeline::{shader_dir, ShaderDev};
 use resources::{
     create_buffer_and_memory, create_camera_desc_set_layout, create_depth_resources,
     create_dummy_texture_and_sampler, create_frame_uniforms_and_sets,
@@ -489,24 +489,20 @@ fn build_renderer(
     let cfg = initial_cfg.to_swapchain_config(size);
     #[cfg(debug_assertions)]
     let shader_dev = {
-        if let Ok(dir) = std::env::var("CUBIC_SHADER_DIR") {
-            let dir = std::path::PathBuf::from(dir);
-            let vp = dir.join("tri.vert.spv");
-            let fp = dir.join("tri.frag.spv");
-            if vp.exists() && fp.exists() {
-                if let (Ok(vm), Ok(fm)) = (
-                    std::fs::metadata(&vp).and_then(|m| m.modified()),
-                    std::fs::metadata(&fp).and_then(|m| m.modified()),
-                ) {
-                    Some(ShaderDev {
-                        vert_spv: vp,
-                        frag_spv: fp,
-                        vert_mtime: vm,
-                        frag_mtime: fm,
-                    })
-                } else {
-                    None
-                }
+        let dir = shader_dir();
+        let vp = dir.join("tri.vert.spv");
+        let fp = dir.join("tri.frag.spv");
+        if vp.exists() && fp.exists() {
+            if let (Ok(vm), Ok(fm)) = (
+                std::fs::metadata(&vp).and_then(|m| m.modified()),
+                std::fs::metadata(&fp).and_then(|m| m.modified()),
+            ) {
+                Some(ShaderDev {
+                    vert_spv: vp,
+                    frag_spv: fp,
+                    vert_mtime: vm,
+                    frag_mtime: fm,
+                })
             } else {
                 None
             }
@@ -731,7 +727,8 @@ impl VkRenderer {
             self.device.device_wait_idle().ok();
         }
 
-        // Rebuild using the same loader (it prefers CUBIC_SHADER_DIR/*.spv if present)
+        // Rebuild using the same loader (reads from shader_dir(), i.e.
+        // CUBIC_SHADER_DIR if set, else assets/shaders/)
         let (new_layout, new_pipeline) = create_pipeline(
             &self.device,
             self.pipeline_cache,

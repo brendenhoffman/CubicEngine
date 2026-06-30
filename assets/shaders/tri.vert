@@ -4,6 +4,11 @@ layout(set = 0, binding = 0) uniform Camera {
     mat4 mvp;
 } ubo;
 
+layout(push_constant) uniform Push {
+    mat4 model;
+    vec4 tint;
+} push;
+
 layout(location = 0) in vec3 in_pos;
 layout(location = 1) in vec3 in_color;
 layout(location = 2) in vec2 in_uv;
@@ -20,9 +25,9 @@ layout(location = 1) out vec2 v_uv;
 #endif
 
 void main() {
-    gl_Position = ubo.mvp * vec4(in_pos, 1.0);
+    gl_Position = ubo.mvp * push.model * vec4(in_pos, 1.0);
 
-    v_color = in_color;
+    v_color = in_color * push.tint.rgb;
 
     vec2 uv = in_uv * UV_TILE;
 #if FLIP_V

@@ -21,8 +21,14 @@ fn load_spv_file(path: &Path) -> Result<Vec<u32>> {
     read_spv(&mut Cursor::new(&bytes[..])).with_context(|| format!("read_spv {:?}", path))
 }
 
-fn load_spv_bytes(bytes: &[u8]) -> Result<Vec<u32>> {
-    read_spv(&mut Cursor::new(bytes)).context("read_spv from embedded bytes")
+/// Directory shaders are loaded from. Defaults to the committed
+/// assets/shaders/ (the single source of truth); CUBIC_SHADER_DIR overrides
+/// it for dev drops/mods and is also what hot-reload watches.
+pub(crate) fn shader_dir() -> PathBuf {
+    match std::env::var("CUBIC_SHADER_DIR") {
+        Ok(dir) => PathBuf::from(dir),
+        Err(_) => PathBuf::from("assets/shaders"),
+    }
 }
 
 fn hex_bytes(b: &[u8]) -> String {
@@ -98,31 +104,11 @@ pub(crate) fn create_pipeline(
     // On swapchain format change, pipeline must be rebuilt before recording.
 
     // --- Load + create shader modules (destroyed before return) ---
-    // Try CUBIC_SHADER_DIR override first (e.g., for mods or dev drops),
-    // otherwise fall back to embedded SPIR-V from build.rs.
-    let (vs_words, fs_words): (Vec<u32>, Vec<u32>) = {
-        if let Ok(dir) = std::env::var("CUBIC_SHADER_DIR") {
-            let vs_path = std::path::Path::new(&dir).join("tri.vert.spv");
-            let fs_path = std::path::Path::new(&dir).join("tri.frag.spv");
-            if vs_path.exists() && fs_path.exists() {
-                (load_spv_file(&vs_path)?, load_spv_file(&fs_path)?)
-            } else {
-                let vs_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/tri.vert.spv"));
-                let fs_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/tri.frag.spv"));
-                (
-                    load_spv_bytes(&vs_bytes[..])?,
-                    load_spv_bytes(&fs_bytes[..])?,
-                )
-            }
-        } else {
-            let vs_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/tri.vert.spv"));
-            let fs_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/tri.frag.spv"));
-            (
-                load_spv_bytes(&vs_bytes[..])?,
-                load_spv_bytes(&fs_bytes[..])?,
-            )
-        }
-    };
+    // assets/shaders/ is the single source of truth (CUBIC_SHADER_DIR can
+    // override the directory for dev drops/mods; see shader_dir()).
+    let dir = shader_dir();
+    let vs_words = load_spv_file(&dir.join("tri.vert.spv"))?;
+    let fs_words = load_spv_file(&dir.join("tri.frag.spv"))?;
 
     let vs_ci = vk::ShaderModuleCreateInfo {
         s_type: vk::StructureType::SHADER_MODULE_CREATE_INFO,
