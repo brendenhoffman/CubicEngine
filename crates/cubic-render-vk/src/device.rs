@@ -121,6 +121,11 @@ pub(crate) fn decide_path_and_create_device(
 
     // Enable timeline semaphore
     feats12.timeline_semaphore = vk::TRUE;
+    // Enable buffer device address (VK_KHR_buffer_device_address, core in
+    // 1.2). Not used yet, but must be enabled at device creation time so
+    // ray tracing / bindless buffer patterns don't require a device
+    // recreation later.
+    feats12.buffer_device_address = vk::TRUE;
 
     let (path, pnext): (RenderPath, *const std::ffi::c_void) = if !force_khr {
         let dev_api = unsafe { instance.get_physical_device_properties(phys).api_version };
