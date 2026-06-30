@@ -58,6 +58,27 @@ struct GpuMesh {
     index_count: u32,
 }
 
+/// A GPU object retired while it might still be in use, destroyed once the
+/// timeline semaphore reaches `value` (see `VkRenderer::drain_trash`).
+enum GpuResource {
+    Buffer {
+        buffer: vk::Buffer,
+        alloc: Allocation,
+    },
+    Image {
+        image: vk::Image,
+        alloc: Allocation,
+    },
+    ImageView(vk::ImageView),
+    Pipeline(vk::Pipeline),
+    PipelineLayout(vk::PipelineLayout),
+}
+
+struct DeferredDrop {
+    value: u64,
+    resource: GpuResource,
+}
+
 // 3) Renderer data model
 pub struct VkRenderer {
     instance: ash::Instance,
@@ -107,6 +128,9 @@ pub struct VkRenderer {
     // Draws queued by draw_mesh() for the next render() call; consumed and
     // cleared each time a frame's command buffer is recorded.
     pending_draws: Vec<(MeshHandle, PushData)>,
+    // GPU resources retired while possibly still in use; reclaimed once the
+    // timeline semaphore catches up (see drain_trash).
+    trash: Vec<DeferredDrop>,
     desc_pool: vk::DescriptorPool,
     desc_set_layout_camera: vk::DescriptorSetLayout,
     desc_set_layout_material: vk::DescriptorSetLayout,
@@ -168,6 +192,14 @@ impl Drop for VkRenderer {
 
             // 2) QUIESCE DEVICE (covers any remaining queue work)
             d.device_wait_idle().ok();
+        }
+
+        // Device is fully idle, so every trashed resource is now safe to
+        // destroy regardless of its retirement value.
+        self.drain_trash();
+
+        unsafe {
+            let d = &self.device;
 
             // 3) PIPELINE & LAYOUTS BEFORE SWAPCHAIN (pipelines can depend on sc format)
             d.destroy_pipeline(self.pipeline, None);
@@ -603,6 +635,7 @@ fn build_renderer(
         depth_format,
         meshes: Vec::new(),
         pending_draws: Vec::new(),
+        trash: Vec::new(),
         desc_pool,
         desc_set_layout_camera,
         desc_set_layout_material,
@@ -680,6 +713,55 @@ impl VkRenderer {
         }
     }
 
+    /// Destroy every trashed resource whose retirement value the timeline
+    /// semaphore has already reached. Non-blocking: queries the semaphore's
+    /// current counter rather than waiting on it.
+    fn drain_trash(&mut self) {
+        if self.trash.is_empty() {
+            return;
+        }
+        // On query failure, fall back to 0 (i.e. drain nothing this round)
+        // rather than risk destroying a resource still in use.
+        let signaled =
+            unsafe { self.device.get_semaphore_counter_value(self.timeline) }.unwrap_or(0);
+
+        let mut i = 0;
+        while i < self.trash.len() {
+            if self.trash[i].value > signaled {
+                i += 1;
+                continue;
+            }
+            let item = self.trash.swap_remove(i);
+            match item.resource {
+                GpuResource::Buffer { buffer, alloc } => unsafe {
+                    self.device.destroy_buffer(buffer, None);
+                    let _ = self
+                        .allocator
+                        .as_mut()
+                        .expect("allocator missing")
+                        .free(alloc);
+                },
+                GpuResource::Image { image, alloc } => unsafe {
+                    self.device.destroy_image(image, None);
+                    let _ = self
+                        .allocator
+                        .as_mut()
+                        .expect("allocator missing")
+                        .free(alloc);
+                },
+                GpuResource::ImageView(view) => unsafe {
+                    self.device.destroy_image_view(view, None);
+                },
+                GpuResource::Pipeline(p) => unsafe {
+                    self.device.destroy_pipeline(p, None);
+                },
+                GpuResource::PipelineLayout(l) => unsafe {
+                    self.device.destroy_pipeline_layout(l, None);
+                },
+            }
+        }
+    }
+
     #[cfg(debug_assertions)]
     fn hot_reload_shaders_if_changed(&mut self) -> Result<()> {
         let Some(dev) = self.shader_dev.as_mut() else {
@@ -727,11 +809,14 @@ impl VkRenderer {
             self.desc_set_layout_material,
         )?;
 
-        unsafe {
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-        }
+        self.trash.push(DeferredDrop {
+            value: self.timeline_value,
+            resource: GpuResource::Pipeline(self.pipeline),
+        });
+        self.trash.push(DeferredDrop {
+            value: self.timeline_value,
+            resource: GpuResource::PipelineLayout(self.pipeline_layout),
+        });
         self.pipeline_layout = new_layout;
         self.pipeline = new_pipeline;
 
@@ -1120,19 +1205,17 @@ impl VkRenderer {
         }
         self.frames.clear();
 
-        // 3b) Destroy per-image UBOs + descriptor pool tied to OLD swapchain
-        // (gpu-allocator persistently maps CpuToGpu allocations, so no
-        // explicit unmap is needed)
-        for &b in &self.ubufs {
-            unsafe { self.device.destroy_buffer(b, None) };
+        // 3b) Retire per-image UBOs + descriptor pool tied to OLD swapchain.
+        // gpu-allocator persistently maps CpuToGpu allocations, so no
+        // explicit unmap is needed. device_wait_idle() above already makes
+        // these safe to destroy immediately, but route them through the
+        // trash queue anyway for consistency with the rest of the renderer.
+        for (buffer, alloc) in self.ubufs.drain(..).zip(self.umems.drain(..)) {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Buffer { buffer, alloc },
+            });
         }
-        {
-            let allocator = self.allocator.as_mut().expect("allocator missing");
-            for alloc in self.umems.drain(..) {
-                let _ = allocator.free(alloc);
-            }
-        }
-        self.ubufs.clear();
         self.ubo_ptrs.clear();
         self.ubo_size = 0;
 
@@ -1187,12 +1270,23 @@ impl VkRenderer {
 
         // 4e) Recreate depth resources for the NEW extent (using same depth format)
         if self.depth_view != vk::ImageView::null() {
-            unsafe { self.device.destroy_image_view(self.depth_view, None) };
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::ImageView(self.depth_view),
+            });
         }
         if self.depth_image != vk::Image::null() {
-            unsafe { self.device.destroy_image(self.depth_image, None) };
-        }
-        {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Image {
+                    image: self.depth_image,
+                    alloc: std::mem::take(&mut self.depth_alloc),
+                },
+            });
+        } else {
+            // No image to pair the allocation with (shouldn't happen in
+            // practice; image/alloc/view are always set together), but
+            // don't leak the allocation if it ever does.
             let old_alloc = std::mem::take(&mut self.depth_alloc);
             let _ = self
                 .allocator
@@ -1248,11 +1342,14 @@ impl VkRenderer {
                 self.desc_set_layout_camera,
                 self.desc_set_layout_material,
             )?;
-            unsafe { self.device.destroy_pipeline(self.pipeline, None) };
-            unsafe {
-                self.device
-                    .destroy_pipeline_layout(self.pipeline_layout, None)
-            };
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Pipeline(self.pipeline),
+            });
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::PipelineLayout(self.pipeline_layout),
+            });
             self.pipeline_layout = new_layout;
             self.pipeline = new_pipeline;
         }
@@ -1372,14 +1469,15 @@ impl Renderer for VkRenderer {
         self.hot_reload_shaders_if_changed()?;
 
         // 1) Acquire
-        let s = &self.acq_slots[self.acq_index];
-        if s.last_signal_value > 0 {
+        let acq_sem = self.acq_slots[self.acq_index].sem;
+        let acq_last_signal_value = self.acq_slots[self.acq_index].last_signal_value;
+        if acq_last_signal_value > 0 {
             let wait_info = vk::SemaphoreWaitInfo {
                 s_type: vk::StructureType::SEMAPHORE_WAIT_INFO,
                 flags: vk::SemaphoreWaitFlags::empty(),
                 semaphore_count: 1,
                 p_semaphores: &self.timeline,
-                p_values: &s.last_signal_value,
+                p_values: &acq_last_signal_value,
                 ..Default::default()
             };
             unsafe {
@@ -1387,11 +1485,13 @@ impl Renderer for VkRenderer {
             }
         }
 
+        self.drain_trash();
+
         let (image_index, _) = match unsafe {
             self.swapchain_loader.acquire_next_image(
                 self.swapchain,
                 u64::MAX,
-                s.sem,
+                acq_sem,
                 vk::Fence::null(),
             )
         } {
@@ -1450,7 +1550,7 @@ impl Renderer for VkRenderer {
         let stage2_color = stage_flags2_from_legacy(stage_color);
 
         // Build the semaphore infos
-        let wait_acquire = semaphore_submit_info_wait(s.sem, 0, stage2_color);
+        let wait_acquire = semaphore_submit_info_wait(acq_sem, 0, stage2_color);
         let signal_present = semaphore_submit_info_signal(f_img.render_finished, 0, stage2_color);
         let signal_timeline = semaphore_submit_info_signal(self.timeline, next_value, stage2_color);
 
