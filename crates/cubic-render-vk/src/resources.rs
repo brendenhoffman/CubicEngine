@@ -47,11 +47,11 @@ pub(crate) struct DrawCandidate {
 /// calls bump-allocate from. There's no mesh-freeing API yet (matching
 /// `VkRenderer::meshes`, which also only ever grows), so this is sized
 /// generously for early-stage testing rather than computed dynamically.
-pub(crate) const MAX_SHARED_VERTICES: u64 = 65_536;
-pub(crate) const MAX_SHARED_INDICES: u64 = 196_608;
+pub(crate) const MAX_SHARED_VERTICES: u64 = 4194304;
+pub(crate) const MAX_SHARED_INDICES: u64 = 12582912;
 
 /// Max draws the indirect-cull compute shader can emit in one dispatch.
-pub(crate) const MAX_INDIRECT_DRAWS: u32 = 1024;
+pub(crate) const MAX_INDIRECT_DRAWS: u32 = 32768;
 
 struct ImageAllocInfo {
     extent: vk::Extent2D,

@@ -8,8 +8,8 @@ use cubic_render::Vertex;
 use cubic_world::{mesh_chunk, BlockRegistry, Chunk, ChunkLocalPos, CHUNK_SIZE, VOXEL_SIZE};
 
 /// Width and depth of the test grid in chunks.
-pub const GRID_W: usize = 8;
-pub const GRID_D: usize = 8;
+pub const GRID_W: usize = 64;
+pub const GRID_D: usize = 64;
 
 /// A flat 8×8 grid of chunks with stone filling the bottom half of each.
 pub struct FlatWorld {

@@ -6,9 +6,9 @@ use anyhow::Result;
 use clap::Parser;
 use cubic_core::init_tracing;
 use cubic_math::{Camera, Vec3};
-use cubic_render::{RenderSize, Renderer};
+use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
 use cubic_render_gl::GlRenderer;
-use cubic_render_vk::{MeshHandle, PushData, VkRenderer};
+use cubic_render_vk::{HdrFlavor, VkRenderer, VkVsyncMode};
 use tracing::{error, info};
 
 use cubic_platform::winit::{
@@ -24,12 +24,131 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
 
+// ---------------------------------------------------------------------------
+// Backend abstraction
+// ---------------------------------------------------------------------------
+
+trait RendererBackend {
+    fn resize(&mut self, size: RenderSize) -> Result<()>;
+    fn set_clear_color(&mut self, rgba: [f32; 4]);
+    fn set_vsync(&mut self, on: bool);
+    fn configure_advanced(&mut self, cfg: &RenderCfg);
+    fn upload_mesh(&mut self, verts: &[Vertex], idxs: &[u32]) -> Result<MeshHandle>;
+    fn set_camera(&mut self, camera: Camera);
+    fn draw_mesh(&mut self, handle: MeshHandle, push: PushData);
+    fn render(&mut self) -> Result<()>;
+}
+
+enum Backend {
+    Gl(Box<GlRenderer>),
+    Vk(Box<VkRenderer>),
+}
+
+impl RendererBackend for Backend {
+    fn resize(&mut self, size: RenderSize) -> Result<()> {
+        match self {
+            Backend::Gl(r) => r.resize(size),
+            Backend::Vk(r) => r.resize(size),
+        }
+    }
+
+    fn set_clear_color(&mut self, rgba: [f32; 4]) {
+        match self {
+            Backend::Gl(r) => r.set_clear_color(rgba),
+            Backend::Vk(r) => r.set_clear_color(rgba),
+        }
+    }
+
+    fn set_vsync(&mut self, on: bool) {
+        match self {
+            Backend::Gl(r) => r.set_vsync(on),
+            Backend::Vk(r) => r.set_vsync(on),
+        }
+    }
+
+    fn configure_advanced(&mut self, cfg: &RenderCfg) {
+        // GL has no advanced knobs yet.
+        if let Backend::Vk(r) = self {
+            let mode = match cfg.vsync_mode {
+                VsyncMode::Fifo => VkVsyncMode::Fifo,
+                VsyncMode::Mailbox => VkVsyncMode::Mailbox,
+            };
+            r.set_vsync_mode(mode);
+            r.set_hdr_enabled(cfg.hdr);
+            let flavor = match cfg.hdr_flavor {
+                HdrFlavorCfg::PreferScrgb => HdrFlavor::PreferScrgb,
+                HdrFlavorCfg::PreferHdr10 => HdrFlavor::PreferHdr10,
+            };
+            r.set_hdr_flavor(flavor);
+        }
+    }
+
+    fn upload_mesh(&mut self, verts: &[Vertex], idxs: &[u32]) -> Result<MeshHandle> {
+        match self {
+            // GL mesh API not yet implemented; uploaded meshes are silently
+            // dropped until the GL backend card is complete.
+            Backend::Gl(_) => Ok(MeshHandle(u32::MAX)),
+            Backend::Vk(r) => r.upload_mesh(verts, idxs),
+        }
+    }
+
+    fn set_camera(&mut self, camera: Camera) {
+        match self {
+            Backend::Gl(_) => {} // GL camera via uniforms — not yet implemented.
+            Backend::Vk(r) => r.set_camera(camera),
+        }
+    }
+
+    fn draw_mesh(&mut self, handle: MeshHandle, push: PushData) {
+        match self {
+            Backend::Gl(_) => {} // GL draw_mesh — not yet implemented.
+            Backend::Vk(r) => r.draw_mesh(handle, push),
+        }
+    }
+
+    fn render(&mut self) -> Result<()> {
+        match self {
+            Backend::Gl(r) => r.render(),
+            Backend::Vk(r) => r.render(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Choose renderer backend: gl | vk
     #[arg(long, default_value = "vk")]
     backend: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum VsyncMode {
+    Fifo,
+    #[default]
+    Mailbox,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum UnfocusedPolicy {
+    None,
+    #[default]
+    VsyncOn,
+    Throttle,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum HdrFlavorCfg {
+    #[default]
+    PreferScrgb,
+    PreferHdr10,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -52,37 +171,6 @@ struct RenderCfg {
     hdr_flavor: HdrFlavorCfg,
 }
 
-#[derive(Debug, Clone, Copy, serde::Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum VsyncMode {
-    Fifo,
-    #[default]
-    Mailbox,
-}
-
-#[derive(Debug, Clone, Copy, serde::Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum UnfocusedPolicy {
-    None,
-    #[default]
-    VsyncOn,
-    Throttle,
-}
-
-#[derive(Debug, Clone, Copy, serde::Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum HdrFlavorCfg {
-    #[default]
-    PreferScrgb,
-    PreferHdr10,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct AppCfg {
-    #[serde(default)]
-    render: RenderCfg,
-}
-
 impl Default for RenderCfg {
     fn default() -> Self {
         RenderCfg {
@@ -98,6 +186,12 @@ impl Default for RenderCfg {
     }
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct AppCfg {
+    #[serde(default)]
+    render: RenderCfg,
+}
+
 fn default_clear() -> [f32; 4] {
     [0.02, 0.02, 0.04, 1.0]
 }
@@ -111,12 +205,14 @@ fn load_cfg() -> AppCfg {
     }
 }
 
-const MOVE_SPEED: f32 = 3.0; // units/sec
-const MOUSE_SENSITIVITY: f32 = 0.0025; // radians/pixel
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+const MOVE_SPEED: f32 = 3.0;
+const MOUSE_SENSITIVITY: f32 = 0.0025;
 const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
 
-/// Held keys and accumulated mouse motion since the last time they were
-/// read, driven from WindowEvent::KeyboardInput and DeviceEvent::MouseMotion.
 #[derive(Default)]
 struct InputState {
     held_keys: HashSet<KeyCode>,
@@ -147,10 +243,9 @@ impl InputState {
     }
 }
 
-enum Backend {
-    Gl(Box<GlRenderer>),
-    Vk(Box<VkRenderer>),
-}
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
 
 struct App {
     backend_choice: String,
@@ -175,90 +270,77 @@ struct App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none() {
-            let window = event_loop
-                .create_window(Window::default_attributes().with_title("cubic"))
-                .expect("create_window");
+        if self.window.is_some() {
+            return;
+        }
 
-            let size = window.inner_size();
+        let window = event_loop
+            .create_window(Window::default_attributes().with_title("cubic"))
+            .expect("create_window");
 
-            self.render_size = RenderSize {
-                width: size.width.max(1),
-                height: size.height.max(1),
-            };
+        let size = window.inner_size();
+        self.render_size = RenderSize {
+            width: size.width.max(1),
+            height: size.height.max(1),
+        };
 
-            let wh = window.window_handle().expect("window_handle");
-            let dh = window.display_handle().expect("display_handle");
+        let wh = window.window_handle().expect("window_handle");
+        let dh = window.display_handle().expect("display_handle");
 
-            // Backend choice
-            let mut backend = match self.backend_choice.as_str() {
-                "gl" => Backend::Gl(Box::new(
-                    GlRenderer::new(&wh, &dh, self.render_size).expect("GL init"),
-                )),
-                _ => match VkRenderer::new(&wh, &dh, self.render_size) {
-                    Ok(vk) => Backend::Vk(Box::new(vk)),
-                    Err(e) => {
-                        error!("vk init failed: {e}; falling back to gl");
-                        Backend::Gl(Box::new(
-                            GlRenderer::new(&wh, &dh, self.render_size).expect("GL init"),
-                        ))
-                    }
-                },
-            };
-
-            // Apply clear color from config
-            match &mut backend {
-                Backend::Gl(r) => {
-                    r.as_mut().set_clear_color(self.cfg.render.clear_color);
-                    r.as_mut().set_vsync(self.cfg.render.vsync);
+        // --- 1. Construct backend ---
+        let mut backend: Backend = match self.backend_choice.as_str() {
+            "gl" => Backend::Gl(Box::new(
+                GlRenderer::new(&wh, &dh, self.render_size).expect("GL init"),
+            )),
+            _ => match VkRenderer::new(&wh, &dh, self.render_size) {
+                Ok(vk) => Backend::Vk(Box::new(vk)),
+                Err(e) => {
+                    error!("vk init failed: {e}; falling back to gl");
+                    Backend::Gl(Box::new(
+                        GlRenderer::new(&wh, &dh, self.render_size).expect("GL init"),
+                    ))
                 }
-                Backend::Vk(r) => {
-                    r.as_mut().set_clear_color(self.cfg.render.clear_color);
-                    r.as_mut().set_vsync(self.cfg.render.vsync);
-                    let mode = match self.cfg.render.vsync_mode {
-                        VsyncMode::Fifo => cubic_render_vk::VkVsyncMode::Fifo,
-                        VsyncMode::Mailbox => cubic_render_vk::VkVsyncMode::Mailbox,
-                    };
-                    r.as_mut().set_vsync_mode(mode);
-                    r.as_mut().set_hdr_enabled(self.cfg.render.hdr);
-                    let flavor = match self.cfg.render.hdr_flavor {
-                        HdrFlavorCfg::PreferScrgb => cubic_render_vk::HdrFlavor::PreferScrgb,
-                        HdrFlavorCfg::PreferHdr10 => cubic_render_vk::HdrFlavor::PreferHdr10,
-                    };
-                    r.as_mut().set_hdr_flavor(flavor);
+            },
+        };
 
-                    let world = test_world::FlatWorld::new();
-                    for (cx, cz) in world.positions() {
-                        if let Some((verts, idxs)) = world.mesh(cx, cz) {
-                            match r.as_mut().upload_mesh(&verts, &idxs) {
-                                Ok(handle) => {
-                                    let push = PushData {
-                                        model: test_world::chunk_model(cx, cz),
-                                        tint: [1.0, 1.0, 1.0, 1.0],
-                                        tex_index: 0,
-                                        _pad: [0; 3],
-                                    };
-                                    self.world_meshes.push((handle, push));
-                                }
-                                Err(e) => error!("chunk ({cx},{cz}) upload failed: {e}"),
-                            }
+        // --- 2. Configure backend (agnostic then advanced) ---
+        backend.set_clear_color(self.cfg.render.clear_color);
+        backend.set_vsync(self.cfg.render.vsync);
+        backend.configure_advanced(&self.cfg.render);
+
+        // --- 3. Load world — decoupled from backend selection ---
+        let world = test_world::FlatWorld::new();
+        for (cx, cz) in world.positions() {
+            if let Some((verts, idxs)) = world.mesh(cx, cz) {
+                match backend.upload_mesh(&verts, &idxs) {
+                    Ok(handle) => {
+                        // Skip the sentinel returned by the GL stub.
+                        if handle.0 != u32::MAX {
+                            let push = PushData {
+                                model: test_world::chunk_model(cx, cz),
+                                tint: [1.0, 1.0, 1.0, 1.0],
+                                tex_index: 0,
+                                _pad: [0; 3],
+                            };
+                            self.world_meshes.push((handle, push));
                         }
                     }
+                    Err(e) => error!("chunk ({cx},{cz}) upload failed: {e}"),
                 }
             }
-
-            info!(
-                "backend = {}",
-                match &backend {
-                    Backend::Gl(_) => "gl",
-                    Backend::Vk(_) => "vk",
-                }
-            );
-            info!("vsync cfg = {}", self.cfg.render.vsync);
-
-            self.window = Some(window);
-            self.backend = Some(backend);
         }
+
+        info!(
+            "backend = {}",
+            match &backend {
+                Backend::Gl(_) => "gl",
+                Backend::Vk(_) => "vk",
+            }
+        );
+        info!("vsync cfg = {}", self.cfg.render.vsync);
+
+        self.window = Some(window);
+        self.backend = Some(backend);
 
         event_loop.set_control_flow(if self.cfg.render.vsync {
             ControlFlow::Wait
@@ -319,10 +401,7 @@ impl ApplicationHandler for App {
 
                 if !self.paused {
                     if let Some(backend) = &mut self.backend {
-                        let _ = match backend {
-                            Backend::Gl(r) => r.as_mut().resize(self.render_size),
-                            Backend::Vk(r) => r.as_mut().resize(self.render_size),
-                        };
+                        let _ = backend.resize(self.render_size);
                     }
                     if let Some(w) = &self.window {
                         w.request_redraw();
@@ -349,28 +428,17 @@ impl ApplicationHandler for App {
                     if let Some(backend) = &mut self.backend {
                         match (focused, self.cfg.render.unfocused) {
                             (false, UnfocusedPolicy::VsyncOn) => {
-                                if let Backend::Vk(r) = backend {
-                                    r.as_mut().set_vsync(true);
-                                    r.as_mut()
-                                        .set_vsync_mode(cubic_render_vk::VkVsyncMode::Fifo);
-                                }
-                                if let Backend::Gl(r) = backend {
-                                    r.as_mut().set_vsync(true);
-                                }
+                                backend.set_vsync(true);
+                                // Force Fifo (lowest-power vsync) while unfocused.
+                                backend.configure_advanced(&RenderCfg {
+                                    vsync_mode: VsyncMode::Fifo,
+                                    ..self.cfg.render
+                                });
                             }
-                            (true, UnfocusedPolicy::VsyncOn) => match backend {
-                                Backend::Vk(r) => {
-                                    r.as_mut().set_vsync(self.cfg.render.vsync);
-                                    let mode = match self.cfg.render.vsync_mode {
-                                        VsyncMode::Fifo => cubic_render_vk::VkVsyncMode::Fifo,
-                                        VsyncMode::Mailbox => cubic_render_vk::VkVsyncMode::Mailbox,
-                                    };
-                                    r.as_mut().set_vsync_mode(mode);
-                                }
-                                Backend::Gl(r) => {
-                                    r.as_mut().set_vsync(self.cfg.render.vsync);
-                                }
-                            },
+                            (true, UnfocusedPolicy::VsyncOn) => {
+                                backend.set_vsync(self.cfg.render.vsync);
+                                backend.configure_advanced(&self.cfg.render);
+                            }
                             _ => {}
                         }
                     }
@@ -390,9 +458,8 @@ impl ApplicationHandler for App {
                     if focused {
                         self.next_frame_deadline = None;
                     } else {
-                        // Can't reliably observe key-up events that happen
-                        // while the window isn't focused, so don't leave
-                        // movement keys stuck held across an alt-tab.
+                        // Can't reliably observe key-up events while unfocused;
+                        // clear held keys so movement doesn't get stuck on alt-tab.
                         self.input.held_keys.clear();
                     }
                 }
@@ -416,28 +483,13 @@ impl ApplicationHandler for App {
                 self.apply_input(dt);
 
                 if let Some(backend) = &mut self.backend {
-                    if let Backend::Vk(r) = &mut *backend {
-                        r.set_camera(self.camera);
+                    backend.set_camera(self.camera);
+                    for &(handle, push) in &self.world_meshes {
+                        backend.draw_mesh(handle, push);
                     }
-                    if let Backend::Vk(r) = &mut *backend {
-                        for &(handle, push) in &self.world_meshes {
-                            r.draw_mesh(handle, push);
-                        }
-                    }
-
-                    let res = match backend {
-                        Backend::Gl(r) => r.render(),
-                        Backend::Vk(r) => r.render(),
-                    };
-
-                    match res {
-                        Ok(()) => {
-                            // count only frames that were actually rendered
-                            self.frames = self.frames.saturating_add(1);
-                        }
-                        Err(e) => {
-                            error!("render error: {e}");
-                        }
+                    match backend.render() {
+                        Ok(()) => self.frames = self.frames.saturating_add(1),
+                        Err(e) => error!("render error: {e}"),
                     }
                 }
             }
@@ -453,8 +505,6 @@ impl ApplicationHandler for App {
         event: DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
-            // Raw input is global, not window-scoped; only track it while
-            // we actually own the cursor.
             if self.focused {
                 self.input
                     .accumulate_mouse_delta(delta.0 as f32, delta.1 as f32);
@@ -467,40 +517,31 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // 1) Decide target FPS for this frame (0 means "no cap here")
-        let mut target_fps: u32 = 0;
-
         if self.paused {
-            // window-size=0 or occluded → sleep
             event_loop.set_control_flow(ControlFlow::Wait);
             self.frames = 0;
             return;
         }
 
+        let mut target_fps: u32 = 0;
+
         if !self.focused {
             match self.cfg.render.unfocused {
-                UnfocusedPolicy::Throttle => {
-                    target_fps = self.cfg.render.unfocused_fps;
-                }
-                UnfocusedPolicy::VsyncOn => {
-                    target_fps = 0; /* rely on vsync */
-                }
-                UnfocusedPolicy::None => { /* fall through to focused policy */ }
+                UnfocusedPolicy::Throttle => target_fps = self.cfg.render.unfocused_fps,
+                UnfocusedPolicy::VsyncOn => {} // vsync handles pacing
+                UnfocusedPolicy::None => {}
             }
         }
 
         if target_fps == 0 {
             if self.cfg.render.vsync {
-                // Vsync: block until events, then redraw once
                 event_loop.set_control_flow(ControlFlow::Wait);
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
             } else {
-                // Optional cap when vsync off
                 target_fps = self.cfg.render.fps_when_vsync_off;
                 if target_fps == 0 {
-                    // Uncapped: poll and keep drawing
                     event_loop.set_control_flow(ControlFlow::Poll);
                     if let Some(w) = &self.window {
                         w.request_redraw();
@@ -509,20 +550,15 @@ impl ApplicationHandler for App {
             }
         }
 
-        // 2) Throttled path (focused or unfocused)
         if target_fps > 0 {
             let now = std::time::Instant::now();
             let frame_dt =
                 std::time::Duration::from_nanos(1_000_000_000u64 / target_fps.max(1) as u64);
-
-            // Only request a redraw when it's time (or when there's no deadline yet).
-            let need_redraw_now = match self.next_frame_deadline {
+            let need_redraw = match self.next_frame_deadline {
                 None => true,
                 Some(t) => now >= t,
             };
-
-            if need_redraw_now {
-                // Schedule the next deadline first, then ask for one redraw.
+            if need_redraw {
                 let next = now + frame_dt;
                 self.next_frame_deadline = Some(next);
                 event_loop.set_control_flow(ControlFlow::WaitUntil(next));
@@ -530,13 +566,12 @@ impl ApplicationHandler for App {
                     w.request_redraw();
                 }
             } else {
-                // Not time yet: just sleep until the stored deadline. Do NOT request redraw.
                 event_loop
                     .set_control_flow(ControlFlow::WaitUntil(self.next_frame_deadline.unwrap()));
             }
         }
 
-        // 3) FPS counter (unchanged)
+        // FPS counter
         let now = std::time::Instant::now();
         if now.duration_since(self.last_fps_instant).as_secs_f32() >= 1.0 {
             info!("fps ~ {}", self.frames);
@@ -547,7 +582,6 @@ impl ApplicationHandler for App {
 }
 
 impl App {
-    /// Apply accumulated mouse look and held-key movement to the camera.
     fn apply_input(&mut self, dt: f32) {
         let (dx, dy) = self.input.take_mouse_delta();
         self.camera.yaw -= dx * MOUSE_SENSITIVITY;
@@ -556,8 +590,8 @@ impl App {
 
         let forward = self.camera.forward();
         let right = forward.cross(Vec3::Y).normalize_or_zero();
-
         let mut movement = Vec3::ZERO;
+
         if self.input.is_held(KeyCode::KeyW) {
             movement += forward;
         }
@@ -602,10 +636,6 @@ fn main() -> Result<()> {
         focused: true,
         next_frame_deadline: None,
         world_meshes: Vec::new(),
-        // Start above the terrain surface and look toward it.
-        // Surface is at y = test_world::SURFACE_Y ≈ 8 m; grid spans
-        // z = 0..128 m. Camera at z=160 with yaw=0 (looking toward −Z)
-        // and a slight downward pitch puts the whole grid in view.
         camera: Camera {
             position: Vec3::new(32.0, test_world::SURFACE_Y + 12.0, 160.0),
             pitch: -0.3,
