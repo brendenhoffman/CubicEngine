@@ -6,6 +6,7 @@ members = [
   "crates/cubic-render",
   "crates/cubic-render-gl",
   "crates/cubic-render-vk",
+  "crates/cubic-world",
   "crates/cubic-app",
 ]
 resolver = "2"
