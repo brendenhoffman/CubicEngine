@@ -6,6 +6,12 @@ use bytemuck::{Pod, Zeroable};
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 use gpu_allocator::MemoryLocation;
 
+// Vertex and PushData now live in cubic-render (the shared trait crate) so
+// that cubic-world's mesher can produce them without depending on Vulkan.
+// Re-export them here so existing internal paths (super::resources::Vertex
+// etc.) continue to work inside this crate.
+pub use cubic_render::Vertex;
+
 // Convention: this holds the combined view*proj matrix only; the model
 // transform is supplied separately via PushData and applied in the vertex
 // shader, so this is not a true "MVP" matrix.
@@ -13,25 +19,6 @@ use gpu_allocator::MemoryLocation;
 #[derive(Clone, Copy, Default, Zeroable, Pod)]
 pub(crate) struct CameraUbo {
     pub(crate) view_proj: [[f32; 4]; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Zeroable, Pod)]
-pub struct Vertex {
-    pub pos: [f32; 3],
-    pub color: [f32; 3],
-    pub uv: [f32; 2],
-    pub normal: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Zeroable, Pod)]
-pub struct PushData {
-    pub model: [[f32; 4]; 4],
-    pub tint: [f32; 4],
-    /// Index into the bindless texture array (see `MAX_TEXTURES`).
-    pub tex_index: u32,
-    pub _pad: [u32; 3],
 }
 
 /// Upper bound on the bindless texture array's descriptor count. Most

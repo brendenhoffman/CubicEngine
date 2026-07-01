@@ -482,6 +482,7 @@ name = "cubic-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytemuck",
  "raw-window-handle",
 ]
 

@@ -37,7 +37,11 @@ use resources::{
     upload_via_staging, write_material_descriptors, CameraUbo, DrawCandidate, MAX_INDIRECT_DRAWS,
     MAX_SHARED_INDICES, MAX_SHARED_VERTICES,
 };
-pub use resources::{PushData, Vertex};
+// Vertex, PushData, and MeshHandle are now defined in cubic-render so that
+// cubic-world can use them without depending on Vulkan. Re-export them from
+// here so existing callers (cubic-app etc.) import from cubic-render-vk
+// without any changes.
+pub use cubic_render::{MeshHandle, PushData, Vertex};
 use swapchain::{
     create_hdr_metadata_if_needed, create_swapchain_bundle, SwapchainBundle, SwapchainConfig,
 };
@@ -46,12 +50,6 @@ use sync::{
     create_command_resources, create_sync_objects, create_timeline_semaphore, AcquireSlot,
     CommandResources, FrameSync,
 };
-
-// 1) Public api / constants
-
-/// Opaque handle to a mesh uploaded via [`VkRenderer::upload_mesh`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MeshHandle(u32);
 
 /// Offsets into the shared vertex/index buffers (see
 /// `MAX_SHARED_VERTICES`/`MAX_SHARED_INDICES`) rather than owning dedicated
