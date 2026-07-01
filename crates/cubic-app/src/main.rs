@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
-mod loader;
+mod test_world;
 
 use anyhow::Result;
 use clap::Parser;
@@ -111,18 +111,6 @@ fn load_cfg() -> AppCfg {
     }
 }
 
-const IDENTITY_PUSH: PushData = PushData {
-    model: [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-    ],
-    tint: [1.0, 1.0, 1.0, 1.0],
-    tex_index: 0,
-    _pad: [0; 3],
-};
-
 const MOVE_SPEED: f32 = 3.0; // units/sec
 const MOUSE_SENSITIVITY: f32 = 0.0025; // radians/pixel
 const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
@@ -179,7 +167,7 @@ struct App {
     focused: bool,
     next_frame_deadline: Option<std::time::Instant>,
 
-    vk_mesh: Option<MeshHandle>,
+    world_meshes: Vec<(MeshHandle, PushData)>,
     camera: Camera,
     input: InputState,
     last_frame_instant: std::time::Instant,
@@ -239,11 +227,22 @@ impl ApplicationHandler for App {
                     };
                     r.as_mut().set_hdr_flavor(flavor);
 
-                    match loader::load_obj_mesh(std::path::Path::new("assets/models/cube.obj"))
-                        .and_then(|(verts, idxs)| r.as_mut().upload_mesh(&verts, &idxs))
-                    {
-                        Ok(handle) => self.vk_mesh = Some(handle),
-                        Err(e) => error!("model load/upload failed: {e}"),
+                    let world = test_world::FlatWorld::new();
+                    for (cx, cz) in world.positions() {
+                        if let Some((verts, idxs)) = world.mesh(cx, cz) {
+                            match r.as_mut().upload_mesh(&verts, &idxs) {
+                                Ok(handle) => {
+                                    let push = PushData {
+                                        model: test_world::chunk_model(cx, cz),
+                                        tint: [1.0, 1.0, 1.0, 1.0],
+                                        tex_index: 0,
+                                        _pad: [0; 3],
+                                    };
+                                    self.world_meshes.push((handle, push));
+                                }
+                                Err(e) => error!("chunk ({cx},{cz}) upload failed: {e}"),
+                            }
+                        }
                     }
                 }
             }
@@ -420,8 +419,10 @@ impl ApplicationHandler for App {
                     if let Backend::Vk(r) = &mut *backend {
                         r.set_camera(self.camera);
                     }
-                    if let (Backend::Vk(r), Some(handle)) = (&mut *backend, self.vk_mesh) {
-                        r.draw_mesh(handle, IDENTITY_PUSH);
+                    if let Backend::Vk(r) = &mut *backend {
+                        for &(handle, push) in &self.world_meshes {
+                            r.draw_mesh(handle, push);
+                        }
                     }
 
                     let res = match backend {
@@ -600,8 +601,16 @@ fn main() -> Result<()> {
         paused: false,
         focused: true,
         next_frame_deadline: None,
-        vk_mesh: None,
-        camera: Camera::default(),
+        world_meshes: Vec::new(),
+        // Start above the terrain surface and look toward it.
+        // Surface is at y = test_world::SURFACE_Y ≈ 8 m; grid spans
+        // z = 0..128 m. Camera at z=160 with yaw=0 (looking toward −Z)
+        // and a slight downward pitch puts the whole grid in view.
+        camera: Camera {
+            position: Vec3::new(32.0, test_world::SURFACE_Y + 12.0, 160.0),
+            pitch: -0.3,
+            ..Camera::default()
+        },
         input: InputState::default(),
         last_frame_instant: std::time::Instant::now(),
     };

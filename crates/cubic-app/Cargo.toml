@@ -18,5 +18,6 @@ cubic-platform = { path = "../cubic-platform" }
 serde = { workspace = true }
 toml = { workspace = true }
 tobj = "4"
+cubic-world = { path = "../cubic-world" }
 
 # winit lives in cubic-platform for now, APIs in use here via that crate

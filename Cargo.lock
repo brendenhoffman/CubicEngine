@@ -444,6 +444,7 @@ dependencies = [
  "cubic-render",
  "cubic-render-gl",
  "cubic-render-vk",
+ "cubic-world",
  "serde",
  "tobj",
  "toml",
