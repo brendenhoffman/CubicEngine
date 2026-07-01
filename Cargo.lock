@@ -516,6 +516,9 @@ dependencies = [
 [[package]]
 name = "cubic-world"
 version = "0.1.0"
+dependencies = [
+ "cubic-render",
+]
 
 [[package]]
 name = "cursor-icon"

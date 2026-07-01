@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
+pub mod mesher;
+pub use mesher::mesh_chunk;
+
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
