@@ -53,7 +53,7 @@ pub struct AsyncWorldStream {
 }
 
 impl AsyncWorldStream {
-    pub fn new(radius: i32) -> Self {
+    pub fn new(radius_xz: i32, radius_y: i32) -> Self {
         let worker_count = thread::available_parallelism()
             .map_or(4, |n| n.get())
             .saturating_sub(1)
@@ -109,7 +109,7 @@ impl AsyncWorldStream {
             .collect();
 
         Self {
-            inner: WorldStream::new(radius),
+            inner: WorldStream::new(radius_xz, radius_y),
             in_flight: HashSet::new(),
             discard: HashSet::new(),
             work_tx,
@@ -131,7 +131,8 @@ impl AsyncWorldStream {
         generator: &Arc<dyn WorldGenerator>,
         seed: u64,
     ) -> StreamDelta {
-        let r = self.inner.radius;
+        let rxz = self.inner.radius_xz;
+        let ry = self.inner.radius_y;
         let mut to_unload = Vec::new();
         let mut loaded = Vec::new();
 
@@ -171,9 +172,9 @@ impl AsyncWorldStream {
         }
 
         // --- Compute desired set and find what needs loading ---
-        for x in (center.x - r)..=(center.x + r) {
-            for y in (center.y - r)..=(center.y + r) {
-                for z in (center.z - r)..=(center.z + r) {
+        for x in (center.x - rxz)..=(center.x + rxz) {
+            for y in (center.y - ry)..=(center.y + ry) {
+                for z in (center.z - rxz)..=(center.z + rxz) {
                     let pos = ChunkPos { x, y, z };
                     if !self.inner.chunks.contains_key(&pos)
                         && !self.in_flight.contains(&pos)
@@ -193,9 +194,9 @@ impl AsyncWorldStream {
 
         // --- Find what needs unloading ---
         for pos in self.inner.chunks.keys().copied() {
-            if (pos.x - center.x).abs() > r
-                || (pos.y - center.y).abs() > r
-                || (pos.z - center.z).abs() > r
+            if (pos.x - center.x).abs() > rxz
+                || (pos.y - center.y).abs() > ry
+                || (pos.z - center.z).abs() > rxz
             {
                 to_unload.push(pos);
             }
@@ -206,9 +207,9 @@ impl AsyncWorldStream {
             .iter()
             .copied()
             .filter(|pos| {
-                (pos.x - center.x).abs() > r
-                    || (pos.y - center.y).abs() > r
-                    || (pos.z - center.z).abs() > r
+                (pos.x - center.x).abs() > rxz
+                    || (pos.y - center.y).abs() > ry
+                    || (pos.z - center.z).abs() > rxz
             })
             .collect();
         for pos in to_discard {
@@ -233,9 +234,9 @@ impl AsyncWorldStream {
         // found via the loop above — drop the ones that fell out of range
         // directly so the set doesn't grow unbounded as the camera moves.
         self.known_air.retain(|pos| {
-            (pos.x - center.x).abs() <= r
-                && (pos.y - center.y).abs() <= r
-                && (pos.z - center.z).abs() <= r
+            (pos.x - center.x).abs() <= rxz
+                && (pos.y - center.y).abs() <= ry
+                && (pos.z - center.z).abs() <= rxz
         });
 
         StreamDelta {

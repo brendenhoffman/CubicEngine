@@ -237,6 +237,8 @@ struct WorldCfg {
     upload_budget_ms: f32,
     #[serde(default = "default_upload_budget_min_ms")]
     upload_budget_min_ms: f32,
+    #[serde(default = "default_stream_radius_y")]
+    stream_radius_y: i32,
 }
 
 impl Default for WorldCfg {
@@ -246,6 +248,7 @@ impl Default for WorldCfg {
             seed: 0,
             upload_budget_ms: 0.0,
             upload_budget_min_ms: default_upload_budget_min_ms(),
+            stream_radius_y: default_stream_radius_y(),
         }
     }
 }
@@ -277,6 +280,10 @@ impl Default for CameraCfg {
 
 fn default_upload_budget_min_ms() -> f32 {
     0.5
+}
+
+fn default_stream_radius_y() -> i32 {
+    2
 }
 
 // ---------------------------------------------------------------------------
@@ -792,7 +799,7 @@ fn main() -> Result<()> {
             width: 1,
             height: 1,
         },
-        stream: AsyncWorldStream::new(cfg.world.stream_radius),
+        stream: AsyncWorldStream::new(cfg.world.stream_radius, cfg.world.stream_radius_y),
         generator: Arc::new(FlatGenerator::new()) as Arc<dyn WorldGenerator>,
         chunk_meshes: HashMap::new(),
         seed,

@@ -26,14 +26,16 @@ pub struct StreamDelta {
 /// See `AsyncWorldStream` for the threaded version.
 pub struct WorldStream {
     pub chunks: HashMap<ChunkPos, Chunk>,
-    pub radius: i32,
+    pub radius_xz: i32,
+    pub radius_y: i32,
 }
 
 impl WorldStream {
-    pub fn new(radius: i32) -> Self {
+    pub fn new(radius_xz: i32, radius_y: i32) -> Self {
         Self {
             chunks: HashMap::new(),
-            radius,
+            radius_xz,
+            radius_y,
         }
     }
 
@@ -46,14 +48,13 @@ impl WorldStream {
         generator: &dyn WorldGenerator,
         seed: u64,
     ) -> StreamDelta {
-        let r = self.radius;
         let mut to_load = Vec::new();
         let mut to_unload = Vec::new();
 
         // Compute desired set and find what needs loading
-        for x in (center.x - r)..=(center.x + r) {
-            for y in (center.y - r)..=(center.y + r) {
-                for z in (center.z - r)..=(center.z + r) {
+        for x in (center.x - self.radius_xz)..=(center.x + self.radius_xz) {
+            for y in (center.y - self.radius_y)..=(center.y + self.radius_y) {
+                for z in (center.z - self.radius_xz)..=(center.z + self.radius_xz) {
                     let pos = ChunkPos { x, y, z };
                     if !self.chunks.contains_key(&pos) {
                         to_load.push(pos);
@@ -64,9 +65,9 @@ impl WorldStream {
 
         // Find what needs unloading
         for pos in self.chunks.keys().copied() {
-            if (pos.x - center.x).abs() > r
-                || (pos.y - center.y).abs() > r
-                || (pos.z - center.z).abs() > r
+            if (pos.x - center.x).abs() > self.radius_xz
+                || (pos.y - center.y).abs() > self.radius_y
+                || (pos.z - center.z).abs() > self.radius_xz
             {
                 to_unload.push(pos);
             }
