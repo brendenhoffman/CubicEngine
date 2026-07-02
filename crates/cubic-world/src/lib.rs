@@ -2,7 +2,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 pub mod mesher;
 pub use mesher::mesh_chunk;
+pub mod generator;
+pub use generator::WorldGenerator;
 
+use cubic_math::Vec3;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -182,6 +185,22 @@ impl Chunk {
                 self.palette.len() - 1
             });
         self.data[pos.to_index()] = palette_idx as u16;
+    }
+}
+
+/// Signed world-space chunk coordinate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ChunkPos {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+impl ChunkPos {
+    /// World-space position of this chunk's (0,0,0) corner in metres.
+    pub fn to_world_origin(self) -> Vec3 {
+        let s = CHUNK_SIZE as f32 * VOXEL_SIZE;
+        Vec3::new(self.x as f32 * s, self.y as f32 * s, self.z as f32 * s)
     }
 }
 

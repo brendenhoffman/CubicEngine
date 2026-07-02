@@ -518,6 +518,7 @@ dependencies = [
 name = "cubic-world"
 version = "0.1.0"
 dependencies = [
+ "cubic-math",
  "cubic-render",
 ]
 

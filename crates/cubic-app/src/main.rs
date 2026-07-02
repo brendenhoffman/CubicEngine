@@ -366,14 +366,13 @@ impl ApplicationHandler for App {
 
         // --- 3. Load world — decoupled from backend selection ---
         let world = test_world::FlatWorld::new();
-        for (cx, cz) in world.positions() {
-            if let Some((verts, idxs)) = world.mesh(cx, cz) {
+        for pos in world.positions() {
+            if let Some((verts, idxs)) = world.mesh(pos) {
                 match backend.upload_mesh(&verts, &idxs) {
                     Ok(handle) => {
-                        // Skip the sentinel returned by the GL stub.
                         if handle.0 != u32::MAX {
                             let push = PushData {
-                                model: test_world::chunk_model(cx, cz),
+                                model: test_world::chunk_model(pos),
                                 tint: [1.0, 1.0, 1.0, 1.0],
                                 tex_index: 0,
                                 _pad: [0; 3],
@@ -381,7 +380,7 @@ impl ApplicationHandler for App {
                             self.world_meshes.push((handle, push));
                         }
                     }
-                    Err(e) => error!("chunk ({cx},{cz}) upload failed: {e}"),
+                    Err(e) => error!("chunk {pos:?} upload failed: {e}"),
                 }
             }
         }
