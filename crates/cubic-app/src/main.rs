@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
+mod frustum;
 mod test_world;
 
 use anyhow::Result;
 use clap::Parser;
 use cubic_core::init_tracing;
 use cubic_math::{Camera, Vec3};
-use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
-use cubic_render_gl::GlRenderer;
-use cubic_render_vk::{HdrFlavor, VkRenderer, VkVsyncMode};
-use tracing::{error, info};
-
 use cubic_platform::winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, WindowEvent},
@@ -19,10 +15,14 @@ use cubic_platform::winit::{
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
     window::{CursorGrabMode, Window, WindowId},
 };
-
+use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
+use cubic_render_gl::GlRenderer;
+use cubic_render_vk::{HdrFlavor, VkRenderer, VkVsyncMode};
+use frustum::Frustum;
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::fs;
+use tracing::{error, info};
 
 // ---------------------------------------------------------------------------
 // Backend abstraction
@@ -118,6 +118,16 @@ impl RendererBackend for Backend {
 // Config
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Deserialize, Default)]
+struct AppCfg {
+    #[serde(default)]
+    render: RenderCfg,
+    #[serde(default)]
+    world: WorldCfg,
+    #[serde(default)]
+    camera: CameraCfg,
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -186,12 +196,6 @@ impl Default for RenderCfg {
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct AppCfg {
-    #[serde(default)]
-    render: RenderCfg,
-}
-
 fn default_clear() -> [f32; 4] {
     [0.02, 0.02, 0.04, 1.0]
 }
@@ -205,12 +209,56 @@ fn load_cfg() -> AppCfg {
     }
 }
 
+fn default_stream_radius() -> i32 {
+    8
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+struct WorldCfg {
+    #[serde(default = "default_stream_radius")]
+    stream_radius: i32,
+    #[serde(default)]
+    seed: u64,
+}
+
+impl Default for WorldCfg {
+    fn default() -> Self {
+        WorldCfg {
+            stream_radius: default_stream_radius(),
+            seed: 0,
+        }
+    }
+}
+
+fn default_move_speed() -> f32 {
+    3.0
+}
+
+fn default_mouse_sensitivity() -> f32 {
+    0.0025
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+struct CameraCfg {
+    #[serde(default = "default_move_speed")]
+    move_speed: f32,
+    #[serde(default = "default_mouse_sensitivity")]
+    mouse_sensitivity: f32,
+}
+
+impl Default for CameraCfg {
+    fn default() -> Self {
+        CameraCfg {
+            move_speed: default_move_speed(),
+            mouse_sensitivity: default_mouse_sensitivity(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
 
-const MOVE_SPEED: f32 = 3.0;
-const MOUSE_SENSITIVITY: f32 = 0.0025;
 const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
 
 #[derive(Default)]
@@ -484,8 +532,21 @@ impl ApplicationHandler for App {
 
                 if let Some(backend) = &mut self.backend {
                     backend.set_camera(self.camera);
+                    let aspect = self.render_size.width as f32 / self.render_size.height as f32;
+                    let view_proj =
+                        self.camera.projection_matrix(aspect) * self.camera.view_matrix();
+                    let frustum = Frustum::from_view_proj(&view_proj);
+
                     for &(handle, push) in &self.world_meshes {
-                        backend.draw_mesh(handle, push);
+                        let origin =
+                            Vec3::new(push.model[3][0], push.model[3][1], push.model[3][2]);
+                        let chunk_world_size =
+                            cubic_world::CHUNK_SIZE as f32 * cubic_world::VOXEL_SIZE;
+                        let min = origin;
+                        let max = origin + Vec3::splat(chunk_world_size);
+                        if frustum.contains_aabb(min, max) {
+                            backend.draw_mesh(handle, push);
+                        }
                     }
                     match backend.render() {
                         Ok(()) => self.frames = self.frames.saturating_add(1),
@@ -584,9 +645,9 @@ impl ApplicationHandler for App {
 impl App {
     fn apply_input(&mut self, dt: f32) {
         let (dx, dy) = self.input.take_mouse_delta();
-        self.camera.yaw -= dx * MOUSE_SENSITIVITY;
-        self.camera.pitch =
-            (self.camera.pitch - dy * MOUSE_SENSITIVITY).clamp(-MAX_PITCH, MAX_PITCH);
+        self.camera.yaw -= dx * self.cfg.camera.mouse_sensitivity;
+        self.camera.pitch = (self.camera.pitch - dy * self.cfg.camera.mouse_sensitivity)
+            .clamp(-MAX_PITCH, MAX_PITCH);
 
         let forward = self.camera.forward();
         let right = forward.cross(Vec3::Y).normalize_or_zero();
@@ -611,7 +672,7 @@ impl App {
             movement -= Vec3::Y;
         }
 
-        self.camera.position += movement.normalize_or_zero() * MOVE_SPEED * dt;
+        self.camera.position += movement.normalize_or_zero() * self.cfg.camera.move_speed * dt;
     }
 }
 
