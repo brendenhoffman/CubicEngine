@@ -34,8 +34,8 @@ use resources::{
     create_indirect_compute_desc_set_layout, create_indirect_draw_resources,
     create_indirect_graphics_desc_set_layout, create_material_desc_pool_and_set,
     create_material_desc_set_layout, depth_aspect_mask, depth_attachment_layout, pick_depth_format,
-    upload_via_staging, write_material_descriptors, CameraUbo, DrawCandidate, MAX_INDIRECT_DRAWS,
-    MAX_SHARED_INDICES, MAX_SHARED_VERTICES,
+    upload_via_staging, write_material_descriptors, CameraUbo, DrawCandidate, RangeAlloc,
+    MAX_INDIRECT_DRAWS, MAX_SHARED_INDICES, MAX_SHARED_VERTICES,
 };
 // Vertex, PushData, and MeshHandle are now defined in cubic-render so that
 // cubic-world can use them without depending on Vulkan. Re-export them from
@@ -60,6 +60,7 @@ struct GpuMesh {
     first_vertex: i32,
     first_index: u32,
     index_count: u32,
+    vertex_count: u32,
 }
 
 /// A GPU object retired while it might still be in use, destroyed once the
@@ -76,6 +77,12 @@ enum GpuResource {
     ImageView(vk::ImageView),
     Pipeline(vk::Pipeline),
     PipelineLayout(vk::PipelineLayout),
+    MeshSlot {
+        first_vertex: u32,
+        vertex_count: u32,
+        first_index: u32,
+        index_count: u32,
+    },
 }
 
 struct DeferredDrop {
@@ -134,8 +141,8 @@ pub struct VkRenderer {
     shared_vbuf_alloc: Allocation,
     shared_ibuf: vk::Buffer,
     shared_ibuf_alloc: Allocation,
-    vertex_cursor: u32,
-    index_cursor: u32,
+    vert_alloc: RangeAlloc,
+    idx_alloc: RangeAlloc,
     meshes: Vec<GpuMesh>,
     // Draws queued by draw_mesh() for the next render() call; consumed and
     // cleared each time a frame's command buffer is recorded.
@@ -751,8 +758,8 @@ fn build_renderer(
         shared_vbuf_alloc,
         shared_ibuf,
         shared_ibuf_alloc,
-        vertex_cursor: 0,
-        index_cursor: 0,
+        vert_alloc: RangeAlloc::new(MAX_SHARED_VERTICES as u32),
+        idx_alloc: RangeAlloc::new(MAX_SHARED_INDICES as u32),
         meshes: Vec::new(),
         pending_draws: Vec::new(),
         trash: Vec::new(),
@@ -892,6 +899,15 @@ impl VkRenderer {
                 GpuResource::PipelineLayout(l) => unsafe {
                     self.device.destroy_pipeline_layout(l, None);
                 },
+                GpuResource::MeshSlot {
+                    first_vertex,
+                    vertex_count,
+                    first_index,
+                    index_count,
+                } => {
+                    self.vert_alloc.free(first_vertex, vertex_count);
+                    self.idx_alloc.free(first_index, index_count);
+                }
             }
         }
     }
@@ -1332,25 +1348,20 @@ impl VkRenderer {
     /// one index buffer so the entire scene can be drawn with one
     /// cmd_draw_indexed_indirect_count call (GPU-driven indirect path).
     pub fn upload_mesh(&mut self, vertices: &[Vertex], indices: &[u32]) -> Result<MeshHandle> {
-        let new_vc = self.vertex_cursor + vertices.len() as u32;
-        let new_ic = self.index_cursor + indices.len() as u32;
-        if new_vc > MAX_SHARED_VERTICES as u32 {
-            return Err(anyhow!(
-                "upload_mesh: shared vertex buffer full ({} / {})",
-                new_vc,
-                MAX_SHARED_VERTICES
-            ));
-        }
-        if new_ic > MAX_SHARED_INDICES as u32 {
-            return Err(anyhow!(
-                "upload_mesh: shared index buffer full ({} / {})",
-                new_ic,
-                MAX_SHARED_INDICES
-            ));
-        }
+        let vc = vertices.len() as u32;
+        let ic = indices.len() as u32;
 
-        let vbyte_offset = self.vertex_cursor as u64 * std::mem::size_of::<Vertex>() as u64;
-        let ibyte_offset = self.index_cursor as u64 * std::mem::size_of::<u32>() as u64;
+        let vstart = self
+            .vert_alloc
+            .alloc(vc)
+            .ok_or_else(|| anyhow!("upload_mesh: shared vertex buffer full"))?;
+        let istart = self
+            .idx_alloc
+            .alloc(ic)
+            .ok_or_else(|| anyhow!("upload_mesh: shared index buffer full"))?;
+
+        let vbyte_offset = vstart as u64 * std::mem::size_of::<Vertex>() as u64;
+        let ibyte_offset = istart as u64 * std::mem::size_of::<u32>() as u64;
 
         upload_via_staging(
             &self.device,
@@ -1373,12 +1384,11 @@ impl VkRenderer {
 
         let handle = MeshHandle(self.meshes.len() as u32);
         self.meshes.push(GpuMesh {
-            first_vertex: self.vertex_cursor as i32,
-            first_index: self.index_cursor,
-            index_count: indices.len() as u32,
+            first_vertex: vstart as i32,
+            first_index: istart,
+            index_count: ic,
+            vertex_count: vc,
         });
-        self.vertex_cursor = new_vc;
-        self.index_cursor = new_ic;
         Ok(handle)
     }
 
@@ -1388,6 +1398,26 @@ impl VkRenderer {
     /// command buffer is recorded.
     pub fn draw_mesh(&mut self, handle: MeshHandle, push: PushData) {
         self.pending_draws.push((handle, push));
+    }
+
+    pub fn free_mesh(&mut self, handle: MeshHandle) {
+        let mesh = &self.meshes[handle.0 as usize];
+        self.trash.push(DeferredDrop {
+            value: self.timeline_value,
+            resource: GpuResource::MeshSlot {
+                first_vertex: mesh.first_vertex as u32,
+                vertex_count: mesh.vertex_count,
+                first_index: mesh.first_index,
+                index_count: mesh.index_count,
+            },
+        });
+        // Tombstone so draw_mesh on a freed handle panics in debug
+        self.meshes[handle.0 as usize] = GpuMesh {
+            first_vertex: -1,
+            first_index: 0,
+            index_count: 0,
+            vertex_count: 0,
+        };
     }
 
     // STRICT ORDER (recreate):

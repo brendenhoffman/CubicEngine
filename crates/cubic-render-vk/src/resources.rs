@@ -12,6 +12,70 @@ use gpu_allocator::MemoryLocation;
 // etc.) continue to work inside this crate.
 pub use cubic_render::Vertex;
 
+/// Fixed capacity of the shared mesh vertex/index buffers all `upload_mesh`
+/// calls bump-allocate from. There's no mesh-freeing API yet (matching
+/// `VkRenderer::meshes`, which also only ever grows), so this is sized
+/// generously for early-stage testing rather than computed dynamically.
+pub(crate) const MAX_SHARED_VERTICES: u64 = 4194304;
+pub(crate) const MAX_SHARED_INDICES: u64 = 12582912;
+
+/// Max draws the indirect-cull compute shader can emit in one dispatch.
+pub(crate) const MAX_INDIRECT_DRAWS: u32 = 32768;
+
+/// Upper bound on the bindless texture array's descriptor count. Most
+/// slots can stay unwritten (the layout binding is PARTIALLY_BOUND); this
+/// just caps how many distinct textures can ever be registered at once.
+pub(crate) const MAX_TEXTURES: u32 = 256;
+
+pub(crate) struct RangeAlloc {
+    capacity: u32,
+    free: Vec<(u32, u32)>, // (start, len), kept sorted by start
+}
+
+impl RangeAlloc {
+    pub fn new(capacity: u32) -> Self {
+        Self {
+            capacity,
+            free: vec![(0, capacity)],
+        }
+    }
+
+    pub fn alloc(&mut self, len: u32) -> Option<u32> {
+        let slot = self.free.iter().position(|&(_, fl)| fl >= len)?;
+        let (start, fl) = self.free[slot];
+        if fl == len {
+            self.free.remove(slot);
+        } else {
+            self.free[slot] = (start + len, fl - len);
+        }
+        Some(start)
+    }
+
+    pub fn free(&mut self, start: u32, len: u32) {
+        // Insert sorted, then merge with neighbors
+        let pos = self.free.partition_point(|&(s, _)| s < start);
+        self.free.insert(pos, (start, len));
+        // Merge with next
+        if pos + 1 < self.free.len() {
+            let (s, l) = self.free[pos];
+            let (ns, nl) = self.free[pos + 1];
+            if s + l == ns {
+                self.free[pos] = (s, l + nl);
+                self.free.remove(pos + 1);
+            }
+        }
+        // Merge with prev
+        if pos > 0 {
+            let (ps, pl) = self.free[pos - 1];
+            let (s, l) = self.free[pos];
+            if ps + pl == s {
+                self.free[pos - 1] = (ps, pl + l);
+                self.free.remove(pos);
+            }
+        }
+    }
+}
+
 // Convention: this holds the combined view*proj matrix only; the model
 // transform is supplied separately via PushData and applied in the vertex
 // shader, so this is not a true "MVP" matrix.
@@ -20,11 +84,6 @@ pub use cubic_render::Vertex;
 pub(crate) struct CameraUbo {
     pub(crate) view_proj: [[f32; 4]; 4],
 }
-
-/// Upper bound on the bindless texture array's descriptor count. Most
-/// slots can stay unwritten (the layout binding is PARTIALLY_BOUND); this
-/// just caps how many distinct textures can ever be registered at once.
-pub(crate) const MAX_TEXTURES: u32 = 256;
 
 /// Per-draw data for the GPU-driven indirect path: one entry per candidate
 /// in `VkRenderer::pending_draws`, written by the CPU each frame and read
@@ -42,16 +101,6 @@ pub(crate) struct DrawCandidate {
     pub(crate) index_count: u32,
     pub(crate) tex_index: u32,
 }
-
-/// Fixed capacity of the shared mesh vertex/index buffers all `upload_mesh`
-/// calls bump-allocate from. There's no mesh-freeing API yet (matching
-/// `VkRenderer::meshes`, which also only ever grows), so this is sized
-/// generously for early-stage testing rather than computed dynamically.
-pub(crate) const MAX_SHARED_VERTICES: u64 = 4194304;
-pub(crate) const MAX_SHARED_INDICES: u64 = 12582912;
-
-/// Max draws the indirect-cull compute shader can emit in one dispatch.
-pub(crate) const MAX_INDIRECT_DRAWS: u32 = 32768;
 
 struct ImageAllocInfo {
     extent: vk::Extent2D,

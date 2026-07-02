@@ -37,6 +37,7 @@ trait RendererBackend {
     fn set_camera(&mut self, camera: Camera);
     fn draw_mesh(&mut self, handle: MeshHandle, push: PushData);
     fn render(&mut self) -> Result<()>;
+    fn free_mesh(&mut self, handle: MeshHandle) {} // default no-op
 }
 
 enum Backend {
@@ -103,6 +104,13 @@ impl RendererBackend for Backend {
         match self {
             Backend::Gl(_) => {} // GL draw_mesh — not yet implemented.
             Backend::Vk(r) => r.draw_mesh(handle, push),
+        }
+    }
+
+    fn free_mesh(&mut self, handle: MeshHandle) {
+        match self {
+            Backend::Gl(_) => {}
+            Backend::Vk(r) => r.free_mesh(handle),
         }
     }
 
