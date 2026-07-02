@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
+mod flat_generator;
 mod frustum;
-mod test_world;
 
 use anyhow::Result;
 use clap::Parser;
@@ -18,10 +18,13 @@ use cubic_platform::winit::{
 use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
 use cubic_render_gl::GlRenderer;
 use cubic_render_vk::{HdrFlavor, VkRenderer, VkVsyncMode};
+use cubic_world::{mesh_chunk, world_pos_to_chunk, ChunkPos, WorldStream, CHUNK_SIZE, VOXEL_SIZE};
+use flat_generator::FlatGenerator;
 use frustum::Frustum;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::sync::Arc;
 use tracing::{error, info};
 
 // ---------------------------------------------------------------------------
@@ -318,7 +321,11 @@ struct App {
     focused: bool,
     next_frame_deadline: Option<std::time::Instant>,
 
-    world_meshes: Vec<(MeshHandle, PushData)>,
+    stream: WorldStream,
+    generator: Arc<FlatGenerator>,
+    chunk_meshes: HashMap<ChunkPos, MeshHandle>,
+    pending_uploads: VecDeque<ChunkPos>,
+    seed: u64,
     camera: Camera,
     input: InputState,
     last_frame_instant: std::time::Instant,
@@ -363,27 +370,6 @@ impl ApplicationHandler for App {
         backend.set_clear_color(self.cfg.render.clear_color);
         backend.set_vsync(self.cfg.render.vsync);
         backend.configure_advanced(&self.cfg.render);
-
-        // --- 3. Load world — decoupled from backend selection ---
-        let world = test_world::FlatWorld::new();
-        for pos in world.positions() {
-            if let Some((verts, idxs)) = world.mesh(pos) {
-                match backend.upload_mesh(&verts, &idxs) {
-                    Ok(handle) => {
-                        if handle.0 != u32::MAX {
-                            let push = PushData {
-                                model: test_world::chunk_model(pos),
-                                tint: [1.0, 1.0, 1.0, 1.0],
-                                tex_index: 0,
-                                _pad: [0; 3],
-                            };
-                            self.world_meshes.push((handle, push));
-                        }
-                    }
-                    Err(e) => error!("chunk {pos:?} upload failed: {e}"),
-                }
-            }
-        }
 
         info!(
             "backend = {}",
@@ -538,23 +524,75 @@ impl ApplicationHandler for App {
                 self.apply_input(dt);
 
                 if let Some(backend) = &mut self.backend {
+                    // --- Stream update ---
+                    let center = world_pos_to_chunk(self.camera.position);
+                    let generator = Arc::clone(&self.generator);
+                    let delta = self.stream.update(center, generator.as_ref(), self.seed);
+
+                    for pos in delta.unloaded {
+                        if let Some(handle) = self.chunk_meshes.remove(&pos) {
+                            backend.free_mesh(handle);
+                        }
+                        self.pending_uploads.retain(|p| *p != pos);
+                    }
+
+                    for pos in delta.loaded {
+                        // skip pure-air chunks — no geometry to upload
+                        self.pending_uploads.push_back(pos);
+                    }
+
+                    // Upload budget — max 4 per frame to avoid stutter
+                    for _ in 0..4 {
+                        let Some(pos) = self.pending_uploads.pop_front() else {
+                            break;
+                        };
+                        let neighbors = self.stream.neighbors(pos);
+                        let chunk = match self.stream.chunks.get(&pos) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        let (verts, idxs) = mesh_chunk(chunk, neighbors);
+                        if verts.is_empty() {
+                            continue;
+                        }
+                        match backend.upload_mesh(&verts, &idxs) {
+                            Ok(handle) => {
+                                self.chunk_meshes.insert(pos, handle);
+                            }
+                            Err(e) => error!("chunk {pos:?} upload failed: {e}"),
+                        }
+                    }
+
+                    // --- Draw ---
                     backend.set_camera(self.camera);
+
                     let aspect = self.render_size.width as f32 / self.render_size.height as f32;
                     let view_proj =
                         self.camera.projection_matrix(aspect) * self.camera.view_matrix();
                     let frustum = Frustum::from_view_proj(&view_proj);
+                    let chunk_world_size = CHUNK_SIZE as f32 * VOXEL_SIZE;
 
-                    for &(handle, push) in &self.world_meshes {
-                        let origin =
-                            Vec3::new(push.model[3][0], push.model[3][1], push.model[3][2]);
-                        let chunk_world_size =
-                            cubic_world::CHUNK_SIZE as f32 * cubic_world::VOXEL_SIZE;
+                    for (&pos, &handle) in &self.chunk_meshes {
+                        let origin = pos.to_world_origin();
                         let min = origin;
                         let max = origin + Vec3::splat(chunk_world_size);
                         if frustum.contains_aabb(min, max) {
+                            let o = origin;
+                            let push = PushData {
+                                model: [
+                                    [1.0, 0.0, 0.0, 0.0],
+                                    [0.0, 1.0, 0.0, 0.0],
+                                    [0.0, 0.0, 1.0, 0.0],
+                                    [o.x, o.y, o.z, 1.0],
+                                ],
+                                tint: [1.0, 1.0, 1.0, 1.0],
+                                tex_index: 0,
+                                _pad: [0; 3],
+                            };
                             backend.draw_mesh(handle, push);
                         }
                     }
+
                     match backend.render() {
                         Ok(()) => self.frames = self.frames.saturating_add(1),
                         Err(e) => error!("render error: {e}"),
@@ -687,6 +725,16 @@ fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
     let event_loop: EventLoop<()> = EventLoop::new()?;
+    let cfg = load_cfg();
+
+    let seed = if cfg.world.seed == 0 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos() as u64
+    } else {
+        cfg.world.seed
+    };
 
     let mut app = App {
         backend_choice: args.backend,
@@ -696,23 +744,26 @@ fn main() -> Result<()> {
             width: 1,
             height: 1,
         },
-        cfg: load_cfg(),
+        stream: WorldStream::new(cfg.world.stream_radius),
+        generator: Arc::new(FlatGenerator::new()),
+        chunk_meshes: HashMap::new(),
+        pending_uploads: VecDeque::new(),
+        seed,
+        cfg,
         exiting: false,
         frames: 0,
         last_fps_instant: std::time::Instant::now(),
         paused: false,
         focused: true,
         next_frame_deadline: None,
-        world_meshes: Vec::new(),
         camera: Camera {
-            position: Vec3::new(32.0, test_world::SURFACE_Y + 12.0, 160.0),
+            position: Vec3::new(0.0, (CHUNK_SIZE / 2) as f32 * VOXEL_SIZE + 12.0, 0.0),
             pitch: -0.3,
             ..Camera::default()
         },
         input: InputState::default(),
         last_frame_instant: std::time::Instant::now(),
     };
-
     event_loop.run_app(&mut app)?;
     Ok(())
 }

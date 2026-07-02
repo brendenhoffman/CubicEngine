@@ -4,6 +4,8 @@ pub mod mesher;
 pub use mesher::mesh_chunk;
 pub mod generator;
 pub use generator::WorldGenerator;
+pub mod stream;
+pub use stream::{world_pos_to_chunk, StreamDelta, WorldStream};
 
 use cubic_math::Vec3;
 use std::collections::HashMap;
