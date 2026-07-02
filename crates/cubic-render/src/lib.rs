@@ -59,5 +59,5 @@ pub trait Renderer {
     fn render(&mut self) -> Result<()>;
     fn set_clear_color(&mut self, rgba: [f32; 4]);
     fn set_vsync(&mut self, _on: bool) {}
-    fn free_mesh(&mut self, handle: MeshHandle) {} // default no-op
+    fn free_mesh(&mut self, _handle: MeshHandle) {} // default no-op
 }

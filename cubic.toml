@@ -15,5 +15,5 @@ stream_radius = 8  # chunks in each direction; higher = more terrain visible, mo
 seed = 0           # 0 = random seed chosen at startup
 
 [camera]
-move_speed = 3.0        # m/s; one chunk = 16 m, one voxel = 0.5 m
+move_speed = 10.0        # m/s; one chunk = 16 m, one voxel = 0.5 m
 mouse_sensitivity = 0.0025

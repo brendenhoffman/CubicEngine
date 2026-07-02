@@ -28,14 +28,12 @@ pub(crate) const MAX_INDIRECT_DRAWS: u32 = 32768;
 pub(crate) const MAX_TEXTURES: u32 = 256;
 
 pub(crate) struct RangeAlloc {
-    capacity: u32,
     free: Vec<(u32, u32)>, // (start, len), kept sorted by start
 }
 
 impl RangeAlloc {
     pub fn new(capacity: u32) -> Self {
         Self {
-            capacity,
             free: vec![(0, capacity)],
         }
     }

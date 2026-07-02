@@ -18,7 +18,10 @@ use cubic_platform::winit::{
 use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
 use cubic_render_gl::GlRenderer;
 use cubic_render_vk::{HdrFlavor, VkRenderer, VkVsyncMode};
-use cubic_world::{mesh_chunk, world_pos_to_chunk, ChunkPos, WorldStream, CHUNK_SIZE, VOXEL_SIZE};
+use cubic_world::{
+    mesh_chunk, world_pos_to_chunk, AsyncWorldStream, ChunkPos, WorldGenerator, CHUNK_SIZE,
+    VOXEL_SIZE,
+};
 use flat_generator::FlatGenerator;
 use frustum::Frustum;
 use serde::Deserialize;
@@ -40,7 +43,7 @@ trait RendererBackend {
     fn set_camera(&mut self, camera: Camera);
     fn draw_mesh(&mut self, handle: MeshHandle, push: PushData);
     fn render(&mut self) -> Result<()>;
-    fn free_mesh(&mut self, handle: MeshHandle) {} // default no-op
+    fn free_mesh(&mut self, _handle: MeshHandle) {} // default no-op
 }
 
 enum Backend {
@@ -321,8 +324,8 @@ struct App {
     focused: bool,
     next_frame_deadline: Option<std::time::Instant>,
 
-    stream: WorldStream,
-    generator: Arc<FlatGenerator>,
+    stream: AsyncWorldStream,
+    generator: Arc<dyn WorldGenerator>,
     chunk_meshes: HashMap<ChunkPos, MeshHandle>,
     pending_uploads: VecDeque<ChunkPos>,
     seed: u64,
@@ -526,8 +529,7 @@ impl ApplicationHandler for App {
                 if let Some(backend) = &mut self.backend {
                     // --- Stream update ---
                     let center = world_pos_to_chunk(self.camera.position);
-                    let generator = Arc::clone(&self.generator);
-                    let delta = self.stream.update(center, generator.as_ref(), self.seed);
+                    let delta = self.stream.update(center, &self.generator, self.seed);
 
                     for pos in delta.unloaded {
                         if let Some(handle) = self.chunk_meshes.remove(&pos) {
@@ -547,7 +549,7 @@ impl ApplicationHandler for App {
                             break;
                         };
                         let neighbors = self.stream.neighbors(pos);
-                        let chunk = match self.stream.chunks.get(&pos) {
+                        let chunk = match self.stream.chunks().get(&pos) {
                             Some(c) => c,
                             None => continue,
                         };
@@ -744,8 +746,8 @@ fn main() -> Result<()> {
             width: 1,
             height: 1,
         },
-        stream: WorldStream::new(cfg.world.stream_radius),
-        generator: Arc::new(FlatGenerator::new()),
+        stream: AsyncWorldStream::new(cfg.world.stream_radius),
+        generator: Arc::new(FlatGenerator::new()) as Arc<dyn WorldGenerator>,
         chunk_meshes: HashMap::new(),
         pending_uploads: VecDeque::new(),
         seed,
