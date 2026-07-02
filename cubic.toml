@@ -13,7 +13,9 @@ unfocused_fps = 30
 [world]
 stream_radius = 8  # chunks in each direction; higher = more terrain visible, more GPU memory
 seed = 0           # 0 = random seed chosen at startup
+upload_budget_ms = 0.0      # 0 = auto (25% of frame time target)
+upload_budget_min_ms = 0.5  # floor in ms, always upload at least this much
 
 [camera]
-move_speed = 10.0        # m/s; one chunk = 16 m, one voxel = 0.5 m
+move_speed = 100.0        # m/s; one chunk = 16 m, one voxel = 0.5 m
 mouse_sensitivity = 0.0025

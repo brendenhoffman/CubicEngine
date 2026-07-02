@@ -25,7 +25,7 @@ use cubic_world::{
 use flat_generator::FlatGenerator;
 use frustum::Frustum;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::Arc;
 use tracing::{error, info};
@@ -233,6 +233,10 @@ struct WorldCfg {
     stream_radius: i32,
     #[serde(default)]
     seed: u64,
+    #[serde(default)] // 0.0 = auto
+    upload_budget_ms: f32,
+    #[serde(default = "default_upload_budget_min_ms")]
+    upload_budget_min_ms: f32,
 }
 
 impl Default for WorldCfg {
@@ -240,6 +244,8 @@ impl Default for WorldCfg {
         WorldCfg {
             stream_radius: default_stream_radius(),
             seed: 0,
+            upload_budget_ms: 0.0,
+            upload_budget_min_ms: default_upload_budget_min_ms(),
         }
     }
 }
@@ -267,6 +273,10 @@ impl Default for CameraCfg {
             mouse_sensitivity: default_mouse_sensitivity(),
         }
     }
+}
+
+fn default_upload_budget_min_ms() -> f32 {
+    0.5
 }
 
 // ---------------------------------------------------------------------------
@@ -327,11 +337,12 @@ struct App {
     stream: AsyncWorldStream,
     generator: Arc<dyn WorldGenerator>,
     chunk_meshes: HashMap<ChunkPos, MeshHandle>,
-    pending_uploads: VecDeque<ChunkPos>,
     seed: u64,
     camera: Camera,
     input: InputState,
     last_frame_instant: std::time::Instant,
+    detected_refresh_hz: f32,
+    remesh_scratch: HashSet<ChunkPos>,
 }
 
 impl ApplicationHandler for App {
@@ -343,6 +354,12 @@ impl ApplicationHandler for App {
         let window = event_loop
             .create_window(Window::default_attributes().with_title("cubic"))
             .expect("create_window");
+
+        self.detected_refresh_hz = event_loop
+            .primary_monitor()
+            .and_then(|m| m.refresh_rate_millihertz())
+            .map(|mhz| mhz as f32 / 1000.0)
+            .unwrap_or(60.0);
 
         let size = window.inner_size();
         self.render_size = RenderSize {
@@ -535,28 +552,23 @@ impl ApplicationHandler for App {
                         if let Some(handle) = self.chunk_meshes.remove(&pos) {
                             backend.free_mesh(handle);
                         }
-                        self.pending_uploads.retain(|p| *p != pos);
                     }
 
-                    for pos in delta.loaded {
-                        // skip pure-air chunks — no geometry to upload
-                        self.pending_uploads.push_back(pos);
-                    }
+                    // Compute this frame's mesh budget
+                    let frame_budget_ms = (dt * 1000.0).min(33.3);
+                    let upload_ms = if self.cfg.world.upload_budget_ms == 0.0 {
+                        (frame_budget_ms * 0.25).max(self.cfg.world.upload_budget_min_ms)
+                    } else {
+                        self.cfg.world.upload_budget_ms
+                    };
+                    let budget_deadline =
+                        now + std::time::Duration::from_secs_f32(upload_ms / 1000.0);
 
-                    // Upload budget — max 4 per frame to avoid stutter
-                    for _ in 0..4 {
-                        let Some(pos) = self.pending_uploads.pop_front() else {
+                    // Upload new chunks
+                    while std::time::Instant::now() < budget_deadline {
+                        let Some((pos, verts, idxs)) = self.stream.ready_meshes.pop() else {
                             break;
                         };
-                        let neighbors = self.stream.neighbors(pos);
-                        let chunk = match self.stream.chunks().get(&pos) {
-                            Some(c) => c,
-                            None => continue,
-                        };
-                        let (verts, idxs) = mesh_chunk(chunk, neighbors);
-                        if verts.is_empty() {
-                            continue;
-                        }
                         match backend.upload_mesh(&verts, &idxs) {
                             Ok(handle) => {
                                 self.chunk_meshes.insert(pos, handle);
@@ -564,6 +576,40 @@ impl ApplicationHandler for App {
                             Err(e) => error!("chunk {pos:?} upload failed: {e}"),
                         }
                     }
+
+                    // Boundary remesh — shares the same deadline
+                    self.remesh_scratch.clear();
+                    self.remesh_scratch
+                        .extend(self.stream.remesh_queue.drain(..));
+                    let mut deferred = Vec::new();
+                    for &pos in &self.remesh_scratch {
+                        if std::time::Instant::now() >= budget_deadline {
+                            deferred.push(pos);
+                            continue;
+                        }
+                        let neighbors = self.stream.neighbors(pos);
+                        if neighbors.iter().all(Option::is_none) {
+                            continue;
+                        }
+                        let chunk = match self.stream.chunks().get(&pos) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        let (verts, idxs) = mesh_chunk(chunk, neighbors);
+                        if let Some(old) = self.chunk_meshes.remove(&pos) {
+                            backend.free_mesh(old);
+                        }
+                        if !verts.is_empty() {
+                            match backend.upload_mesh(&verts, &idxs) {
+                                Ok(handle) => {
+                                    self.chunk_meshes.insert(pos, handle);
+                                    self.stream.mark_remeshed(pos);
+                                }
+                                Err(e) => error!("remesh {pos:?} failed: {e}"),
+                            }
+                        }
+                    }
+                    self.stream.remesh_queue.extend(deferred);
 
                     // --- Draw ---
                     backend.set_camera(self.camera);
@@ -682,7 +728,7 @@ impl ApplicationHandler for App {
         // FPS counter
         let now = std::time::Instant::now();
         if now.duration_since(self.last_fps_instant).as_secs_f32() >= 1.0 {
-            info!("fps ~ {}", self.frames);
+            info!("fps ~ {} | loaded={}", self.frames, self.chunk_meshes.len());
             self.frames = 0;
             self.last_fps_instant = now;
         }
@@ -749,7 +795,6 @@ fn main() -> Result<()> {
         stream: AsyncWorldStream::new(cfg.world.stream_radius),
         generator: Arc::new(FlatGenerator::new()) as Arc<dyn WorldGenerator>,
         chunk_meshes: HashMap::new(),
-        pending_uploads: VecDeque::new(),
         seed,
         cfg,
         exiting: false,
@@ -765,6 +810,8 @@ fn main() -> Result<()> {
         },
         input: InputState::default(),
         last_frame_instant: std::time::Instant::now(),
+        detected_refresh_hz: 60.0, // overwritten in resumed()
+        remesh_scratch: HashSet::new(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
