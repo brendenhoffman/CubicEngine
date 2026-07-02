@@ -75,6 +75,8 @@ ignore = [
   #"a-crate-that-is-yanked@0.1.1", # you can also ignore yanked crate versions if you wish
   #{ crate = "a-crate-that-is-yanked@0.1.1", reason = "you can specify why you are ignoring the yanked crate" },
   { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained; pulled in transitively via winit -> sctk-adwaita (Wayland decoration text rendering) -> ab_glyph. winit 0.30.12 pins sctk-adwaita = \"^0.10.1\", which depends on the unmaintained ttf-parser; only winit 0.31.0-beta.2 moves past it. Revisit once winit 0.31 stabilizes." },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml unbounded namespace-declaration allocation (DoS on untrusted XML), pulled in transitively via winit -> smithay-client-toolkit/wayland-client -> wayland-scanner (build-time proc-macro codegen). Patched only at quick-xml >= 0.41.0, but the newest published wayland-scanner (0.31.10) still requires quick-xml ^0.39 -- no version resolves this yet. Not exploitable here regardless: wayland-scanner only parses the fixed, bundled Wayland protocol XML files at build time, never attacker-controlled input at runtime. Revisit once wayland-rs bumps past quick-xml 0.39." },
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic-time duplicate-attribute check (DoS on untrusted XML), same dependency chain and same quick-xml 0.37.5 pulled in via wayland-scanner as RUSTSEC-2026-0195 above -- see that entry for details. Also patched only at quick-xml >= 0.41.0, which wayland-scanner does not yet allow. Not exploitable here: only ever parses the fixed, bundled Wayland protocol XML at build time." },
 ]
 # If this is true, then cargo deny will use the git executable to fetch advisory database.
 # If this is false, then it uses a built-in git library.
