@@ -45,10 +45,10 @@ pub struct AsyncWorldStream {
     // Key: chunk position. Value: bitmask of which of the 6 neighbors were present
     // (bit 0 = -X, 1 = +X, 2 = -Y, 3 = +Y, 4 = -Z, 5 = +Z).
     remeshed_with: HashMap<ChunkPos, u8>,
-    // Positions a worker determined produce no geometry (pure air or fully
-    // buried). Never inserted into `inner.chunks`, so tracked separately to
-    // avoid re-dispatching them to workers every frame.
-    known_air: HashSet<ChunkPos>,
+    // Positions whose last mesh attempt produced no geometry — either pure air
+    // or fully buried solid. Not inserted into inner.chunks. Solid entries will
+    // need revisiting when block removal exists (dirty chunk system).
+    known_empty: HashSet<ChunkPos>,
     _workers: Vec<JoinHandle<()>>,
 }
 
@@ -117,7 +117,7 @@ impl AsyncWorldStream {
             ready_meshes: Vec::new(),
             remesh_queue: Vec::new(),
             remeshed_with: HashMap::new(),
-            known_air: HashSet::new(),
+            known_empty: HashSet::new(),
             _workers: workers,
         }
     }
@@ -145,7 +145,7 @@ impl AsyncWorldStream {
             let chunk = match result.chunk {
                 Some(chunk) => chunk,
                 None => {
-                    self.known_air.insert(result.pos);
+                    self.known_empty.insert(result.pos);
                     continue;
                 }
             };
@@ -163,6 +163,7 @@ impl AsyncWorldStream {
             }
             for neighbor_pos in six_neighbors(result.pos) {
                 if self.inner.chunks.contains_key(&neighbor_pos)
+                    && !self.known_empty.contains(&neighbor_pos)
                     && needs_remesh(&self.remeshed_with, &self.inner.chunks, neighbor_pos)
                 {
                     self.remesh_queue.push(neighbor_pos);
@@ -178,7 +179,7 @@ impl AsyncWorldStream {
                     let pos = ChunkPos { x, y, z };
                     if !self.inner.chunks.contains_key(&pos)
                         && !self.in_flight.contains(&pos)
-                        && !self.known_air.contains(&pos)
+                        && !self.known_empty.contains(&pos)
                         && !generator.is_definitely_air(pos)
                     {
                         self.in_flight.insert(pos);
@@ -231,10 +232,10 @@ impl AsyncWorldStream {
             }
         }
 
-        // known_air positions never enter `inner.chunks`, so they can't be
+        // known_empty positions never enter `inner.chunks`, so they can't be
         // found via the loop above — drop the ones that fell out of range
         // directly so the set doesn't grow unbounded as the camera moves.
-        self.known_air.retain(|pos| {
+        self.known_empty.retain(|pos| {
             (pos.x - center.x).abs() <= rxz
                 && (pos.y - center.y).abs() <= ry
                 && (pos.z - center.z).abs() <= rxz
