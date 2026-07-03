@@ -802,7 +802,11 @@ fn main() -> Result<()> {
             width: 1,
             height: 1,
         },
-        stream: AsyncWorldStream::new(cfg.world.stream_radius, cfg.world.stream_radius_y),
+        stream: AsyncWorldStream::new(
+            cfg.world.stream_radius,
+            cfg.world.stream_radius_y,
+            None, // replaced with Some(...) when WASM is wired in
+        ),
         generator: Arc::new(NoiseGenerator::new(
             8.0,  // sea_level
             16.0, // base_height

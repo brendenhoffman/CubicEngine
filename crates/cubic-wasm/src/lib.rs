@@ -1,0 +1,333 @@
+// SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
+
+use anyhow::{anyhow, Context, Result};
+use cubic_world::{Chunk, ChunkLocalPos, ChunkPos, WorldGenerator, CHUNK_SIZE, CHUNK_VOLUME};
+use std::sync::{Arc, Mutex};
+use wasmtime::{Engine, Linker, Memory, Module, Store, TypedFunc};
+
+// ---------------------------------------------------------------------------
+// WIT-mangled names
+// ---------------------------------------------------------------------------
+//
+// We call into the guest's core wasm module directly (no Component Model on
+// the host side), but the guest still uses wit-bindgen, which mangles names
+// for interfaces declared in the WIT world. Verified against an actual
+// compiled guest (`wasm-tools print` on a wit-bindgen-generated module for
+// this exact wit/game.wit): imports are named
+// "<namespace>:<package>/<interface>@<version>" (function name unmangled,
+// since core wasm imports already have a two-part module/name key), and
+// *exports* are named "<namespace>:<package>/<interface>@<version>#<function>"
+// (core wasm exports have only a flat name, so wit-bindgen folds the
+// interface path in). These must stay in sync with the `package
+// cubic:game@0.1.0` declaration in wit/game.wit.
+const IMPORT_BLOCK_REGISTRY_MODULE: &str = "cubic:game/block-registry@0.1.0";
+const EXPORT_ON_LOAD: &str = "cubic:game/world-gen@0.1.0#on-load";
+const EXPORT_GENERATE: &str = "cubic:game/world-gen@0.1.0#generate";
+const EXPORT_IS_DEFINITELY_AIR: &str = "cubic:game/world-gen@0.1.0#is-definitely-air";
+
+// ---------------------------------------------------------------------------
+// Memory layout
+// ---------------------------------------------------------------------------
+
+/// CHUNK_VOLUME * 4 bytes per chunk output buffer.
+const CHUNK_BUFFER_BYTES: usize = CHUNK_VOLUME * 4;
+
+/// How many bytes to reserve at the start of WASM memory for the guest's
+/// own stack and heap before our output buffers begin.
+const GUEST_RESERVED_BYTES: usize = 2 * 1024 * 1024; // 2MB
+
+pub struct WasmMemoryLayout {
+    worker_count: usize,
+    /// Byte offset in WASM linear memory where per-worker output buffers start.
+    buffer_base: usize,
+}
+
+impl WasmMemoryLayout {
+    pub fn new(worker_count: usize) -> Self {
+        Self {
+            worker_count,
+            buffer_base: GUEST_RESERVED_BYTES,
+        }
+    }
+
+    /// Total bytes needed for output buffers.
+    pub fn buffer_bytes(&self) -> usize {
+        self.worker_count * CHUNK_BUFFER_BYTES
+    }
+
+    /// Minimum total WASM memory in bytes.
+    pub fn min_memory_bytes(&self) -> usize {
+        GUEST_RESERVED_BYTES + self.buffer_bytes()
+    }
+
+    /// Byte offset in WASM linear memory for worker `id`'s output buffer.
+    pub fn worker_buffer_offset(&self, worker_id: usize) -> u32 {
+        (self.buffer_base + worker_id * CHUNK_BUFFER_BYTES) as u32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host state (passed into Store)
+// ---------------------------------------------------------------------------
+
+struct HostState {
+    block_registry: Arc<Mutex<cubic_world::BlockRegistry>>,
+}
+
+// ---------------------------------------------------------------------------
+// Per-worker WASM instance
+// ---------------------------------------------------------------------------
+
+struct WasmInstance {
+    store: Store<HostState>,
+    memory: Memory,
+    fn_generate: TypedFunc<(u32, i32, i32, i32, u64, u32), u32>,
+    fn_is_definitely_air: TypedFunc<(u32, i32, i32, i32), u32>,
+    generator_handle: u32,
+}
+
+impl WasmInstance {
+    fn new(
+        engine: &Engine,
+        module: &Module,
+        block_registry: Arc<Mutex<cubic_world::BlockRegistry>>,
+        memory_bytes: usize,
+    ) -> Result<Self> {
+        let mut store = Store::new(
+            engine,
+            HostState {
+                block_registry: Arc::clone(&block_registry),
+            },
+        );
+
+        let mut linker = Linker::new(engine);
+
+        // Host function: block_registry::register_block
+        linker.func_wrap(
+            IMPORT_BLOCK_REGISTRY_MODULE,
+            "register-block",
+            |mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+                let data = mem.data(&caller);
+                let name_bytes = &data[ptr as usize..(ptr + len) as usize];
+                let name = std::str::from_utf8(name_bytes).unwrap_or("unknown");
+                let mut reg = caller.data().block_registry.lock().unwrap();
+                let id = reg.register(name);
+                id.0 as i32
+            },
+        )?;
+
+        let instance = linker.instantiate(&mut store, module)?;
+
+        // Grow memory to required size if needed
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow!("guest has no 'memory' export"))?;
+        let current_bytes = memory.data_size(&store);
+        if current_bytes < memory_bytes {
+            let pages_needed = (memory_bytes - current_bytes).div_ceil(65536);
+            memory.grow(&mut store, pages_needed as u64)?;
+        }
+
+        // Get exported functions. Names are the wit-bindgen-mangled forms —
+        // see the EXPORT_* constants above.
+        let fn_on_load = instance
+            .get_typed_func::<(), u32>(&mut store, EXPORT_ON_LOAD)
+            .map_err(anyhow::Error::from)
+            .context("guest missing 'on-load' export")?;
+        let fn_generate = instance
+            .get_typed_func::<(u32, i32, i32, i32, u64, u32), u32>(&mut store, EXPORT_GENERATE)
+            .map_err(anyhow::Error::from)
+            .context("guest missing 'generate' export")?;
+        let fn_is_definitely_air = instance
+            .get_typed_func::<(u32, i32, i32, i32), u32>(&mut store, EXPORT_IS_DEFINITELY_AIR)
+            .map_err(anyhow::Error::from)
+            .context("guest missing 'is-definitely-air' export")?;
+
+        // Call on_load — guest registers blocks and returns generator handle
+        let generator_handle = fn_on_load.call(&mut store, ())?;
+        tracing::info!("WASM guest on_load complete, generator_handle={generator_handle}");
+
+        Ok(Self {
+            store,
+            memory,
+            fn_generate,
+            fn_is_definitely_air,
+            generator_handle,
+        })
+    }
+
+    fn generate(&mut self, pos: ChunkPos, seed: u64, out_ptr: u32) -> Result<u32> {
+        let handle = self.generator_handle;
+        let n = self.fn_generate.call(
+            &mut self.store,
+            (handle, pos.x, pos.y, pos.z, seed, out_ptr),
+        )?;
+        Ok(n)
+    }
+
+    fn is_definitely_air(&mut self, pos: ChunkPos) -> Result<bool> {
+        let handle = self.generator_handle;
+        let result = self
+            .fn_is_definitely_air
+            .call(&mut self.store, (handle, pos.x, pos.y, pos.z))?;
+        Ok(result != 0)
+    }
+
+    fn read_chunk(&self, out_ptr: u32) -> Chunk {
+        let data = self.memory.data(&self.store);
+        let offset = out_ptr as usize;
+        let mut chunk = Chunk::new();
+        for i in 0..CHUNK_VOLUME {
+            let id_bytes = &data[offset + i * 4..offset + i * 4 + 4];
+            let id = u32::from_le_bytes(id_bytes.try_into().unwrap());
+            if id != 0 {
+                let x = (i % CHUNK_SIZE) as u8;
+                let y = (i / CHUNK_SIZE / CHUNK_SIZE) as u8;
+                let z = ((i / CHUNK_SIZE) % CHUNK_SIZE) as u8;
+                chunk.set(ChunkLocalPos::new(x, y, z), cubic_world::BlockTypeId(id));
+            }
+        }
+        chunk
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WasmPlugin — owns Module and per-worker instances
+// ---------------------------------------------------------------------------
+
+/// Shared across threads via Arc. Owns the compiled Module and registry.
+/// Per-worker instances are stored in thread-locals inside WasmWorldGenerator.
+pub struct WasmPlugin {
+    engine: Engine,
+    module: Module,
+    layout: WasmMemoryLayout,
+    memory_bytes: usize,
+    block_registry: Arc<Mutex<cubic_world::BlockRegistry>>,
+}
+
+impl WasmPlugin {
+    pub fn load(path: &str, worker_count: usize, memory_mb: usize) -> Result<Self> {
+        let engine = Engine::default();
+        let bytes =
+            std::fs::read(path).with_context(|| format!("failed to read game plugin: {path}"))?;
+        let module = Module::new(&engine, &bytes)
+            .map_err(anyhow::Error::from)
+            .context("failed to compile game plugin")?;
+
+        let layout = WasmMemoryLayout::new(worker_count);
+        let memory_bytes = (memory_mb * 1024 * 1024).max(layout.min_memory_bytes());
+
+        tracing::info!(
+            "WASM plugin loaded: {path}, workers={worker_count}, memory={}MB",
+            memory_bytes / 1024 / 1024
+        );
+
+        Ok(Self {
+            engine,
+            module,
+            layout,
+            memory_bytes,
+            block_registry: Arc::new(Mutex::new(cubic_world::BlockRegistry::new())),
+        })
+    }
+
+    fn make_instance(&self) -> Result<WasmInstance> {
+        WasmInstance::new(
+            &self.engine,
+            &self.module,
+            Arc::clone(&self.block_registry),
+            self.memory_bytes,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WasmWorldGenerator — implements WorldGenerator
+// ---------------------------------------------------------------------------
+
+// Thread-local storage for per-worker WASM instances.
+// Initialized lazily on first generate() call per thread.
+thread_local! {
+    static WASM_INSTANCE: std::cell::RefCell<Option<WasmInstance>> =
+        const { std::cell::RefCell::new(None) };
+    static WORKER_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Called by each streaming worker thread at startup to assign its WASM
+/// shared memory buffer slot. Must be called before any generate() calls
+/// on that thread.
+pub fn set_worker_id(id: usize) {
+    WORKER_ID.set(id);
+}
+
+pub struct WasmWorldGenerator {
+    plugin: Arc<WasmPlugin>,
+}
+
+impl WasmWorldGenerator {
+    pub fn new(plugin: WasmPlugin) -> Self {
+        Self {
+            plugin: Arc::new(plugin),
+        }
+    }
+}
+
+impl WorldGenerator for WasmWorldGenerator {
+    fn generate(&self, pos: ChunkPos, seed: u64) -> Chunk {
+        let worker_id = WORKER_ID.get();
+        let out_ptr = if worker_id == usize::MAX {
+            // Main thread fallback — use slot 0
+            self.plugin.layout.worker_buffer_offset(0)
+        } else {
+            self.plugin
+                .layout
+                .worker_buffer_offset(worker_id % self.plugin.layout.worker_count)
+        };
+
+        let plugin = Arc::clone(&self.plugin);
+
+        // NB: don't lock block_registry here. The lazy `make_instance()` call
+        // below runs the guest's on-load export, which calls back into the
+        // host's register-block import — that import also locks
+        // block_registry, so holding the lock across instance creation would
+        // self-deadlock on every worker thread's first generate() call.
+        WASM_INSTANCE.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if opt.is_none() {
+                *opt = Some(
+                    plugin
+                        .make_instance()
+                        .expect("failed to create WASM instance"),
+                );
+            }
+            let instance = opt.as_mut().unwrap();
+            instance
+                .generate(pos, seed, out_ptr)
+                .expect("WASM generate failed");
+            instance.read_chunk(out_ptr)
+        })
+    }
+
+    fn is_definitely_air(&self, pos: ChunkPos) -> bool {
+        WASM_INSTANCE.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if opt.is_none() {
+                let plugin = Arc::clone(&self.plugin);
+                *opt = Some(
+                    plugin
+                        .make_instance()
+                        .expect("failed to create WASM instance"),
+                );
+            }
+            opt.as_mut()
+                .unwrap()
+                .is_definitely_air(pos)
+                .unwrap_or(false)
+        })
+    }
+}

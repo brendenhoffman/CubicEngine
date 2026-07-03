@@ -1,0 +1,42 @@
+package cubic:game@0.1.0;
+
+interface world-gen {
+    /// Opaque handle to a generator instance owned by the guest.
+    type generator-handle = u32;
+
+    /// Called once at startup. Guest registers block types via the
+    /// block-registry import, then returns a generator handle.
+    on-load: func() -> generator-handle;
+
+    /// Generate a chunk. Guest writes CHUNK_VOLUME u32 block type IDs
+    /// starting at out-ptr in shared linear memory.
+    /// Returns the number of u32s written (always CHUNK_VOLUME = 32768).
+    generate: func(
+        handle: generator-handle,
+        cx: s32,
+        cy: s32,
+        cz: s32,
+        seed: u64,
+        out-ptr: u32,
+    ) -> u32;
+
+    /// Returns true if this chunk is guaranteed to contain only air.
+    /// Host skips generate entirely if this returns true.
+    is-definitely-air: func(
+        handle: generator-handle,
+        cx: s32,
+        cy: s32,
+        cz: s32,
+    ) -> bool;
+}
+
+interface block-registry {
+    /// Host function — game calls this during on-load to register a block type.
+    /// Returns the BlockTypeId assigned by the engine.
+    register-block: func(name: string) -> u32;
+}
+
+world game {
+    export world-gen;
+    import block-registry;
+}
