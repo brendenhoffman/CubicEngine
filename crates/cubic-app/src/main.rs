@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
+#[cfg(debug_assertions)]
 mod flat_generator;
 mod frustum;
+mod noise_generator;
 
 use anyhow::Result;
 use clap::Parser;
@@ -19,11 +21,11 @@ use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
 use cubic_render_gl::GlRenderer;
 use cubic_render_vk::{HdrFlavor, VkRenderer, VkVsyncMode};
 use cubic_world::{
-    mesh_chunk, world_pos_to_chunk, AsyncWorldStream, ChunkPos, WorldGenerator, CHUNK_SIZE,
-    VOXEL_SIZE,
+    mesh_chunk, world_pos_to_chunk, AsyncWorldStream, BlockTypeId, ChunkPos, WorldGenerator,
+    CHUNK_SIZE, VOXEL_SIZE,
 };
-use flat_generator::FlatGenerator;
 use frustum::Frustum;
+use noise_generator::{NoiseGenerator, NoiseLayer};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -622,23 +624,24 @@ impl ApplicationHandler for App {
                     backend.set_camera(self.camera);
 
                     let aspect = self.render_size.width as f32 / self.render_size.height as f32;
-                    let view_proj =
-                        self.camera.projection_matrix(aspect) * self.camera.view_matrix();
+                    let view_proj = self.camera.projection_matrix(aspect)
+                        * self.camera.view_matrix_no_translation();
                     let frustum = Frustum::from_view_proj(&view_proj);
                     let chunk_world_size = CHUNK_SIZE as f32 * VOXEL_SIZE;
+                    let cam_pos = self.camera.position; // snapshot once
 
                     for (&pos, &handle) in &self.chunk_meshes {
-                        let origin = pos.to_world_origin();
-                        let min = origin;
-                        let max = origin + Vec3::splat(chunk_world_size);
+                        let world_origin = pos.to_world_origin();
+                        let relative = world_origin - cam_pos; // camera-relative translation
+                        let min = relative;
+                        let max = relative + Vec3::splat(chunk_world_size);
                         if frustum.contains_aabb(min, max) {
-                            let o = origin;
                             let push = PushData {
                                 model: [
                                     [1.0, 0.0, 0.0, 0.0],
                                     [0.0, 1.0, 0.0, 0.0],
                                     [0.0, 0.0, 1.0, 0.0],
-                                    [o.x, o.y, o.z, 1.0],
+                                    [relative.x, relative.y, relative.z, 1.0],
                                 ],
                                 tint: [1.0, 1.0, 1.0, 1.0],
                                 tex_index: 0,
@@ -800,7 +803,26 @@ fn main() -> Result<()> {
             height: 1,
         },
         stream: AsyncWorldStream::new(cfg.world.stream_radius, cfg.world.stream_radius_y),
-        generator: Arc::new(FlatGenerator::new()) as Arc<dyn WorldGenerator>,
+        generator: Arc::new(NoiseGenerator::new(
+            8.0,  // sea_level
+            16.0, // base_height
+            vec![
+                NoiseLayer {
+                    frequency: 0.01,
+                    amplitude: 16.0,
+                },
+                NoiseLayer {
+                    frequency: 0.05,
+                    amplitude: 4.0,
+                },
+                NoiseLayer {
+                    frequency: 0.1,
+                    amplitude: 1.0,
+                },
+            ],
+            BlockTypeId(1),
+            cfg.world.seed,
+        )) as Arc<dyn WorldGenerator>,
         chunk_meshes: HashMap::new(),
         seed,
         cfg,

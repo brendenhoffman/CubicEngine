@@ -3,11 +3,13 @@
 
 use cubic_world::{BlockTypeId, Chunk, ChunkLocalPos, ChunkPos, WorldGenerator, CHUNK_SIZE};
 
+#[allow(dead_code)]
 pub struct FlatGenerator {
     pub stone: BlockTypeId,
     pub fill_y: usize,
 }
 
+#[allow(dead_code)]
 impl FlatGenerator {
     pub fn new() -> Self {
         Self {

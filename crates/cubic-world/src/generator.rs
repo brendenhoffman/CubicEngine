@@ -15,4 +15,11 @@ use crate::{Chunk, ChunkPos};
 ///   it needs internally. Do not take a `&BlockRegistry` parameter.
 pub trait WorldGenerator: Send + Sync {
     fn generate(&self, pos: ChunkPos, seed: u64) -> Chunk;
+    /// Returns true if this chunk is guaranteed to contain only air.
+    /// Used by the streaming system to skip generation entirely.
+    /// Default impl returns false — conservative, always generates.
+    /// Override with a cheap height check for significant performance gains.
+    fn is_definitely_air(&self, _pos: ChunkPos) -> bool {
+        false
+    }
 }

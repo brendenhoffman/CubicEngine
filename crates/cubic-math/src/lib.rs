@@ -57,4 +57,11 @@ impl Camera {
             Vec4::new(0.0, 0.0, self.near, 0.0),
         )
     }
+
+    /// View matrix with translation zeroed — for camera-relative rendering.
+    /// Use this instead of view_matrix() when model matrices are built
+    /// relative to the camera position.
+    pub fn view_matrix_no_translation(&self) -> Mat4 {
+        Mat4::look_to_rh(Vec3::ZERO, self.forward(), Vec3::Y)
+    }
 }

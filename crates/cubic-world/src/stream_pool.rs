@@ -179,6 +179,7 @@ impl AsyncWorldStream {
                     if !self.inner.chunks.contains_key(&pos)
                         && !self.in_flight.contains(&pos)
                         && !self.known_air.contains(&pos)
+                        && !generator.is_definitely_air(pos)
                     {
                         self.in_flight.insert(pos);
                         // best-effort send — if the channel is full we'll retry next frame

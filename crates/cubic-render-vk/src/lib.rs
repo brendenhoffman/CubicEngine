@@ -983,7 +983,7 @@ impl VkRenderer {
         camera: &Camera,
         aspect: f32,
     ) -> anyhow::Result<()> {
-        let view_proj = camera.projection_matrix(aspect) * camera.view_matrix();
+        let view_proj = camera.projection_matrix(aspect) * camera.view_matrix_no_translation();
         let data = CameraUbo {
             view_proj: view_proj.to_cols_array_2d(),
         };
