@@ -82,7 +82,7 @@ struct HostState {
 struct WasmInstance {
     store: Store<HostState>,
     memory: Memory,
-    fn_generate: TypedFunc<(u32, i32, i32, i32, u64, u32), u32>,
+    fn_generate: TypedFunc<(u32, i32, i32, i32, u32), u32>,
     fn_is_definitely_air: TypedFunc<(u32, i32, i32, i32), u32>,
     generator_handle: u32,
 }
@@ -93,6 +93,7 @@ impl WasmInstance {
         module: &Module,
         block_registry: Arc<Mutex<cubic_world::BlockRegistry>>,
         memory_bytes: usize,
+        seed: u64,
     ) -> Result<Self> {
         let mut store = Store::new(
             engine,
@@ -136,11 +137,11 @@ impl WasmInstance {
         // Get exported functions. Names are the wit-bindgen-mangled forms —
         // see the EXPORT_* constants above.
         let fn_on_load = instance
-            .get_typed_func::<(), u32>(&mut store, EXPORT_ON_LOAD)
+            .get_typed_func::<u64, u32>(&mut store, EXPORT_ON_LOAD)
             .map_err(anyhow::Error::from)
             .context("guest missing 'on-load' export")?;
         let fn_generate = instance
-            .get_typed_func::<(u32, i32, i32, i32, u64, u32), u32>(&mut store, EXPORT_GENERATE)
+            .get_typed_func::<(u32, i32, i32, i32, u32), u32>(&mut store, EXPORT_GENERATE)
             .map_err(anyhow::Error::from)
             .context("guest missing 'generate' export")?;
         let fn_is_definitely_air = instance
@@ -149,7 +150,7 @@ impl WasmInstance {
             .context("guest missing 'is-definitely-air' export")?;
 
         // Call on_load — guest registers blocks and returns generator handle
-        let generator_handle = fn_on_load.call(&mut store, ())?;
+        let generator_handle = fn_on_load.call(&mut store, seed)?;
         tracing::info!("WASM guest on_load complete, generator_handle={generator_handle}");
 
         Ok(Self {
@@ -161,12 +162,11 @@ impl WasmInstance {
         })
     }
 
-    fn generate(&mut self, pos: ChunkPos, seed: u64, out_ptr: u32) -> Result<u32> {
+    fn generate(&mut self, pos: ChunkPos, out_ptr: u32) -> Result<u32> {
         let handle = self.generator_handle;
-        let n = self.fn_generate.call(
-            &mut self.store,
-            (handle, pos.x, pos.y, pos.z, seed, out_ptr),
-        )?;
+        let n = self
+            .fn_generate
+            .call(&mut self.store, (handle, pos.x, pos.y, pos.z, out_ptr))?;
         Ok(n)
     }
 
@@ -208,10 +208,11 @@ pub struct WasmPlugin {
     layout: WasmMemoryLayout,
     memory_bytes: usize,
     block_registry: Arc<Mutex<cubic_world::BlockRegistry>>,
+    seed: u64,
 }
 
 impl WasmPlugin {
-    pub fn load(path: &str, worker_count: usize, memory_mb: usize) -> Result<Self> {
+    pub fn load(path: &str, worker_count: usize, memory_mb: usize, seed: u64) -> Result<Self> {
         let engine = Engine::default();
         let bytes =
             std::fs::read(path).with_context(|| format!("failed to read game plugin: {path}"))?;
@@ -233,6 +234,7 @@ impl WasmPlugin {
             layout,
             memory_bytes,
             block_registry: Arc::new(Mutex::new(cubic_world::BlockRegistry::new())),
+            seed,
         })
     }
 
@@ -242,6 +244,7 @@ impl WasmPlugin {
             &self.module,
             Arc::clone(&self.block_registry),
             self.memory_bytes,
+            self.seed,
         )
     }
 }
@@ -278,7 +281,7 @@ impl WasmWorldGenerator {
 }
 
 impl WorldGenerator for WasmWorldGenerator {
-    fn generate(&self, pos: ChunkPos, seed: u64) -> Chunk {
+    fn generate(&self, pos: ChunkPos, _seed: u64) -> Chunk {
         let worker_id = WORKER_ID.get();
         let out_ptr = if worker_id == usize::MAX {
             // Main thread fallback — use slot 0
@@ -307,7 +310,7 @@ impl WorldGenerator for WasmWorldGenerator {
             }
             let instance = opt.as_mut().unwrap();
             instance
-                .generate(pos, seed, out_ptr)
+                .generate(pos, out_ptr)
                 .expect("WASM generate failed");
             instance.read_chunk(out_ptr)
         })

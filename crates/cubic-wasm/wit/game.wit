@@ -6,7 +6,7 @@ interface world-gen {
 
     /// Called once at startup. Guest registers block types via the
     /// block-registry import, then returns a generator handle.
-    on-load: func() -> generator-handle;
+    on-load: func(seed: u64) -> generator-handle;
 
     /// Generate a chunk. Guest writes CHUNK_VOLUME u32 block type IDs
     /// starting at out-ptr in shared linear memory.
@@ -16,7 +16,6 @@ interface world-gen {
         cx: s32,
         cy: s32,
         cz: s32,
-        seed: u64,
         out-ptr: u32,
     ) -> u32;
 

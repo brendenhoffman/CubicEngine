@@ -20,3 +20,7 @@ upload_budget_min_ms = 0.5  # floor in ms, always upload at least this much
 [camera]
 move_speed = 100.0        # m/s; one chunk = 16 m, one voxel = 0.5 m
 mouse_sensitivity = 0.0025
+
+[game]
+path = "games/cubic-game/game.wasm"
+wasm_memory_mb = 16

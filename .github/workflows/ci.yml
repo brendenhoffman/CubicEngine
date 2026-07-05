@@ -69,10 +69,30 @@ jobs:
       - name: Ensure crate roots deny unsafe_op_in_unsafe_fn
         shell: bash
         run: tools/check-headers.sh
+  # cubic-game only ever targets wasm32-wasip1 (it's excluded from
+  # workspace default-members for that reason), so the clippy matrix above
+  # type-checking it against desktop targets doesn't verify the thing that
+  # actually ships. wasm32-wasip1 is tier-2 with full std support, so it
+  # builds and links natively on ubuntu-latest with no cross toolchain.
+  cubic-game-wasm:
+    name: cubic-game (wasm32-wasip1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustup target add wasm32-wasip1
+        run: rustup target add wasm32-wasip1
+      - name: cargo clippy (fail on warnings)
+        run: cargo clippy -p cubic-game --target wasm32-wasip1 --all-targets -- -D warnings
+      - name: cargo build --release
+        run: cargo build -p cubic-game --target wasm32-wasip1 --release
   # Gate merges on everything passing
   ci-ok:
     name: all checks
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, cargo-deny, unsafe-lint]
+    needs: [fmt, clippy, cargo-deny, unsafe-lint, cubic-game-wasm]
     steps:
       - run: echo "All good!"

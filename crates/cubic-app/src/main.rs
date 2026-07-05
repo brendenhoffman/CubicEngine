@@ -3,7 +3,6 @@
 #[cfg(debug_assertions)]
 mod flat_generator;
 mod frustum;
-mod noise_generator;
 
 use anyhow::Result;
 use clap::Parser;
@@ -20,12 +19,12 @@ use cubic_platform::winit::{
 use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
 use cubic_render_gl::GlRenderer;
 use cubic_render_vk::{HdrFlavor, VkRenderer, VkVsyncMode};
+use cubic_wasm::{WasmPlugin, WasmWorldGenerator};
 use cubic_world::{
-    mesh_chunk, world_pos_to_chunk, AsyncWorldStream, BlockTypeId, ChunkPos, WorldGenerator,
-    CHUNK_SIZE, VOXEL_SIZE,
+    mesh_chunk, world_pos_to_chunk, AsyncWorldStream, ChunkPos, WorldGenerator, CHUNK_SIZE,
+    VOXEL_SIZE,
 };
 use frustum::Frustum;
-use noise_generator::{NoiseGenerator, NoiseLayer};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -142,6 +141,8 @@ struct AppCfg {
     world: WorldCfg,
     #[serde(default)]
     camera: CameraCfg,
+    #[serde(default)]
+    game: GameCfg,
 }
 
 #[derive(Parser, Debug)]
@@ -286,6 +287,31 @@ fn default_upload_budget_min_ms() -> f32 {
 
 fn default_stream_radius_y() -> i32 {
     2
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct GameCfg {
+    #[serde(default = "default_game_path")]
+    path: String,
+    #[serde(default = "default_wasm_memory_mb")]
+    wasm_memory_mb: usize,
+}
+
+fn default_game_path() -> String {
+    "games/cubic-game/game.wasm".to_string()
+}
+
+fn default_wasm_memory_mb() -> usize {
+    16
+}
+
+impl Default for GameCfg {
+    fn default() -> Self {
+        GameCfg {
+            path: default_game_path(),
+            wasm_memory_mb: default_wasm_memory_mb(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -794,6 +820,14 @@ fn main() -> Result<()> {
         cfg.world.seed
     };
 
+    let worker_count = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .saturating_sub(1)
+        .max(1);
+
+    let plugin = WasmPlugin::load(&cfg.game.path, worker_count, cfg.game.wasm_memory_mb, seed)?;
+    let generator = Arc::new(WasmWorldGenerator::new(plugin)) as Arc<dyn WorldGenerator>;
+
     let mut app = App {
         backend_choice: args.backend,
         window: None,
@@ -805,28 +839,9 @@ fn main() -> Result<()> {
         stream: AsyncWorldStream::new(
             cfg.world.stream_radius,
             cfg.world.stream_radius_y,
-            None, // replaced with Some(...) when WASM is wired in
+            Some(Arc::new(|id| cubic_wasm::set_worker_id(id))),
         ),
-        generator: Arc::new(NoiseGenerator::new(
-            8.0,  // sea_level
-            16.0, // base_height
-            vec![
-                NoiseLayer {
-                    frequency: 0.01,
-                    amplitude: 16.0,
-                },
-                NoiseLayer {
-                    frequency: 0.05,
-                    amplitude: 4.0,
-                },
-                NoiseLayer {
-                    frequency: 0.1,
-                    amplitude: 1.0,
-                },
-            ],
-            BlockTypeId(1),
-            cfg.world.seed,
-        )) as Arc<dyn WorldGenerator>,
+        generator,
         chunk_meshes: HashMap::new(),
         seed,
         cfg,
