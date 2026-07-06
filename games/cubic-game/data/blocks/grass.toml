@@ -1,0 +1,7 @@
+[block]
+name = "grass"
+
+[block.faces]
+top = "assets/textures/blocks/grass_top.png"
+bottom = "assets/textures/blocks/dirt.png"
+sides = "assets/textures/blocks/grass_side.png"

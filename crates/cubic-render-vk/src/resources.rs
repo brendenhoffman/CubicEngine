@@ -100,6 +100,22 @@ pub(crate) struct DrawCandidate {
     pub(crate) tex_index: u32,
 }
 
+/// Sampler settings derived from `cubic.toml`'s `[render]` texture_filter /
+/// mipmap_mode / anisotropy / lod_bias, applied to every texture the
+/// sampler-creation helpers below build.
+pub(crate) struct SamplerConfig {
+    pub mag_filter: vk::Filter,
+    pub min_filter: vk::Filter,
+    pub mipmap_mode: vk::SamplerMipmapMode,
+    /// 0.0 = disabled, otherwise clamped to the device's
+    /// `max_sampler_anisotropy` limit by the caller before storing.
+    pub max_anisotropy: f32,
+    /// Offset applied to the computed mip level before sampling; positive
+    /// values bias toward blurrier/lower-resolution mips, negative toward
+    /// sharper/higher-resolution ones.
+    pub lod_bias: f32,
+}
+
 struct ImageAllocInfo {
     extent: vk::Extent2D,
     mip_levels: u32,
@@ -473,17 +489,86 @@ fn transition_color_to_transfer_dst(
     );
 }
 
+/// Single-mip-level variant used by the mip-chain blit loop: level `mip` was
+/// just written as a blit destination (or the initial copy, for level 0) and
+/// needs to become a blit *source* for the next level.
 #[inline]
-fn transition_color_to_shader_read(
+fn transition_mip_dst_to_blit_src(
     device: &ash::Device,
     cmd: vk::CommandBuffer,
     image: vk::Image,
-    mips: u32,
+    mip: u32,
 ) {
     let sub = vk::ImageSubresourceRange {
         aspect_mask: vk::ImageAspectFlags::COLOR,
-        base_mip_level: 0,
-        level_count: mips,
+        base_mip_level: mip,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    transition_image_layout2(
+        device,
+        cmd,
+        &LayoutTransition {
+            image,
+            sub,
+            src_stage: vk::PipelineStageFlags2::TRANSFER,
+            src_access: vk::AccessFlags2::TRANSFER_WRITE,
+            old_layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            dst_stage: vk::PipelineStageFlags2::TRANSFER,
+            dst_access: vk::AccessFlags2::TRANSFER_READ,
+            new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        },
+    );
+}
+
+/// Single-mip-level variant: level `mip` has finished being read as a blit
+/// source and is now done, so it can move to its final shader-read layout.
+#[inline]
+fn transition_mip_blit_src_to_shader_read(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    mip: u32,
+) {
+    let sub = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: mip,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    transition_image_layout2(
+        device,
+        cmd,
+        &LayoutTransition {
+            image,
+            sub,
+            src_stage: vk::PipelineStageFlags2::TRANSFER,
+            src_access: vk::AccessFlags2::TRANSFER_READ,
+            old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            dst_stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            dst_access: vk::AccessFlags2::SHADER_READ,
+            new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        },
+    );
+}
+
+/// TRANSFER_DST_OPTIMAL -> SHADER_READ_ONLY_OPTIMAL for a single mip level:
+/// the last level in a chain, which was only ever a blit *destination*
+/// (never a source, since there's no further level to blit from it), so it's
+/// still in TRANSFER_DST_OPTIMAL rather than TRANSFER_SRC_OPTIMAL.
+#[inline]
+fn transition_mip_dst_to_shader_read(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    mip: u32,
+) {
+    let sub = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: mip,
+        level_count: 1,
         base_array_layer: 0,
         layer_count: 1,
     };
@@ -501,6 +586,79 @@ fn transition_color_to_shader_read(
             new_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
         },
     );
+}
+
+/// Blit-based mip chain generation: assumes level 0 already holds the base
+/// image data and is in TRANSFER_DST_OPTIMAL (all levels are, right after
+/// the initial whole-range `transition_color_to_transfer_dst`). Each level
+/// `i` is filled by blitting down from level `i-1` at half resolution using
+/// LINEAR filtering (a box-filter-ish downsample), then level `i-1` moves to
+/// its final SHADER_READ_ONLY_OPTIMAL layout since nothing needs it anymore.
+/// The last level was never a blit source, so it's transitioned separately
+/// after the loop.
+fn generate_mip_chain(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    mip_levels: u32,
+) {
+    let mut mip_w = width as i32;
+    let mut mip_h = height as i32;
+    for i in 1..mip_levels {
+        transition_mip_dst_to_blit_src(device, cmd, image, i - 1);
+
+        let next_w = (mip_w / 2).max(1);
+        let next_h = (mip_h / 2).max(1);
+        let blit = vk::ImageBlit {
+            src_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: i - 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            src_offsets: [
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D {
+                    x: mip_w,
+                    y: mip_h,
+                    z: 1,
+                },
+            ],
+            dst_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: i,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            dst_offsets: [
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D {
+                    x: next_w,
+                    y: next_h,
+                    z: 1,
+                },
+            ],
+        };
+        unsafe {
+            device.cmd_blit_image(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&blit),
+                vk::Filter::LINEAR,
+            )
+        };
+
+        transition_mip_blit_src_to_shader_read(device, cmd, image, i - 1);
+
+        mip_w = next_w;
+        mip_h = next_h;
+    }
+    transition_mip_dst_to_shader_read(device, cmd, image, mip_levels - 1);
 }
 
 fn copy_buffer_to_image(
@@ -539,18 +697,32 @@ fn copy_buffer_to_image(
     };
 }
 
-fn create_sampler(device: &ash::Device, mip_levels: u32) -> Result<vk::Sampler> {
-    // No anisotropy yet (you didn't enable it on device features). Safe defaults.
+pub(crate) fn create_sampler(
+    device: &ash::Device,
+    mip_levels: u32,
+    mag_filter: vk::Filter,
+    min_filter: vk::Filter,
+    mipmap_mode: vk::SamplerMipmapMode,
+    anisotropy: f32,
+    lod_bias: f32,
+) -> Result<vk::Sampler> {
     let ci = vk::SamplerCreateInfo {
         s_type: vk::StructureType::SAMPLER_CREATE_INFO,
-        mag_filter: vk::Filter::LINEAR,
-        min_filter: vk::Filter::LINEAR,
-        mipmap_mode: vk::SamplerMipmapMode::LINEAR,
+        mag_filter,
+        min_filter,
+        mipmap_mode,
         address_mode_u: vk::SamplerAddressMode::REPEAT,
         address_mode_v: vk::SamplerAddressMode::REPEAT,
         address_mode_w: vk::SamplerAddressMode::REPEAT,
+        anisotropy_enable: if anisotropy > 0.0 {
+            vk::TRUE
+        } else {
+            vk::FALSE
+        },
+        max_anisotropy: anisotropy,
         min_lod: 0.0,
         max_lod: mip_levels as f32,
+        mip_lod_bias: lod_bias,
         ..Default::default()
     };
     Ok(unsafe { device.create_sampler(&ci, None)? })
@@ -611,30 +783,65 @@ pub(crate) fn write_material_descriptors(
     unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
 }
 
+/// 2x2 checkerboard RGBA, registered at bindless index 0 as the fallback
+/// texture. Delegates to `create_texture_and_sampler` so it goes through the
+/// exact same mip-chain generation as every other texture (a 2x2 source
+/// image gets mip_levels = 2: the 2x2 base plus a 1x1 level) rather than a
+/// second, independently-maintained copy of that logic.
 pub(crate) fn create_dummy_texture_and_sampler(
     device: &ash::Device,
     allocator: &mut Allocator,
     queue: vk::Queue,
     cmd_pool: vk::CommandPool,
+    sampler_config: &SamplerConfig,
 ) -> Result<(vk::Image, Allocation, vk::ImageView, vk::Sampler)> {
-    // 2x2 checkerboard RGBA
-    let extent = vk::Extent2D {
-        width: 2,
-        height: 2,
-    };
     let pixels: [u8; 16] = [
         255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255,
     ];
+    create_texture_and_sampler(
+        device,
+        allocator,
+        queue,
+        cmd_pool,
+        &pixels,
+        vk::Extent2D {
+            width: 2,
+            height: 2,
+        },
+        sampler_config,
+    )
+}
 
-    // Create device-local image
+/// Same staging/transition/copy/view/sampler pattern as
+/// `create_dummy_texture_and_sampler`, parameterized over caller-supplied
+/// RGBA8 pixel data instead of the hardcoded 2x2 checkerboard. Registering
+/// the result into the bindless descriptor array (`write_material_descriptors`)
+/// is the caller's job since that needs the live `material_desc_set` and the
+/// next free index, both of which live on `VkRenderer`.
+pub(crate) fn create_texture_and_sampler(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    queue: vk::Queue,
+    cmd_pool: vk::CommandPool,
+    pixels: &[u8],
+    extent: vk::Extent2D,
+    sampler_config: &SamplerConfig,
+) -> Result<(vk::Image, Allocation, vk::ImageView, vk::Sampler)> {
+    let mip_levels = (extent.width.max(extent.height) as f32).log2().floor() as u32 + 1;
+
+    // Create device-local image. TRANSFER_SRC is needed in addition to
+    // TRANSFER_DST because the mip chain is generated by blitting each level
+    // from the previous one (see generate_mip_chain), which reads from it.
     let info = ImageAllocInfo {
         extent,
-        mip_levels: 1,
-        format: vk::Format::R8G8B8A8_UNORM,
-        usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        mip_levels,
+        format: vk::Format::R8G8B8A8_SRGB,
+        usage: vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::SAMPLED,
         tiling: vk::ImageTiling::OPTIMAL,
     };
-    let (image, memory) = create_image_and_memory(device, allocator, &info, "dummy texture")?;
+    let (image, memory) = create_image_and_memory(device, allocator, &info, "uploaded texture")?;
 
     // Create staging buffer and copy pixels into it
     let size = pixels.len() as vk::DeviceSize;
@@ -644,13 +851,13 @@ pub(crate) fn create_dummy_texture_and_sampler(
         size,
         vk::BufferUsageFlags::TRANSFER_SRC,
         MemoryLocation::CpuToGpu,
-        "dummy texture staging",
+        "texture upload staging",
     )?;
     {
         let mapped = staging_alloc
             .mapped_slice_mut()
-            .ok_or_else(|| anyhow!("dummy texture staging allocation not host-mapped"))?;
-        mapped[..pixels.len()].copy_from_slice(&pixels);
+            .ok_or_else(|| anyhow!("texture upload staging allocation not host-mapped"))?;
+        mapped[..pixels.len()].copy_from_slice(pixels);
     }
 
     // One-time command buffer to do the transitions + copy
@@ -669,9 +876,9 @@ pub(crate) fn create_dummy_texture_and_sampler(
     };
     unsafe { device.begin_command_buffer(cmd, &bi)? };
 
-    transition_color_to_transfer_dst(device, cmd, image, 1);
+    transition_color_to_transfer_dst(device, cmd, image, mip_levels);
     copy_buffer_to_image(device, cmd, staging, image, extent);
-    transition_color_to_shader_read(device, cmd, image, 1);
+    generate_mip_chain(device, cmd, image, extent.width, extent.height, mip_levels);
 
     unsafe { device.end_command_buffer(cmd)? };
     let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
@@ -690,8 +897,16 @@ pub(crate) fn create_dummy_texture_and_sampler(
     }
     allocator.free(staging_alloc)?;
 
-    let view = make_image_view_2d_color(device, image, vk::Format::R8G8B8A8_UNORM, 0, 1)?;
-    let sampler = create_sampler(device, 1)?;
+    let view = make_image_view_2d_color(device, image, vk::Format::R8G8B8A8_SRGB, 0, mip_levels)?;
+    let sampler = create_sampler(
+        device,
+        mip_levels,
+        sampler_config.mag_filter,
+        sampler_config.min_filter,
+        sampler_config.mipmap_mode,
+        sampler_config.max_anisotropy,
+        sampler_config.lod_bias,
+    )?;
 
     Ok((image, memory, view, sampler))
 }

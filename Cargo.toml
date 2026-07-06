@@ -8,6 +8,24 @@ members = [
   "crates/cubic-render-vk",
   "crates/cubic-world",
   "crates/cubic-app",
+  "crates/cubic-wasm",
+  # wasm32-wasip1-only plugin crate. It's a full workspace member (not its
+  # own opt-out workspace) so rust-analyzer's default project discovery
+  # actually picks it up instead of treating it as a detached file with no
+  # crate graph or proc-macro expansion. Kept out of default-members below
+  # so plain `cargo build`/`cargo test` at the root don't try to build it.
+  "crates/cubic-game",
+]
+default-members = [
+  "crates/cubic-core",
+  "crates/cubic-math",
+  "crates/cubic-platform",
+  "crates/cubic-render",
+  "crates/cubic-render-gl",
+  "crates/cubic-render-vk",
+  "crates/cubic-world",
+  "crates/cubic-app",
+  "crates/cubic-wasm",
 ]
 resolver = "2"
 

@@ -33,9 +33,10 @@ use resources::{
     create_dummy_texture_and_sampler, create_frame_uniforms_and_sets,
     create_indirect_compute_desc_set_layout, create_indirect_draw_resources,
     create_indirect_graphics_desc_set_layout, create_material_desc_pool_and_set,
-    create_material_desc_set_layout, depth_aspect_mask, depth_attachment_layout, pick_depth_format,
-    upload_via_staging, write_material_descriptors, CameraUbo, DrawCandidate, RangeAlloc,
-    MAX_INDIRECT_DRAWS, MAX_SHARED_INDICES, MAX_SHARED_VERTICES,
+    create_material_desc_set_layout, create_texture_and_sampler, depth_aspect_mask,
+    depth_attachment_layout, pick_depth_format, upload_via_staging, write_material_descriptors,
+    CameraUbo, DrawCandidate, RangeAlloc, SamplerConfig, MAX_INDIRECT_DRAWS, MAX_SHARED_INDICES,
+    MAX_SHARED_VERTICES, MAX_TEXTURES,
 };
 // Vertex, PushData, and MeshHandle are now defined in cubic-render so that
 // cubic-world can use them without depending on Vulkan. Re-export them from
@@ -46,6 +47,11 @@ use swapchain::{
     create_hdr_metadata_if_needed, create_swapchain_bundle, SwapchainBundle, SwapchainConfig,
 };
 pub use swapchain::{HdrFlavor, VkVsyncMode};
+// Re-exported so callers (cubic-app's set_sampler_config plumbing) can build
+// sampler settings without depending on `ash` directly. These two are plain,
+// trivially-constructible enums (unlike e.g. vsync/HDR, which need custom
+// wrapper types for fallback logic), so re-exporting as-is is simplest.
+pub use ash::vk::{Filter, SamplerMipmapMode};
 use sync::{
     create_command_resources, create_sync_objects, create_timeline_semaphore, AcquireSlot,
     CommandResources, FrameSync,
@@ -190,6 +196,16 @@ pub struct VkRenderer {
     tex_alloc: Allocation,
     tex_view: vk::ImageView,
     tex_sampler: vk::Sampler,
+    // Bindless texture array bookkeeping for upload_texture(). Index 0 is
+    // permanently the dummy texture above; uploads start at 1.
+    next_tex_index: u32,
+    tex_store: Vec<(vk::Image, Allocation, vk::ImageView, vk::Sampler)>,
+    // Filter/mipmap/anisotropy settings applied to every texture uploaded
+    // via upload_texture(). Starts at a sensible default (used for the
+    // dummy texture, created before cubic-app's configure_advanced() can
+    // run); set_sampler_config() overrides it with the real cubic.toml
+    // values immediately after construction, before any real textures load.
+    sampler_config: SamplerConfig,
 }
 
 // STRICT TEARDOWN ORDER:
@@ -342,6 +358,14 @@ impl Drop for VkRenderer {
             d.destroy_image_view(self.tex_view, None);
             d.destroy_image(self.tex_image, None);
             let _ = allocator.free(std::mem::take(&mut self.tex_alloc));
+
+            // Uploaded textures (upload_texture)
+            for (image, alloc, view, sampler) in self.tex_store.drain(..) {
+                d.destroy_sampler(sampler, None);
+                d.destroy_image_view(view, None);
+                d.destroy_image(image, None);
+                let _ = allocator.free(alloc);
+            }
 
             // Save and destroy pipeline cache
             let props = self.instance.get_physical_device_properties(self.phys);
@@ -687,10 +711,28 @@ fn build_renderer(
     let (material_desc_pool, material_desc_set) =
         create_material_desc_pool_and_set(&device, desc_set_layout_material)?;
 
+    // Sensible default until cubic-app's configure_advanced() pushes the
+    // real cubic.toml values via set_sampler_config() — see the field doc
+    // on VkRenderer::sampler_config. Only the dummy texture below ever
+    // actually uses this default, since configure_advanced() always runs
+    // before any real texture is uploaded.
+    let sampler_config = SamplerConfig {
+        mag_filter: vk::Filter::LINEAR,
+        min_filter: vk::Filter::LINEAR,
+        mipmap_mode: vk::SamplerMipmapMode::LINEAR,
+        max_anisotropy: 0.0,
+        lod_bias: 0.0,
+    };
+
     // Tiny 2×2 texture and sampler, registered at bindless index 0 (the
     // fallback every draw uses until real texture loading exists).
-    let (tex_image, tex_alloc, tex_view, tex_sampler) =
-        create_dummy_texture_and_sampler(&device, &mut allocator, queue, cmd.pool)?;
+    let (tex_image, tex_alloc, tex_view, tex_sampler) = create_dummy_texture_and_sampler(
+        &device,
+        &mut allocator,
+        queue,
+        cmd.pool,
+        &sampler_config,
+    )?;
     write_material_descriptors(&device, material_desc_set, 0, tex_view, tex_sampler);
 
     let (ubufs, umems, ubo_ptrs, ubo_size, desc_pool, desc_sets) = create_frame_uniforms_and_sets(
@@ -799,6 +841,9 @@ fn build_renderer(
         tex_alloc,
         tex_view,
         tex_sampler,
+        next_tex_index: 1,
+        tex_store: Vec::new(),
+        sampler_config,
     };
 
     Ok(r)
@@ -842,6 +887,35 @@ impl VkRenderer {
 
     pub fn set_camera(&mut self, camera: Camera) {
         self.camera = camera;
+    }
+
+    /// Push cubic.toml's texture_filter/mipmap_mode/anisotropy/lod_bias
+    /// settings into the renderer. Only affects textures uploaded *after*
+    /// this call — the dummy texture created in `build_renderer` already
+    /// has its sampler baked in. `anisotropy` is clamped to the device's
+    /// actual `max_sampler_anisotropy` limit (0.0 disables anisotropic
+    /// filtering regardless of the device limit).
+    pub fn set_sampler_config(
+        &mut self,
+        mag_filter: vk::Filter,
+        min_filter: vk::Filter,
+        mipmap_mode: vk::SamplerMipmapMode,
+        anisotropy: f32,
+        lod_bias: f32,
+    ) {
+        let limits = unsafe {
+            self.instance
+                .get_physical_device_properties(self.phys)
+                .limits
+        };
+        let max_anisotropy = anisotropy.clamp(0.0, limits.max_sampler_anisotropy);
+        self.sampler_config = SamplerConfig {
+            mag_filter,
+            min_filter,
+            mipmap_mode,
+            max_anisotropy,
+            lod_bias,
+        };
     }
 
     #[inline]
@@ -1390,6 +1464,36 @@ impl VkRenderer {
             vertex_count: vc,
         });
         Ok(handle)
+    }
+
+    /// Upload an RGBA8 texture and register it into the bindless descriptor
+    /// array, returning its index (see `PushData::tex_index`). Index 0 is
+    /// permanently the dummy texture created in `build_renderer`; this
+    /// starts handing out indices at 1.
+    pub fn upload_texture(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<u32> {
+        if self.next_tex_index >= MAX_TEXTURES {
+            return Err(anyhow!(
+                "upload_texture: bindless texture array full (MAX_TEXTURES = {MAX_TEXTURES})"
+            ));
+        }
+
+        let (image, alloc, view, sampler) = create_texture_and_sampler(
+            &self.device,
+            self.allocator.as_mut().expect("allocator missing"),
+            self.queue,
+            self.cmd_pool,
+            pixels,
+            vk::Extent2D { width, height },
+            &self.sampler_config,
+        )?;
+
+        let index = self.next_tex_index;
+        write_material_descriptors(&self.device, self.material_desc_set, index, view, sampler);
+
+        self.tex_store.push((image, alloc, view, sampler));
+        self.next_tex_index += 1;
+
+        Ok(index)
     }
 
     /// Queue a draw of a previously uploaded mesh for the next render()

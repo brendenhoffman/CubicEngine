@@ -20,8 +20,10 @@ jobs:
   # This job runs on ubuntu-latest and only type-checks against each target triple.
   # It verifies the code compiles and lints clean for that target; it does NOT verify
   # that an actual build links successfully on that platform. Real builds for the
-  # windows-msvc and macOS targets need either a native runner or a cross toolchain
-  # (cargo-xwin for windows-msvc), which we don't have set up yet.
+  # windows-msvc targets need a cross toolchain (cargo-xwin), which we don't have set
+  # up yet. macOS targets are checked on an actual macos-latest runner instead (see
+  # the clippy-macos job below) rather than cross-compiling from Linux, since that
+  # needs Apple's SDK and there's no package-manager-installable substitute for it.
   clippy:
     name: clippy (matrix)
     runs-on: ubuntu-latest
@@ -29,14 +31,12 @@ jobs:
       fail-fast: false
       matrix:
         target:
-          - aarch64-apple-darwin
           - aarch64-pc-windows-msvc
           - aarch64-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
           - i686-unknown-linux-gnu
           - powerpc64-unknown-linux-gnu
           - riscv64gc-unknown-linux-gnu
-          - x86_64-apple-darwin
           - x86_64-pc-windows-msvc
           - x86_64-unknown-linux-gnu
     steps:
@@ -47,8 +47,40 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: rustup target add
         run: rustup target add ${{ matrix.target }}
+      # wasmtime's build.rs compiles a small C helper (src/runtime/vm/helpers.c)
+      # via cc-rs for every target, even though clippy itself only type-checks
+      # and never links — so these two still need a real cross C compiler.
+      - name: install cross C compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'riscv64gc-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
       # Clippy only needs to type-check; it won't actually link,
       # so we don't need cross linkers.
+      - name: cargo clippy (fail on warnings)
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
+  # Separate from the clippy matrix above: these two targets can't be
+  # cross-compiled from ubuntu-latest (no free/installable Apple SDK), so they
+  # run natively on macos-latest instead. Apple's own toolchain (Xcode's clang
+  # + SDK) supports both architectures as build targets regardless of the
+  # runner's native arch, so one runner covers both.
+  clippy-macos:
+    name: clippy (macOS matrix)
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustup target add
+        run: rustup target add ${{ matrix.target }}
       - name: cargo clippy (fail on warnings)
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
   cargo-deny:
@@ -69,10 +101,30 @@ jobs:
       - name: Ensure crate roots deny unsafe_op_in_unsafe_fn
         shell: bash
         run: tools/check-headers.sh
+  # cubic-game only ever targets wasm32-wasip1 (it's excluded from
+  # workspace default-members for that reason), so the clippy matrix above
+  # type-checking it against desktop targets doesn't verify the thing that
+  # actually ships. wasm32-wasip1 is tier-2 with full std support, so it
+  # builds and links natively on ubuntu-latest with no cross toolchain.
+  cubic-game-wasm:
+    name: cubic-game (wasm32-wasip1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustup target add wasm32-wasip1
+        run: rustup target add wasm32-wasip1
+      - name: cargo clippy (fail on warnings)
+        run: cargo clippy -p cubic-game --target wasm32-wasip1 --all-targets -- -D warnings
+      - name: cargo build --release
+        run: cargo build -p cubic-game --target wasm32-wasip1 --release
   # Gate merges on everything passing
   ci-ok:
     name: all checks
     runs-on: ubuntu-latest
-    needs: [fmt, clippy, cargo-deny, unsafe-lint]
+    needs: [fmt, clippy, clippy-macos, cargo-deny, unsafe-lint, cubic-game-wasm]
     steps:
       - run: echo "All good!"

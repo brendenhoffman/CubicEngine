@@ -1,0 +1,26 @@
+[terrain]
+base_height = 16.0
+sea_level = 8.0
+
+[[terrain.layers]]
+frequency = 0.01
+amplitude = 16.0
+
+[[terrain.layers]]
+frequency = 0.05
+amplitude = 4.0
+
+[[terrain.layers]]
+frequency = 0.1
+amplitude = 1.0
+
+[[terrain.surface_rules]]
+block = "grass"
+max_depth = 1
+
+[[terrain.surface_rules]]
+block = "dirt"
+max_depth = 4
+
+[[terrain.surface_rules]]
+block = "stone"

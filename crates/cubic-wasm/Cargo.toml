@@ -1,0 +1,11 @@
+[package]
+name = "cubic-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cubic-world = { path = "../cubic-world" }
+wasmtime = { version = "46.0.1", default-features = false, features = ["cranelift", "runtime", "anyhow"] }
+anyhow = "1"
+tracing = "0.1"

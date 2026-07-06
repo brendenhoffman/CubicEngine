@@ -1,0 +1,61 @@
+package cubic:game@0.1.0;
+
+interface world-gen {
+    /// Opaque handle to a generator instance owned by the guest.
+    type generator-handle = u32;
+
+    /// Called once at startup. Guest registers block types via the
+    /// block-registry import, then returns a generator handle.
+    on-load: func(seed: u64) -> generator-handle;
+
+    /// Generate a chunk. Guest writes CHUNK_VOLUME u32 block type IDs
+    /// starting at out-ptr in shared linear memory.
+    /// Returns the number of u32s written (always CHUNK_VOLUME = 32768).
+    generate: func(
+        handle: generator-handle,
+        cx: s32,
+        cy: s32,
+        cz: s32,
+        out-ptr: u32,
+    ) -> u32;
+
+    /// Returns true if this chunk is guaranteed to contain only air.
+    /// Host skips generate entirely if this returns true.
+    is-definitely-air: func(
+        handle: generator-handle,
+        cx: s32,
+        cy: s32,
+        cz: s32,
+    ) -> bool;
+}
+
+interface block-registry {
+    /// Host function — game calls this during on-load to register a block type.
+    /// Returns the BlockTypeId assigned by the engine.
+    register-block: func(name: string) -> u32;
+
+    record face-def {
+        top: string,
+        bottom: string,
+        front: string,
+        back: string,
+        left: string,
+        right: string,
+    }
+
+    register-block-with-faces: func(name: string, faces: face-def) -> u32;
+}
+
+interface data {
+    /// Read a file from the game's data directory into a pre-allocated buffer.
+    /// Returns the actual number of bytes written, or 0 if the file doesn't exist.
+    /// max-len must be large enough to hold the file contents.
+    read-file: func(path: string, out-ptr: u32, max-len: u32) -> u32;
+    list-dir: func(path: string, out-ptr: u32, max-len: u32) -> u32;
+}
+
+world game {
+    export world-gen;
+    import block-registry;
+    import data;
+}

@@ -20,6 +20,40 @@ const CS: usize = CHUNK_SIZE;
 const AIR: BlockTypeId = BlockTypeId(0);
 
 // ---------------------------------------------------------------------------
+// BlockFaceTextures
+// ---------------------------------------------------------------------------
+
+/// Pre-built per-block face texture index table, indexed by `BlockTypeId.0`.
+/// Entry `6*id+dir` gives the bindless texture array index for that face.
+/// Dir order matches the mesher: 0=-X 1=+X 2=-Y 3=+Y 4=-Z 5=+Z
+pub struct BlockFaceTextures {
+    /// Flat array: [block0_neg_x, block0_pos_x, block0_neg_y, block0_pos_y, block0_neg_z, block0_pos_z, block1_neg_x, ...]
+    data: Vec<u32>,
+}
+
+impl Default for BlockFaceTextures {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlockFaceTextures {
+    pub fn new() -> Self {
+        Self { data: Vec::new() }
+    }
+
+    pub fn push(&mut self, faces: [u32; 6]) {
+        self.data.extend_from_slice(&faces);
+    }
+
+    #[inline]
+    pub fn get(&self, id: BlockTypeId, dir: u8) -> u32 {
+        let base = id.0 as usize * 6;
+        self.data.get(base + dir as usize).copied().unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -30,8 +64,15 @@ const AIR: BlockTypeId = BlockTypeId(0);
 /// a missing neighbor to treat that boundary as exposed (face is always
 /// generated).
 ///
+/// `face_textures` supplies the bindless texture index for each block/face
+/// combination (see `BlockFaceTextures`).
+///
 /// Returns `(vertices, indices)` ready to hand directly to `upload_mesh`.
-pub fn mesh_chunk(chunk: &Chunk, neighbors: [Option<&Chunk>; 6]) -> (Vec<Vertex>, Vec<u32>) {
+pub fn mesh_chunk(
+    chunk: &Chunk,
+    neighbors: [Option<&Chunk>; 6],
+    face_textures: &BlockFaceTextures,
+) -> (Vec<Vertex>, Vec<u32>) {
     let mut verts: Vec<Vertex> = Vec::new();
     let mut idxs: Vec<u32> = Vec::new();
 
@@ -139,13 +180,49 @@ pub fn mesh_chunk(chunk: &Chunk, neighbors: [Option<&Chunk>; 6]) -> (Vec<Vertex>
                         world_pos(axis, af, u0f + wf, v0f + hf), // 2 = TR
                         world_pos(axis, af, u0f, v0f + hf),      // 3 = TL
                     ];
-                    // UVs tiled by quad size (atlas coordinates come later).
-                    let uvs = [
-                        [0.0f32, 0.0],
-                        [w as f32, 0.0],
-                        [w as f32, h as f32],
-                        [0.0f32, h as f32],
-                    ];
+                    // UVs corrected per face direction so textures appear upright on all faces.
+                    // Corners are BL, BR, TR, TL in u-v space — the mapping differs per axis
+                    // to compensate for how world_pos lays out the quad geometry.
+                    // dir: 0=-X  1=+X  2=-Y  3=+Y  4=-Z  5=+Z
+                    let uvs: [[f32; 2]; 4] = match dir {
+                        0 => [
+                            [0.0, w as f32],
+                            [0.0, 0.0],
+                            [h as f32, 0.0],
+                            [h as f32, w as f32],
+                        ],
+                        1 => [
+                            [h as f32, w as f32],
+                            [h as f32, 0.0],
+                            [0.0, 0.0],
+                            [0.0, w as f32],
+                        ],
+                        2 => [
+                            [0.0, h as f32],
+                            [w as f32, h as f32],
+                            [w as f32, 0.0],
+                            [0.0, 0.0],
+                        ],
+                        3 => [
+                            [0.0, 0.0],
+                            [w as f32, 0.0],
+                            [w as f32, h as f32],
+                            [0.0, h as f32],
+                        ],
+                        4 => [
+                            [w as f32, h as f32],
+                            [0.0, h as f32],
+                            [0.0, 0.0],
+                            [w as f32, 0.0],
+                        ],
+                        _ => [
+                            [0.0, h as f32],
+                            [w as f32, h as f32],
+                            [w as f32, 0.0],
+                            [0.0, 0.0],
+                        ],
+                    };
+                    let tex_index = face_textures.get(block, dir);
 
                     let base = verts.len() as u32;
                     for (pos, uv) in corners.iter().zip(uvs.iter()) {
@@ -154,6 +231,7 @@ pub fn mesh_chunk(chunk: &Chunk, neighbors: [Option<&Chunk>; 6]) -> (Vec<Vertex>
                             color: [1.0, 1.0, 1.0],
                             uv: *uv,
                             normal,
+                            tex_index,
                         });
                     }
 
@@ -270,7 +348,7 @@ mod tests {
     #[test]
     fn empty_chunk_no_geometry() {
         let chunk = Chunk::new();
-        let (v, i) = mesh_chunk(&chunk, [None; 6]);
+        let (v, i) = mesh_chunk(&chunk, [None; 6], &BlockFaceTextures::new());
         assert!(v.is_empty(), "empty chunk should produce no vertices");
         assert!(i.is_empty());
     }
@@ -281,7 +359,7 @@ mod tests {
         let stone = reg.register("stone");
         let mut chunk = Chunk::new();
         chunk.set(ChunkLocalPos::new(1, 1, 1), stone);
-        let (v, i) = mesh_chunk(&chunk, [None; 6]);
+        let (v, i) = mesh_chunk(&chunk, [None; 6], &BlockFaceTextures::new());
         // 6 faces × 4 vertices = 24 verts, 6 faces × 6 indices = 36 indices
         assert_eq!(v.len(), 24, "single voxel: 6 faces × 4 verts");
         assert_eq!(i.len(), 36, "single voxel: 6 faces × 6 indices");
@@ -291,7 +369,7 @@ mod tests {
     fn solid_chunk_with_solid_neighbors_no_geometry() {
         let mut reg = BlockRegistry::new();
         let c = solid_chunk(&mut reg);
-        let (v, _) = mesh_chunk(&c, [Some(&c); 6]);
+        let (v, _) = mesh_chunk(&c, [Some(&c); 6], &BlockFaceTextures::new());
         assert!(v.is_empty(), "fully-buried solid chunk: no visible faces");
     }
 
@@ -299,7 +377,7 @@ mod tests {
     fn solid_chunk_no_neighbors_only_boundary_faces() {
         let mut reg = BlockRegistry::new();
         let c = solid_chunk(&mut reg);
-        let (v, _) = mesh_chunk(&c, [None; 6]);
+        let (v, _) = mesh_chunk(&c, [None; 6], &BlockFaceTextures::new());
         // 6 faces, each a single CHUNK_SIZE×CHUNK_SIZE greedy quad → 4 verts each
         assert_eq!(
             v.len(),
@@ -316,7 +394,7 @@ mod tests {
         // Put one voxel at the centre; verify all 6 normals are unit vectors
         // pointing along a single axis.
         chunk.set(ChunkLocalPos::new(0, 0, 0), stone);
-        let (verts, _) = mesh_chunk(&chunk, [None; 6]);
+        let (verts, _) = mesh_chunk(&chunk, [None; 6], &BlockFaceTextures::new());
         let unique_normals: std::collections::HashSet<[i32; 3]> = verts
             .iter()
             .map(|v| [v.normal[0] as i32, v.normal[1] as i32, v.normal[2] as i32])
@@ -335,7 +413,7 @@ mod tests {
         for x in 0..4u8 {
             chunk.set(ChunkLocalPos::new(x, 0, 0), stone);
         }
-        let (verts, idxs) = mesh_chunk(&chunk, [None; 6]);
+        let (verts, idxs) = mesh_chunk(&chunk, [None; 6], &BlockFaceTextures::new());
         // The +Y face should be one quad (4 verts, 6 indices) — the four voxels
         // are adjacent, same type, same slice → greedy merges them.
         // Count how many quads have a +Y normal.

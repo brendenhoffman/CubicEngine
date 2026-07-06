@@ -3,7 +3,6 @@
 #[cfg(debug_assertions)]
 mod flat_generator;
 mod frustum;
-mod noise_generator;
 
 use anyhow::Result;
 use clap::Parser;
@@ -19,13 +18,13 @@ use cubic_platform::winit::{
 };
 use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
 use cubic_render_gl::GlRenderer;
-use cubic_render_vk::{HdrFlavor, VkRenderer, VkVsyncMode};
+use cubic_render_vk::{Filter, HdrFlavor, SamplerMipmapMode, VkRenderer, VkVsyncMode};
+use cubic_wasm::{WasmPlugin, WasmWorldGenerator};
 use cubic_world::{
-    mesh_chunk, world_pos_to_chunk, AsyncWorldStream, BlockTypeId, ChunkPos, WorldGenerator,
+    mesh_chunk, world_pos_to_chunk, AsyncWorldStream, BlockFaceTextures, ChunkPos, WorldGenerator,
     CHUNK_SIZE, VOXEL_SIZE,
 };
 use frustum::Frustum;
-use noise_generator::{NoiseGenerator, NoiseLayer};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -46,6 +45,7 @@ trait RendererBackend {
     fn draw_mesh(&mut self, handle: MeshHandle, push: PushData);
     fn render(&mut self) -> Result<()>;
     fn free_mesh(&mut self, _handle: MeshHandle) {} // default no-op
+    fn upload_texture(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<u32>;
 }
 
 enum Backend {
@@ -89,6 +89,16 @@ impl RendererBackend for Backend {
                 HdrFlavorCfg::PreferHdr10 => HdrFlavor::PreferHdr10,
             };
             r.set_hdr_flavor(flavor);
+
+            let filter = match cfg.texture_filter {
+                TextureFilter::Nearest => Filter::NEAREST,
+                TextureFilter::Linear => Filter::LINEAR,
+            };
+            let mipmap_mode = match cfg.mipmap_mode {
+                MipmapMode::Nearest => SamplerMipmapMode::NEAREST,
+                MipmapMode::Linear => SamplerMipmapMode::LINEAR,
+            };
+            r.set_sampler_config(filter, filter, mipmap_mode, cfg.anisotropy, cfg.lod_bias);
         }
     }
 
@@ -128,6 +138,14 @@ impl RendererBackend for Backend {
             Backend::Vk(r) => r.render(),
         }
     }
+
+    fn upload_texture(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<u32> {
+        match self {
+            // GL texture API not yet implemented.
+            Backend::Gl(_) => Ok(0),
+            Backend::Vk(r) => r.upload_texture(pixels, width, height),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +160,8 @@ struct AppCfg {
     world: WorldCfg,
     #[serde(default)]
     camera: CameraCfg,
+    #[serde(default)]
+    game: GameCfg,
 }
 
 #[derive(Parser, Debug)]
@@ -177,6 +197,22 @@ enum HdrFlavorCfg {
     PreferHdr10,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum TextureFilter {
+    Nearest,
+    #[default]
+    Linear,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum MipmapMode {
+    Nearest,
+    #[default]
+    Linear,
+}
+
 #[derive(Debug, Deserialize, Clone, Copy)]
 struct RenderCfg {
     #[serde(default = "default_clear")]
@@ -195,6 +231,14 @@ struct RenderCfg {
     hdr: bool,
     #[serde(default)]
     hdr_flavor: HdrFlavorCfg,
+    #[serde(default)]
+    texture_filter: TextureFilter,
+    #[serde(default)]
+    mipmap_mode: MipmapMode,
+    #[serde(default = "default_anisotropy")]
+    anisotropy: f32,
+    #[serde(default)]
+    lod_bias: f32,
 }
 
 impl Default for RenderCfg {
@@ -208,6 +252,10 @@ impl Default for RenderCfg {
             fps_when_vsync_off: 0,
             hdr: false,
             hdr_flavor: HdrFlavorCfg::PreferScrgb,
+            texture_filter: TextureFilter::Linear,
+            mipmap_mode: MipmapMode::Linear,
+            anisotropy: default_anisotropy(),
+            lod_bias: 0.0,
         }
     }
 }
@@ -217,6 +265,9 @@ fn default_clear() -> [f32; 4] {
 }
 fn default_vsync() -> bool {
     true
+}
+fn default_anisotropy() -> f32 {
+    0.0
 }
 fn load_cfg() -> AppCfg {
     match fs::read_to_string("cubic.toml") {
@@ -288,6 +339,31 @@ fn default_stream_radius_y() -> i32 {
     2
 }
 
+#[derive(Debug, Deserialize, Clone)]
+struct GameCfg {
+    #[serde(default = "default_game_path")]
+    path: String,
+    #[serde(default = "default_wasm_memory_mb")]
+    wasm_memory_mb: usize,
+}
+
+fn default_game_path() -> String {
+    "games/cubic-game/game.wasm".to_string()
+}
+
+fn default_wasm_memory_mb() -> usize {
+    16
+}
+
+impl Default for GameCfg {
+    fn default() -> Self {
+        GameCfg {
+            path: default_game_path(),
+            wasm_memory_mb: default_wasm_memory_mb(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
@@ -345,6 +421,7 @@ struct App {
 
     stream: AsyncWorldStream,
     generator: Arc<dyn WorldGenerator>,
+    plugin: Arc<WasmPlugin>,
     chunk_meshes: HashMap<ChunkPos, MeshHandle>,
     seed: u64,
     camera: Camera,
@@ -352,6 +429,13 @@ struct App {
     last_frame_instant: std::time::Instant,
     detected_refresh_hz: f32,
     remesh_scratch: HashSet<ChunkPos>,
+    // Path (relative to the game's data dir) -> bindless texture index,
+    // populated once in resumed() from the WASM plugin's block registry.
+    // Consumed by the mesher to assign tex_index per face.
+    tex_map: HashMap<String, u32>,
+    // Per-block-per-face bindless texture index lookup built from tex_map
+    // once in resumed(); Arc'd so streaming worker threads can share it.
+    face_textures: Arc<BlockFaceTextures>,
 }
 
 impl ApplicationHandler for App {
@@ -399,6 +483,72 @@ impl ApplicationHandler for App {
         backend.set_clear_color(self.cfg.render.clear_color);
         backend.set_vsync(self.cfg.render.vsync);
         backend.configure_advanced(&self.cfg.render);
+
+        // --- 2b. Load block face textures into the bindless array ---
+        let unique_paths: HashSet<String> = {
+            let registry_arc = self.plugin.block_registry();
+            let registry = registry_arc.lock().unwrap();
+            registry
+                .all_defs()
+                .flat_map(|def| {
+                    [
+                        def.faces.top.clone(),
+                        def.faces.bottom.clone(),
+                        def.faces.front.clone(),
+                        def.faces.back.clone(),
+                        def.faces.left.clone(),
+                        def.faces.right.clone(),
+                    ]
+                })
+                .filter(|p| !p.is_empty())
+                .collect()
+        };
+
+        let game_dir = std::path::Path::new(&self.cfg.game.path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+
+        let mut tex_map: HashMap<String, u32> = HashMap::new();
+        for path in unique_paths {
+            let full = game_dir.join(&path);
+            match image::open(&full) {
+                Ok(img) => {
+                    let rgba = img.to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    match backend.upload_texture(rgba.as_raw(), w, h) {
+                        Ok(index) => {
+                            tex_map.insert(path, index);
+                        }
+                        Err(e) => error!("texture upload failed {full:?}: {e}"),
+                    }
+                }
+                Err(e) => error!("failed to load texture {full:?}: {e}"),
+            }
+        }
+        self.tex_map = tex_map;
+
+        // Build the per-block-per-face texture lookup the mesher indexes by
+        // BlockTypeId, now that tex_map has the path -> bindless index
+        // mapping.
+        {
+            let registry_arc = self.plugin.block_registry();
+            let registry = registry_arc.lock().unwrap();
+            let mut face_textures = BlockFaceTextures::new();
+            for def in registry.all_defs() {
+                // dir order: -X, +X, -Y, +Y, -Z, +Z
+                // face mapping: left/right=sides, bottom=-Y, top=+Y, front/back=sides
+                let get = |path: &str| self.tex_map.get(path).copied().unwrap_or(0);
+                face_textures.push([
+                    get(&def.faces.left),   // -X
+                    get(&def.faces.right),  // +X
+                    get(&def.faces.bottom), // -Y
+                    get(&def.faces.top),    // +Y
+                    get(&def.faces.front),  // -Z
+                    get(&def.faces.back),   // +Z
+                ]);
+            }
+            self.face_textures = Arc::new(face_textures);
+        }
 
         info!(
             "backend = {}",
@@ -555,7 +705,9 @@ impl ApplicationHandler for App {
                 if let Some(backend) = &mut self.backend {
                     // --- Stream update ---
                     let center = world_pos_to_chunk(self.camera.position);
-                    let delta = self.stream.update(center, &self.generator, self.seed);
+                    let delta =
+                        self.stream
+                            .update(center, &self.generator, self.seed, &self.face_textures);
 
                     for pos in delta.unloaded {
                         if let Some(handle) = self.chunk_meshes.remove(&pos) {
@@ -604,7 +756,7 @@ impl ApplicationHandler for App {
                             Some(c) => c,
                             None => continue,
                         };
-                        let (verts, idxs) = mesh_chunk(chunk, neighbors);
+                        let (verts, idxs) = mesh_chunk(chunk, neighbors, &self.face_textures);
                         if let Some(old) = self.chunk_meshes.remove(&pos) {
                             backend.free_mesh(old);
                         }
@@ -794,6 +946,21 @@ fn main() -> Result<()> {
         cfg.world.seed
     };
 
+    let worker_count = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .saturating_sub(1)
+        .max(1);
+
+    let plugin = Arc::new(WasmPlugin::load(
+        &cfg.game.path,
+        worker_count,
+        cfg.game.wasm_memory_mb,
+        seed,
+    )?);
+    plugin.warm_up(); // populates block_registry via on_load
+    let generator =
+        Arc::new(WasmWorldGenerator::new(Arc::clone(&plugin))) as Arc<dyn WorldGenerator>;
+
     let mut app = App {
         backend_choice: args.backend,
         window: None,
@@ -802,27 +969,13 @@ fn main() -> Result<()> {
             width: 1,
             height: 1,
         },
-        stream: AsyncWorldStream::new(cfg.world.stream_radius, cfg.world.stream_radius_y),
-        generator: Arc::new(NoiseGenerator::new(
-            8.0,  // sea_level
-            16.0, // base_height
-            vec![
-                NoiseLayer {
-                    frequency: 0.01,
-                    amplitude: 16.0,
-                },
-                NoiseLayer {
-                    frequency: 0.05,
-                    amplitude: 4.0,
-                },
-                NoiseLayer {
-                    frequency: 0.1,
-                    amplitude: 1.0,
-                },
-            ],
-            BlockTypeId(1),
-            cfg.world.seed,
-        )) as Arc<dyn WorldGenerator>,
+        stream: AsyncWorldStream::new(
+            cfg.world.stream_radius,
+            cfg.world.stream_radius_y,
+            Some(Arc::new(cubic_wasm::set_worker_id as fn(usize))),
+        ),
+        generator,
+        plugin,
         chunk_meshes: HashMap::new(),
         seed,
         cfg,
@@ -841,6 +994,8 @@ fn main() -> Result<()> {
         last_frame_instant: std::time::Instant::now(),
         detected_refresh_hz: 60.0, // overwritten in resumed()
         remesh_scratch: HashSet::new(),
+        tex_map: HashMap::new(),
+        face_textures: Arc::new(BlockFaceTextures::new()), // populated in resumed()
     };
     event_loop.run_app(&mut app)?;
     Ok(())
