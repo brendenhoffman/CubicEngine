@@ -543,9 +543,9 @@ fn create_sampler(device: &ash::Device, mip_levels: u32) -> Result<vk::Sampler> 
     // No anisotropy yet (you didn't enable it on device features). Safe defaults.
     let ci = vk::SamplerCreateInfo {
         s_type: vk::StructureType::SAMPLER_CREATE_INFO,
-        mag_filter: vk::Filter::LINEAR,
-        min_filter: vk::Filter::LINEAR,
-        mipmap_mode: vk::SamplerMipmapMode::LINEAR,
+        mag_filter: vk::Filter::NEAREST,
+        min_filter: vk::Filter::NEAREST,
+        mipmap_mode: vk::SamplerMipmapMode::NEAREST,
         address_mode_u: vk::SamplerAddressMode::REPEAT,
         address_mode_v: vk::SamplerAddressMode::REPEAT,
         address_mode_w: vk::SamplerAddressMode::REPEAT,
@@ -630,7 +630,7 @@ pub(crate) fn create_dummy_texture_and_sampler(
     let info = ImageAllocInfo {
         extent,
         mip_levels: 1,
-        format: vk::Format::R8G8B8A8_UNORM,
+        format: vk::Format::R8G8B8A8_SRGB,
         usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
         tiling: vk::ImageTiling::OPTIMAL,
     };
@@ -690,7 +690,94 @@ pub(crate) fn create_dummy_texture_and_sampler(
     }
     allocator.free(staging_alloc)?;
 
-    let view = make_image_view_2d_color(device, image, vk::Format::R8G8B8A8_UNORM, 0, 1)?;
+    let view = make_image_view_2d_color(device, image, vk::Format::R8G8B8A8_SRGB, 0, 1)?;
+    let sampler = create_sampler(device, 1)?;
+
+    Ok((image, memory, view, sampler))
+}
+
+/// Same staging/transition/copy/view/sampler pattern as
+/// `create_dummy_texture_and_sampler`, parameterized over caller-supplied
+/// RGBA8 pixel data instead of the hardcoded 2x2 checkerboard. Registering
+/// the result into the bindless descriptor array (`write_material_descriptors`)
+/// is the caller's job since that needs the live `material_desc_set` and the
+/// next free index, both of which live on `VkRenderer`.
+pub(crate) fn create_texture_and_sampler(
+    device: &ash::Device,
+    allocator: &mut Allocator,
+    queue: vk::Queue,
+    cmd_pool: vk::CommandPool,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<(vk::Image, Allocation, vk::ImageView, vk::Sampler)> {
+    let extent = vk::Extent2D { width, height };
+
+    // Create device-local image
+    let info = ImageAllocInfo {
+        extent,
+        mip_levels: 1,
+        format: vk::Format::R8G8B8A8_SRGB,
+        usage: vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        tiling: vk::ImageTiling::OPTIMAL,
+    };
+    let (image, memory) = create_image_and_memory(device, allocator, &info, "uploaded texture")?;
+
+    // Create staging buffer and copy pixels into it
+    let size = pixels.len() as vk::DeviceSize;
+    let (staging, mut staging_alloc) = create_buffer_and_memory(
+        device,
+        allocator,
+        size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        MemoryLocation::CpuToGpu,
+        "texture upload staging",
+    )?;
+    {
+        let mapped = staging_alloc
+            .mapped_slice_mut()
+            .ok_or_else(|| anyhow!("texture upload staging allocation not host-mapped"))?;
+        mapped[..pixels.len()].copy_from_slice(pixels);
+    }
+
+    // One-time command buffer to do the transitions + copy
+    let ai = vk::CommandBufferAllocateInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
+        command_pool: cmd_pool,
+        level: vk::CommandBufferLevel::PRIMARY,
+        command_buffer_count: 1,
+        ..Default::default()
+    };
+    let cmd = unsafe { device.allocate_command_buffers(&ai)?[0] };
+    let bi = vk::CommandBufferBeginInfo {
+        s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
+        flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+        ..Default::default()
+    };
+    unsafe { device.begin_command_buffer(cmd, &bi)? };
+
+    transition_color_to_transfer_dst(device, cmd, image, 1);
+    copy_buffer_to_image(device, cmd, staging, image, extent);
+    transition_color_to_shader_read(device, cmd, image, 1);
+
+    unsafe { device.end_command_buffer(cmd)? };
+    let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None)? };
+    let si = vk::SubmitInfo {
+        s_type: vk::StructureType::SUBMIT_INFO,
+        command_buffer_count: 1,
+        p_command_buffers: &cmd,
+        ..Default::default()
+    };
+    unsafe {
+        device.queue_submit(queue, std::slice::from_ref(&si), fence)?;
+        device.wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)?;
+        device.destroy_fence(fence, None);
+        device.free_command_buffers(cmd_pool, std::slice::from_ref(&cmd));
+        device.destroy_buffer(staging, None);
+    }
+    allocator.free(staging_alloc)?;
+
+    let view = make_image_view_2d_color(device, image, vk::Format::R8G8B8A8_SRGB, 0, 1)?;
     let sampler = create_sampler(device, 1)?;
 
     Ok((image, memory, view, sampler))

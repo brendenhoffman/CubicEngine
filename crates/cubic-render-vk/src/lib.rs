@@ -33,9 +33,10 @@ use resources::{
     create_dummy_texture_and_sampler, create_frame_uniforms_and_sets,
     create_indirect_compute_desc_set_layout, create_indirect_draw_resources,
     create_indirect_graphics_desc_set_layout, create_material_desc_pool_and_set,
-    create_material_desc_set_layout, depth_aspect_mask, depth_attachment_layout, pick_depth_format,
-    upload_via_staging, write_material_descriptors, CameraUbo, DrawCandidate, RangeAlloc,
-    MAX_INDIRECT_DRAWS, MAX_SHARED_INDICES, MAX_SHARED_VERTICES,
+    create_material_desc_set_layout, create_texture_and_sampler, depth_aspect_mask,
+    depth_attachment_layout, pick_depth_format, upload_via_staging, write_material_descriptors,
+    CameraUbo, DrawCandidate, RangeAlloc, MAX_INDIRECT_DRAWS, MAX_SHARED_INDICES,
+    MAX_SHARED_VERTICES, MAX_TEXTURES,
 };
 // Vertex, PushData, and MeshHandle are now defined in cubic-render so that
 // cubic-world can use them without depending on Vulkan. Re-export them from
@@ -190,6 +191,10 @@ pub struct VkRenderer {
     tex_alloc: Allocation,
     tex_view: vk::ImageView,
     tex_sampler: vk::Sampler,
+    // Bindless texture array bookkeeping for upload_texture(). Index 0 is
+    // permanently the dummy texture above; uploads start at 1.
+    next_tex_index: u32,
+    tex_store: Vec<(vk::Image, Allocation, vk::ImageView, vk::Sampler)>,
 }
 
 // STRICT TEARDOWN ORDER:
@@ -342,6 +347,14 @@ impl Drop for VkRenderer {
             d.destroy_image_view(self.tex_view, None);
             d.destroy_image(self.tex_image, None);
             let _ = allocator.free(std::mem::take(&mut self.tex_alloc));
+
+            // Uploaded textures (upload_texture)
+            for (image, alloc, view, sampler) in self.tex_store.drain(..) {
+                d.destroy_sampler(sampler, None);
+                d.destroy_image_view(view, None);
+                d.destroy_image(image, None);
+                let _ = allocator.free(alloc);
+            }
 
             // Save and destroy pipeline cache
             let props = self.instance.get_physical_device_properties(self.phys);
@@ -799,6 +812,8 @@ fn build_renderer(
         tex_alloc,
         tex_view,
         tex_sampler,
+        next_tex_index: 1,
+        tex_store: Vec::new(),
     };
 
     Ok(r)
@@ -1390,6 +1405,36 @@ impl VkRenderer {
             vertex_count: vc,
         });
         Ok(handle)
+    }
+
+    /// Upload an RGBA8 texture and register it into the bindless descriptor
+    /// array, returning its index (see `PushData::tex_index`). Index 0 is
+    /// permanently the dummy texture created in `build_renderer`; this
+    /// starts handing out indices at 1.
+    pub fn upload_texture(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<u32> {
+        if self.next_tex_index >= MAX_TEXTURES {
+            return Err(anyhow!(
+                "upload_texture: bindless texture array full (MAX_TEXTURES = {MAX_TEXTURES})"
+            ));
+        }
+
+        let (image, alloc, view, sampler) = create_texture_and_sampler(
+            &self.device,
+            self.allocator.as_mut().expect("allocator missing"),
+            self.queue,
+            self.cmd_pool,
+            pixels,
+            width,
+            height,
+        )?;
+
+        let index = self.next_tex_index;
+        write_material_descriptors(&self.device, self.material_desc_set, index, view, sampler);
+
+        self.tex_store.push((image, alloc, view, sampler));
+        self.next_tex_index += 1;
+
+        Ok(index)
     }
 
     /// Queue a draw of a previously uploaded mesh for the next render()

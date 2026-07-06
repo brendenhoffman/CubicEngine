@@ -1,29 +1,37 @@
 // SPDX-License-Identifier: CEPL-1.0
-#![deny(unsafe_op_in_unsafe_fn)]
-
 wit_bindgen::generate!({
     world: "game",
     path: "../cubic-wasm/wit/game.wit",
 });
 
+use cubic::game::block_registry::{FaceDef, register_block_with_faces};
 use exports::cubic::game::world_gen::Guest;
 use noise::{NoiseFn, OpenSimplex};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Noise config
 // ---------------------------------------------------------------------------
 
+#[derive(Deserialize)]
 struct NoiseLayer {
     frequency: f32,
     amplitude: f32,
+}
+
+struct ResolvedSurfaceRule {
+    block_id: u32,
+    max_depth: Option<u32>,
 }
 
 struct NoiseGenerator {
     base_height: f32,
     layers: Vec<NoiseLayer>,
     noise: OpenSimplex,
-    stone_id: u32,
+    surface_rules: Vec<ResolvedSurfaceRule>,
+    fallback_id: u32, // used if no rules match (shouldn't happen with a catch-all)
 }
 
 impl NoiseGenerator {
@@ -42,6 +50,98 @@ impl NoiseGenerator {
     fn max_possible_height(&self) -> f32 {
         self.base_height + self.layers.iter().map(|l| l.amplitude).sum::<f32>()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Terrain TOML schema
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct TerrainConfig {
+    terrain: TerrainInner,
+}
+
+#[derive(Deserialize)]
+struct TerrainInner {
+    base_height: f32,
+    #[allow(dead_code)]
+    sea_level: f32,
+    #[serde(default)]
+    layers: Vec<NoiseLayer>,
+    #[serde(default)]
+    surface_rules: Vec<SurfaceRule>,
+}
+
+#[derive(Deserialize)]
+struct SurfaceRule {
+    block: String,
+    #[serde(default)]
+    max_depth: Option<u32>, // None = no limit (catch-all)
+}
+
+// ---------------------------------------------------------------------------
+// Block textures
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct BlockConfig {
+    block: BlockInner,
+}
+
+#[derive(Deserialize)]
+struct BlockInner {
+    name: String,
+    faces: BlockFaces,
+}
+
+#[derive(Deserialize)]
+struct BlockFaces {
+    // shorthands
+    #[serde(default)]
+    all: Option<String>,
+    #[serde(default)]
+    sides: Option<String>,
+    // per-face overrides
+    #[serde(default)]
+    top: Option<String>,
+    #[serde(default)]
+    bottom: Option<String>,
+    #[serde(default)]
+    front: Option<String>,
+    #[serde(default)]
+    back: Option<String>,
+    #[serde(default)]
+    left: Option<String>,
+    #[serde(default)]
+    right: Option<String>,
+}
+
+impl BlockFaces {
+    fn resolve(&self) -> [String; 6] {
+        // Priority: per-face > sides > all > empty
+        let all = self.all.as_deref().unwrap_or("");
+        let sides = self.sides.as_deref().unwrap_or(all);
+        [
+            self.left.as_deref().unwrap_or(sides).to_string(), // -X
+            self.right.as_deref().unwrap_or(sides).to_string(), // +X
+            self.bottom.as_deref().unwrap_or(all).to_string(), // -Y
+            self.top.as_deref().unwrap_or(all).to_string(),    // +Y
+            self.front.as_deref().unwrap_or(sides).to_string(), // -Z
+            self.back.as_deref().unwrap_or(sides).to_string(), // +Z
+        ]
+    }
+}
+
+fn load_block(path: &str) -> Option<(String, [String; 6])> {
+    let mut buf = vec![0u8; 65536];
+    let len = cubic::game::data::read_file(path, buf.as_mut_ptr() as u32, buf.len() as u32);
+    if len == 0 {
+        return None;
+    }
+    buf.truncate(len as usize);
+    let cfg: BlockConfig = toml::from_str(std::str::from_utf8(&buf).ok()?).ok()?;
+    let faces = cfg.block.faces.resolve();
+    Some((cfg.block.name, faces))
 }
 
 // ---------------------------------------------------------------------------
@@ -72,34 +172,65 @@ struct GamePlugin;
 
 impl Guest for GamePlugin {
     fn on_load(seed: u64) -> u32 {
-        let stone_id = cubic::game::block_registry::register_block("stone");
+        // Register all block types from datapack
+        let mut block_ids: HashMap<String, u32> = HashMap::new();
+        for path in &["blocks/stone.toml", "blocks/dirt.toml", "blocks/grass.toml"] {
+            if let Some((name, faces)) = load_block(path) {
+                let id = register_block_with_faces(
+                    &name,
+                    &FaceDef {
+                        top: faces[3].clone(),
+                        bottom: faces[2].clone(),
+                        front: faces[4].clone(),
+                        back: faces[5].clone(),
+                        left: faces[0].clone(),
+                        right: faces[1].clone(),
+                    },
+                );
+                block_ids.insert(name, id);
+            }
+        }
+
+        // Read terrain config from datapack
+        let mut buf = vec![0u8; 65536];
+        let len = cubic::game::data::read_file(
+            "world/terrain.toml",
+            buf.as_mut_ptr() as u32,
+            buf.len() as u32,
+        );
+        buf.truncate(len as usize);
+        let cfg: TerrainConfig =
+            toml::from_str(std::str::from_utf8(&buf).expect("terrain.toml is not valid utf8"))
+                .expect("failed to parse terrain.toml");
+
+        // Resolve surface rules: map block names to registered IDs
+        let surface_rules: Vec<ResolvedSurfaceRule> = cfg
+            .terrain
+            .surface_rules
+            .iter()
+            .map(|r| ResolvedSurfaceRule {
+                block_id: block_ids.get(&r.block).copied().unwrap_or(0),
+                max_depth: r.max_depth,
+            })
+            .collect();
+
+        let fallback_id = block_ids.get("stone").copied().unwrap_or(0);
+
         GENERATOR
             .set(NoiseGenerator {
-                base_height: 16.0,
-                layers: vec![
-                    NoiseLayer {
-                        frequency: 0.01,
-                        amplitude: 16.0,
-                    },
-                    NoiseLayer {
-                        frequency: 0.05,
-                        amplitude: 4.0,
-                    },
-                    NoiseLayer {
-                        frequency: 0.1,
-                        amplitude: 1.0,
-                    },
-                ],
+                base_height: cfg.terrain.base_height,
+                layers: cfg.terrain.layers,
                 noise: OpenSimplex::new(seed as u32),
-                stone_id,
+                surface_rules,
+                fallback_id,
             })
             .unwrap_or_else(|_| panic!("on_load called twice"));
+
         0
     }
 
     fn generate(_handle: u32, cx: i32, cy: i32, cz: i32, out_ptr: u32) -> u32 {
         let noise_gen = generator();
-
         let origin_x = (cx as f32) * (CHUNK_SIZE as f32) * VOXEL_SIZE;
         let origin_y = (cy as f32) * (CHUNK_SIZE as f32) * VOXEL_SIZE;
         let origin_z = (cz as f32) * (CHUNK_SIZE as f32) * VOXEL_SIZE;
@@ -118,7 +249,13 @@ impl Guest for GamePlugin {
                     let surface = noise_gen.surface_height(world_x, world_z);
                     let index = x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE;
                     let id = if world_y < surface {
-                        noise_gen.stone_id
+                        let depth_voxels = ((surface - world_y) / VOXEL_SIZE).ceil() as u32;
+                        noise_gen
+                            .surface_rules
+                            .iter()
+                            .find(|r| r.max_depth.map_or(true, |d| depth_voxels <= d))
+                            .map(|r| r.block_id)
+                            .unwrap_or(noise_gen.fallback_id)
                     } else {
                         0
                     };
@@ -129,7 +266,6 @@ impl Guest for GamePlugin {
                 }
             }
         }
-
         CHUNK_VOLUME as u32
     }
 

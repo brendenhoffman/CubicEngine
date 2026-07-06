@@ -2,7 +2,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use anyhow::{anyhow, Context, Result};
-use cubic_world::{Chunk, ChunkLocalPos, ChunkPos, WorldGenerator, CHUNK_SIZE, CHUNK_VOLUME};
+use cubic_world::{
+    Chunk, ChunkLocalPos, ChunkPos, FaceDef, WorldGenerator, CHUNK_SIZE, CHUNK_VOLUME,
+};
 use std::sync::{Arc, Mutex};
 use wasmtime::{Engine, Linker, Memory, Module, Store, TypedFunc};
 
@@ -25,6 +27,7 @@ const IMPORT_BLOCK_REGISTRY_MODULE: &str = "cubic:game/block-registry@0.1.0";
 const EXPORT_ON_LOAD: &str = "cubic:game/world-gen@0.1.0#on-load";
 const EXPORT_GENERATE: &str = "cubic:game/world-gen@0.1.0#generate";
 const EXPORT_IS_DEFINITELY_AIR: &str = "cubic:game/world-gen@0.1.0#is-definitely-air";
+const IMPORT_DATA_MODULE: &str = "cubic:game/data@0.1.0";
 
 // ---------------------------------------------------------------------------
 // Memory layout
@@ -70,9 +73,37 @@ impl WasmMemoryLayout {
 // ---------------------------------------------------------------------------
 // Host state (passed into Store)
 // ---------------------------------------------------------------------------
+pub struct DataStore {
+    /// Data directories in load order. Later entries win for the same path.
+    dirs: Vec<std::path::PathBuf>,
+}
+
+impl DataStore {
+    pub fn new(game_dir: &std::path::Path) -> Self {
+        Self {
+            dirs: vec![game_dir.join("data")],
+        }
+    }
+
+    pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
+        // Iterate in reverse — last dir wins
+        for dir in self.dirs.iter().rev() {
+            let full = dir.join(path);
+            if full.exists() {
+                return std::fs::read(&full).ok();
+            }
+        }
+        None
+    }
+
+    pub fn add_mod_dir(&mut self, mod_dir: &std::path::Path) {
+        self.dirs.push(mod_dir.join("data"));
+    }
+}
 
 struct HostState {
     block_registry: Arc<Mutex<cubic_world::BlockRegistry>>,
+    data_store: Arc<DataStore>,
 }
 
 // ---------------------------------------------------------------------------
@@ -92,6 +123,7 @@ impl WasmInstance {
         engine: &Engine,
         module: &Module,
         block_registry: Arc<Mutex<cubic_world::BlockRegistry>>,
+        data_store: Arc<DataStore>,
         memory_bytes: usize,
         seed: u64,
     ) -> Result<Self> {
@@ -99,6 +131,7 @@ impl WasmInstance {
             engine,
             HostState {
                 block_registry: Arc::clone(&block_registry),
+                data_store,
             },
         );
 
@@ -119,6 +152,91 @@ impl WasmInstance {
                 let mut reg = caller.data().block_registry.lock().unwrap();
                 let id = reg.register(name);
                 id.0 as i32
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_BLOCK_REGISTRY_MODULE,
+            "register-block-with-faces",
+            |mut caller: wasmtime::Caller<'_, HostState>,
+             name_ptr: i32,
+             name_len: i32,
+             top_ptr: i32,
+             top_len: i32,
+             bot_ptr: i32,
+             bot_len: i32,
+             front_ptr: i32,
+             front_len: i32,
+             back_ptr: i32,
+             back_len: i32,
+             left_ptr: i32,
+             left_len: i32,
+             right_ptr: i32,
+             right_len: i32|
+             -> i32 {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+
+                let read_str = |data: &[u8], ptr: i32, len: i32| -> String {
+                    std::str::from_utf8(&data[ptr as usize..(ptr + len) as usize])
+                        .unwrap_or("")
+                        .to_owned()
+                };
+
+                let (name, faces) = {
+                    let data = mem.data(&caller);
+                    let name = read_str(data, name_ptr, name_len);
+                    let faces = FaceDef {
+                        top: read_str(data, top_ptr, top_len),
+                        bottom: read_str(data, bot_ptr, bot_len),
+                        front: read_str(data, front_ptr, front_len),
+                        back: read_str(data, back_ptr, back_len),
+                        left: read_str(data, left_ptr, left_len),
+                        right: read_str(data, right_ptr, right_len),
+                    };
+                    (name, faces)
+                };
+
+                let mut reg = caller.data().block_registry.lock().unwrap();
+                let id = reg.register_with_faces(&name, faces);
+                id.0 as i32
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_DATA_MODULE,
+            "read-file",
+            |mut caller: wasmtime::Caller<'_, HostState>,
+             path_ptr: i32,
+             path_len: i32,
+             out_ptr: i32,
+             max_len: i32|
+             -> i32 {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+
+                // Read path string from guest memory
+                let path = {
+                    let data = mem.data(&caller);
+                    let bytes = &data[path_ptr as usize..(path_ptr + path_len) as usize];
+                    std::str::from_utf8(bytes).unwrap_or("").to_owned()
+                };
+
+                let store = Arc::clone(&caller.data().data_store);
+                match store.read_file(&path) {
+                    None => 0,
+                    Some(contents) => {
+                        let write_len = contents.len().min(max_len as usize);
+                        let data = mem.data_mut(&mut caller);
+                        data[out_ptr as usize..out_ptr as usize + write_len]
+                            .copy_from_slice(&contents[..write_len]);
+                        write_len as i32
+                    }
+                }
             },
         )?;
 
@@ -208,11 +326,16 @@ pub struct WasmPlugin {
     layout: WasmMemoryLayout,
     memory_bytes: usize,
     block_registry: Arc<Mutex<cubic_world::BlockRegistry>>,
+    data_store: Arc<DataStore>,
     seed: u64,
 }
 
 impl WasmPlugin {
     pub fn load(path: &str, worker_count: usize, memory_mb: usize, seed: u64) -> Result<Self> {
+        let game_dir = std::path::Path::new(path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf();
         let engine = Engine::default();
         let bytes =
             std::fs::read(path).with_context(|| format!("failed to read game plugin: {path}"))?;
@@ -234,6 +357,7 @@ impl WasmPlugin {
             layout,
             memory_bytes,
             block_registry: Arc::new(Mutex::new(cubic_world::BlockRegistry::new())),
+            data_store: Arc::new(DataStore::new(&game_dir)),
             seed,
         })
     }
@@ -243,9 +367,35 @@ impl WasmPlugin {
             &self.engine,
             &self.module,
             Arc::clone(&self.block_registry),
+            Arc::clone(&self.data_store),
             self.memory_bytes,
             self.seed,
         )
+    }
+
+    /// Shared handle to the block registry the guest populates via
+    /// `on_load` (see `register-block`/`register-block-with-faces`).
+    pub fn block_registry(&self) -> Arc<Mutex<cubic_world::BlockRegistry>> {
+        Arc::clone(&self.block_registry)
+    }
+
+    /// Eagerly create a WASM instance on the calling thread, running the
+    /// guest's `on_load` synchronously so `block_registry` is populated
+    /// immediately — otherwise it only happens lazily on a worker thread's
+    /// first `generate()`/`is_definitely_air()` call, which is too late for
+    /// callers (like texture loading) that need it right after `load()`.
+    /// Worker threads still lazily create their own instances later; this
+    /// only guarantees one exists up front.
+    pub fn warm_up(&self) {
+        WASM_INSTANCE.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if opt.is_none() {
+                *opt = Some(
+                    self.make_instance()
+                        .expect("failed to warm up WASM instance"),
+                );
+            }
+        });
     }
 }
 
@@ -273,10 +423,8 @@ pub struct WasmWorldGenerator {
 }
 
 impl WasmWorldGenerator {
-    pub fn new(plugin: WasmPlugin) -> Self {
-        Self {
-            plugin: Arc::new(plugin),
-        }
+    pub fn new(plugin: Arc<WasmPlugin>) -> Self {
+        Self { plugin }
     }
 }
 

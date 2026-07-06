@@ -33,9 +33,28 @@ interface block-registry {
     /// Host function — game calls this during on-load to register a block type.
     /// Returns the BlockTypeId assigned by the engine.
     register-block: func(name: string) -> u32;
+
+    record face-def {
+        top: string,
+        bottom: string,
+        front: string,
+        back: string,
+        left: string,
+        right: string,
+    }
+
+    register-block-with-faces: func(name: string, faces: face-def) -> u32;
+}
+
+interface data {
+    /// Read a file from the game's data directory into a pre-allocated buffer.
+    /// Returns the actual number of bytes written, or 0 if the file doesn't exist.
+    /// max-len must be large enough to hold the file contents.
+    read-file: func(path: string, out-ptr: u32, max-len: u32) -> u32;
 }
 
 world game {
     export world-gen;
     import block-registry;
+    import data;
 }

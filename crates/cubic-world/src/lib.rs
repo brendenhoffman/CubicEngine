@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
 pub mod mesher;
-pub use mesher::mesh_chunk;
+pub use mesher::{mesh_chunk, BlockFaceTextures};
 pub mod generator;
 pub use generator::WorldGenerator;
 pub mod stream;
@@ -29,16 +29,33 @@ pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 // ---------------------------------------------------------------------------
 // BlockTypeId and BlockRegistry
 // ---------------------------------------------------------------------------
-
 /// Indexes into a `BlockRegistry`. Newtypes u32 so the type system prevents
 /// mixing block ids with other integers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct BlockTypeId(pub u32);
 
+#[derive(Clone, Debug)]
+pub struct FaceDef {
+    pub top: String,
+    pub bottom: String,
+    pub front: String,
+    pub back: String,
+    pub left: String,
+    pub right: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct BlockDef {
+    pub id: BlockTypeId,
+    pub name: String,
+    pub faces: FaceDef,
+}
+
 /// String-keyed registry of block types. `BlockTypeId(0)` is always "air"
 /// and is registered automatically on construction.
 pub struct BlockRegistry {
     map: HashMap<String, BlockTypeId>,
+    defs: Vec<BlockDef>,
     next_id: u32,
 }
 
@@ -53,6 +70,7 @@ impl BlockRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
             map: HashMap::new(),
+            defs: Vec::new(),
             next_id: 0,
         };
         reg.register("air"); // always BlockTypeId(0)
@@ -68,7 +86,36 @@ impl BlockRegistry {
         let id = BlockTypeId(self.next_id);
         self.next_id += 1;
         self.map.insert(name.to_owned(), id);
+        self.defs.push(BlockDef {
+            id,
+            name: name.to_owned(),
+            faces: FaceDef::none(), // placeholder — no textures
+        });
         id
+    }
+
+    pub fn register_with_faces(&mut self, name: &str, faces: FaceDef) -> BlockTypeId {
+        if let Some(&id) = self.map.get(name) {
+            return id;
+        }
+        let id = BlockTypeId(self.next_id);
+        self.next_id += 1;
+        self.map.insert(name.to_owned(), id);
+        self.defs.push(BlockDef {
+            id,
+            name: name.to_owned(),
+            faces,
+        });
+        id
+    }
+
+    pub fn get_def(&self, id: BlockTypeId) -> Option<&BlockDef> {
+        self.defs.get(id.0 as usize)
+    }
+
+    /// Iterate over every registered block definition (including "air").
+    pub fn all_defs(&self) -> impl Iterator<Item = &BlockDef> {
+        self.defs.iter()
     }
 
     /// Look up a block type by name without registering it.
@@ -79,6 +126,19 @@ impl BlockRegistry {
     /// The id for air (always 0).
     pub fn air() -> BlockTypeId {
         BlockTypeId(0)
+    }
+}
+
+impl FaceDef {
+    pub fn none() -> Self {
+        Self {
+            top: String::new(),
+            bottom: String::new(),
+            front: String::new(),
+            back: String::new(),
+            left: String::new(),
+            right: String::new(),
+        }
     }
 }
 

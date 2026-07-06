@@ -49,6 +49,7 @@ pub fn load_obj_mesh(path: &Path) -> Result<(Vec<Vertex>, Vec<u32>)> {
                 color: [1.0, 1.0, 1.0], // OBJ carries no per-vertex colour
                 uv,
                 normal,
+                tex_index: 0,
             });
         }
 

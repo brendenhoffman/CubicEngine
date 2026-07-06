@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use crate::{mesh_chunk, Chunk, ChunkPos, StreamDelta, WorldGenerator, WorldStream};
+use crate::{
+    mesh_chunk, BlockFaceTextures, Chunk, ChunkPos, StreamDelta, WorldGenerator, WorldStream,
+};
 use cubic_render::Vertex;
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -16,6 +18,7 @@ struct WorkItem {
     pos: ChunkPos,
     seed: u64,
     generator: Arc<dyn WorldGenerator>,
+    face_textures: Arc<BlockFaceTextures>,
 }
 
 struct WorkResult {
@@ -87,7 +90,8 @@ impl AsyncWorldStream {
                         match item {
                             Ok(work) => {
                                 let chunk = work.generator.generate(work.pos, work.seed);
-                                let (vertices, indices) = mesh_chunk(&chunk, [None; 6]);
+                                let (vertices, indices) =
+                                    mesh_chunk(&chunk, [None; 6], &work.face_textures);
                                 if vertices.is_empty() {
                                     // No geometry — pure air or fully buried solid.
                                     // Neighbors don't need to know since this chunk
@@ -139,6 +143,7 @@ impl AsyncWorldStream {
         center: ChunkPos,
         generator: &Arc<dyn WorldGenerator>,
         seed: u64,
+        face_textures: &Arc<BlockFaceTextures>,
     ) -> StreamDelta {
         let rxz = self.inner.radius_xz;
         let ry = self.inner.radius_y;
@@ -197,6 +202,7 @@ impl AsyncWorldStream {
                             pos,
                             seed,
                             generator: Arc::clone(generator),
+                            face_textures: Arc::clone(face_textures),
                         });
                     }
                 }

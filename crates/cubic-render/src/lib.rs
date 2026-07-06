@@ -18,6 +18,8 @@ pub struct Vertex {
     pub color: [f32; 3],
     pub uv: [f32; 2],
     pub normal: [f32; 3],
+    /// Index into the bindless texture array (see `PushData::tex_index`).
+    pub tex_index: u32,
 }
 
 /// Per-draw push-constant data: model matrix, tint colour, and bindless
@@ -60,4 +62,7 @@ pub trait Renderer {
     fn set_clear_color(&mut self, rgba: [f32; 4]);
     fn set_vsync(&mut self, _on: bool) {}
     fn free_mesh(&mut self, _handle: MeshHandle) {} // default no-op
+    fn upload_texture(&mut self, _pixels: &[u8], _width: u32, _height: u32) -> Result<u32> {
+        Ok(0) // default no-op
+    }
 }

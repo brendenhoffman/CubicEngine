@@ -10,3 +10,5 @@ crate-type = ["cdylib"]
 [dependencies]
 wit-bindgen = "0.58"
 noise = "0.9"
+toml = "0.9"
+serde = { version = "1", features = ["derive"] }
