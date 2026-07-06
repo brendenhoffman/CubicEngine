@@ -22,7 +22,7 @@ Our licensing differs from standard OSI/open-source licenses in order to:
 - 🚫 No harmful or illegal content (pornography, CSAM, etc).
 - 🔞 We will **never comply with age verification laws**. As a result, the game may be limited or unavailable in some regions. We make no guarantee of global availability.
 - 🔒 We will **never store or share personal information**.
-  - Servers may use encrypted client identifiers (IP address or hostname hash) for ban-evasion prevention.
+  - Servers may use client identifiers (IP address, username + random UUID, hardware ID) for ban-evasion prevention.
   - Third-party login systems (e.g., Steam) are subject to their own terms.
 
 For details, see:
