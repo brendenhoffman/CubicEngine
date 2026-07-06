@@ -28,6 +28,7 @@ const EXPORT_ON_LOAD: &str = "cubic:game/world-gen@0.1.0#on-load";
 const EXPORT_GENERATE: &str = "cubic:game/world-gen@0.1.0#generate";
 const EXPORT_IS_DEFINITELY_AIR: &str = "cubic:game/world-gen@0.1.0#is-definitely-air";
 const IMPORT_DATA_MODULE: &str = "cubic:game/data@0.1.0";
+const IMPORT_DATA_LIST_DIR: &str = "cubic:game/data@0.1.0";
 
 // ---------------------------------------------------------------------------
 // Memory layout
@@ -98,6 +99,26 @@ impl DataStore {
 
     pub fn add_mod_dir(&mut self, mod_dir: &std::path::Path) {
         self.dirs.push(mod_dir.join("data"));
+    }
+
+    pub fn list_dir(&self, path: &str) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+        // Iterate in reverse so later dirs (mods) override earlier (base game)
+        // For listing we want all files, deduped by filename — later wins
+        for dir in self.dirs.iter().rev() {
+            let full = dir.join(path);
+            if let Ok(entries) = std::fs::read_dir(&full) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if seen.insert(name.clone()) {
+                        result.push(name);
+                    }
+                }
+            }
+        }
+        result.sort(); // deterministic load order
+        result
     }
 }
 
@@ -237,6 +258,38 @@ impl WasmInstance {
                         write_len as i32
                     }
                 }
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_DATA_LIST_DIR,
+            "list-dir",
+            |mut caller: wasmtime::Caller<'_, HostState>,
+             path_ptr: i32,
+             path_len: i32,
+             out_ptr: i32,
+             max_len: i32|
+             -> i32 {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+
+                let path = {
+                    let data = mem.data(&caller);
+                    let bytes = &data[path_ptr as usize..(path_ptr + path_len) as usize];
+                    std::str::from_utf8(bytes).unwrap_or("").to_owned()
+                };
+
+                let store = Arc::clone(&caller.data().data_store);
+                let listing = store.list_dir(&path);
+                let result = listing.join("\n");
+                let bytes = result.as_bytes();
+                let write_len = bytes.len().min(max_len as usize);
+                let data = mem.data_mut(&mut caller);
+                data[out_ptr as usize..out_ptr as usize + write_len]
+                    .copy_from_slice(&bytes[..write_len]);
+                write_len as i32
             },
         )?;
 

@@ -51,6 +51,7 @@ interface data {
     /// Returns the actual number of bytes written, or 0 if the file doesn't exist.
     /// max-len must be large enough to hold the file contents.
     read-file: func(path: string, out-ptr: u32, max-len: u32) -> u32;
+    list-dir: func(path: string, out-ptr: u32, max-len: u32) -> u32;
 }
 
 world game {

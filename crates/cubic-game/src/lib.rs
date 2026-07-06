@@ -172,10 +172,18 @@ struct GamePlugin;
 
 impl Guest for GamePlugin {
     fn on_load(seed: u64) -> u32 {
-        // Register all block types from datapack
+        // Scan blocks/ directory and register all block definitions
         let mut block_ids: HashMap<String, u32> = HashMap::new();
-        for path in &["blocks/stone.toml", "blocks/dirt.toml", "blocks/grass.toml"] {
-            if let Some((name, faces)) = load_block(path) {
+        let mut buf = vec![0u8; 65536];
+        let len = cubic::game::data::list_dir("blocks", buf.as_mut_ptr() as u32, buf.len() as u32);
+        buf.truncate(len as usize);
+
+        for filename in std::str::from_utf8(&buf).unwrap_or("").lines() {
+            if !filename.ends_with(".toml") {
+                continue;
+            }
+            let path = format!("blocks/{filename}");
+            if let Some((name, faces)) = load_block(&path) {
                 let id = register_block_with_faces(
                     &name,
                     &FaceDef {
