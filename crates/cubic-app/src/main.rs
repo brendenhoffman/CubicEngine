@@ -18,7 +18,7 @@ use cubic_platform::winit::{
 };
 use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
 use cubic_render_gl::GlRenderer;
-use cubic_render_vk::{HdrFlavor, VkRenderer, VkVsyncMode};
+use cubic_render_vk::{Filter, HdrFlavor, SamplerMipmapMode, VkRenderer, VkVsyncMode};
 use cubic_wasm::{WasmPlugin, WasmWorldGenerator};
 use cubic_world::{
     mesh_chunk, world_pos_to_chunk, AsyncWorldStream, BlockFaceTextures, ChunkPos, WorldGenerator,
@@ -89,6 +89,16 @@ impl RendererBackend for Backend {
                 HdrFlavorCfg::PreferHdr10 => HdrFlavor::PreferHdr10,
             };
             r.set_hdr_flavor(flavor);
+
+            let filter = match cfg.texture_filter {
+                TextureFilter::Nearest => Filter::NEAREST,
+                TextureFilter::Linear => Filter::LINEAR,
+            };
+            let mipmap_mode = match cfg.mipmap_mode {
+                MipmapMode::Nearest => SamplerMipmapMode::NEAREST,
+                MipmapMode::Linear => SamplerMipmapMode::LINEAR,
+            };
+            r.set_sampler_config(filter, filter, mipmap_mode, cfg.anisotropy, cfg.lod_bias);
         }
     }
 
@@ -187,6 +197,22 @@ enum HdrFlavorCfg {
     PreferHdr10,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum TextureFilter {
+    Nearest,
+    #[default]
+    Linear,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum MipmapMode {
+    Nearest,
+    #[default]
+    Linear,
+}
+
 #[derive(Debug, Deserialize, Clone, Copy)]
 struct RenderCfg {
     #[serde(default = "default_clear")]
@@ -205,6 +231,14 @@ struct RenderCfg {
     hdr: bool,
     #[serde(default)]
     hdr_flavor: HdrFlavorCfg,
+    #[serde(default)]
+    texture_filter: TextureFilter,
+    #[serde(default)]
+    mipmap_mode: MipmapMode,
+    #[serde(default = "default_anisotropy")]
+    anisotropy: f32,
+    #[serde(default)]
+    lod_bias: f32,
 }
 
 impl Default for RenderCfg {
@@ -218,6 +252,10 @@ impl Default for RenderCfg {
             fps_when_vsync_off: 0,
             hdr: false,
             hdr_flavor: HdrFlavorCfg::PreferScrgb,
+            texture_filter: TextureFilter::Linear,
+            mipmap_mode: MipmapMode::Linear,
+            anisotropy: default_anisotropy(),
+            lod_bias: 0.0,
         }
     }
 }
@@ -227,6 +265,9 @@ fn default_clear() -> [f32; 4] {
 }
 fn default_vsync() -> bool {
     true
+}
+fn default_anisotropy() -> f32 {
+    0.0
 }
 fn load_cfg() -> AppCfg {
     match fs::read_to_string("cubic.toml") {

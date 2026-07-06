@@ -136,6 +136,12 @@ pub(crate) fn decide_path_and_create_device(
     feats12.shader_sampled_image_array_non_uniform_indexing = vk::TRUE;
     // Required by cmd_draw_indexed_indirect_count (GPU-driven indirect draw).
     feats12.draw_indirect_count = vk::TRUE;
+    // Anisotropic texture filtering (see cubic-app's texture_filter/anisotropy
+    // config). Enabled unconditionally, matching the other features above —
+    // actual max_anisotropy is capped per-sampler against
+    // physical_device_properties.limits.max_sampler_anisotropy, and a config
+    // of 0.0 disables it regardless (anisotropy_enable = FALSE on the sampler).
+    feats2.features.sampler_anisotropy = vk::TRUE;
 
     let (path, pnext): (RenderPath, *const std::ffi::c_void) = if !force_khr {
         let dev_api = unsafe { instance.get_physical_device_properties(phys).api_version };

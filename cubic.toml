@@ -1,5 +1,5 @@
 [render]
-clear_color = [0.02, 0.02, 0.04, 1.0]
+clear_color = [0.45, 0.65, 0.85, 1.0]
 hdr = true
 hdr_flavor = "prefer_scrgb"           # "prefer_scrgb" (safe default) | "prefer_hdr10"
 
@@ -10,6 +10,13 @@ fps_when_vsync_off = 60 # cap when vsync=false; omit or 0 to disable
 unfocused = "vsync_on" # "throttle" | "vsync_on" | "none"
 unfocused_fps = 30
 
+texture_filter = "nearest"   # "nearest" | "linear"
+mipmap_mode = "linear"      # "nearest" | "linear"
+anisotropy = 0.0             # 0.0 = disabled, 1.0-16.0 = anisotropic filtering
+lod_bias = 0.5               # offset applied to the sampled mip level; positive = blurrier, negative = sharper
+# Pixel art default is nearest/nearest/0.0/0.0. For smoother textures, switch to
+# linear/linear/16.0/0.5.
+
 [world]
 stream_radius = 8  # chunks in each direction; higher = more terrain visible, more GPU memory
 stream_radius_y = 4
@@ -18,7 +25,7 @@ upload_budget_ms = 0.0      # 0 = auto (25% of frame time target)
 upload_budget_min_ms = 0.5  # floor in ms, always upload at least this much
 
 [camera]
-move_speed = 100.0        # m/s; one chunk = 16 m, one voxel = 0.5 m
+move_speed = 10.0        # m/s; one chunk = 16 m, one voxel = 0.5 m
 mouse_sensitivity = 0.0025
 
 [game]
