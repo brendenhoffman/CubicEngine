@@ -3,7 +3,10 @@
 # Usage: fish tools/ci-local.fish [--full]
 #
 # Default: host-target clippy only (fast).
-# --full  runs the complete cross-target clippy matrix, same as CI.
+# --full  runs the cross-target clippy matrix, same as CI minus the two
+#         macOS targets — those can't be cross-compiled from Linux (no
+#         installable Apple SDK) and only run in CI's clippy-macos job,
+#         on an actual macos-latest runner.
 
 set -l fast 1
 for arg in $argv
@@ -53,24 +56,24 @@ else
     end
 end
 
-# ── 3. cubic-game (wasm32-wasip1) ─────────────────────────────────────────────
-# cubic-game only ever targets wasm32-wasip1 (excluded from workspace
+# ── 3. cubic-game (wasm32-unknown-unknown) ─────────────────────────────────────────────
+# cubic-game only ever targets wasm32-unknown-unknown (excluded from workspace
 # default-members for that reason), so the clippy matrix above never
 # actually verifies it — it only type-checks it against desktop targets.
 # This is the only step that builds/lints it for its real target.
-section "3/5  cubic-game (wasm32-wasip1)"
-rustup target add wasm32-wasip1 >/dev/null 2>&1
-if cargo clippy -p cubic-game --target wasm32-wasip1 --all-targets -- -D warnings
-    echo "✅  cubic-game clippy (wasm32-wasip1)"
+section "3/5  cubic-game (wasm32-unknown-unknown)"
+rustup target add wasm32-unknown-unknown >/dev/null 2>&1
+if cargo clippy -p cubic-game --target wasm32-unknown-unknown --all-targets -- -D warnings
+    echo "✅  cubic-game clippy (wasm32-unknown-unknown)"
 else
-    echo "❌  cubic-game clippy (wasm32-wasip1)"
+    echo "❌  cubic-game clippy (wasm32-unknown-unknown)"
     set -a failed "cubic-game-clippy"
 end
 
-if cargo build -p cubic-game --target wasm32-wasip1 --release
-    echo "✅  cubic-game build (wasm32-wasip1)"
+if cargo build -p cubic-game --target wasm32-unknown-unknown --release
+    echo "✅  cubic-game build (wasm32-unknown-unknown)"
 else
-    echo "❌  cubic-game build (wasm32-wasip1)"
+    echo "❌  cubic-game build (wasm32-unknown-unknown)"
     set -a failed "cubic-game-build"
 end
 

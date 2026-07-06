@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
 wit_bindgen::generate!({
     world: "game",
     path: "../cubic-wasm/wit/game.wit",
@@ -261,7 +262,7 @@ impl Guest for GamePlugin {
                         noise_gen
                             .surface_rules
                             .iter()
-                            .find(|r| r.max_depth.map_or(true, |d| depth_voxels <= d))
+                            .find(|r| r.max_depth.is_none_or(|d| depth_voxels <= d))
                             .map(|r| r.block_id)
                             .unwrap_or(noise_gen.fallback_id)
                     } else {

@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# aarch64-apple-darwin and x86_64-apple-darwin are deliberately excluded:
+# cross-compiling to macOS from Linux needs Apple's SDK, which can't be
+# fetched by a package manager, so there's no way to make these pass locally.
+# CI checks them on an actual macos-latest runner instead (see ci.yml).
 TARGETS=(
-  aarch64-apple-darwin
   aarch64-pc-windows-msvc
   aarch64-unknown-linux-gnu
   armv7-unknown-linux-gnueabihf
   i686-unknown-linux-gnu
   powerpc64-unknown-linux-gnu
   riscv64gc-unknown-linux-gnu
-  x86_64-apple-darwin
   x86_64-pc-windows-msvc
   x86_64-unknown-linux-gnu
 )

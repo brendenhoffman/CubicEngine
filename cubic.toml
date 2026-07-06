@@ -16,6 +16,7 @@ anisotropy = 0.0             # 0.0 = disabled, 1.0-16.0 = anisotropic filtering
 lod_bias = 0.5               # offset applied to the sampled mip level; positive = blurrier, negative = sharper
 # Pixel art default is nearest/nearest/0.0/0.0. For smoother textures, switch to
 # linear/linear/16.0/0.5.
+# anisotropy + nearest is unreliable across GPU vendors. Intel may have issues.
 
 [world]
 stream_radius = 8  # chunks in each direction; higher = more terrain visible, more GPU memory
