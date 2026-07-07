@@ -16,6 +16,7 @@ use cubic_render::{RenderSize, Renderer};
 use gpu_allocator::vulkan::{Allocation, Allocator, AllocatorCreateDesc};
 use gpu_allocator::MemoryLocation;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use device::{decide_path_and_create_device, select_device_and_queue, RenderPath};
@@ -206,6 +207,21 @@ pub struct VkRenderer {
     // run); set_sampler_config() overrides it with the real cubic.toml
     // values immediately after construction, before any real textures load.
     sampler_config: SamplerConfig,
+
+    // egui overlay support (GPU plumbing only — no egui::Context or input
+    // handling here; that lives in cubic-app). Option because it's created
+    // after the swapchain exists, not at struct-literal time.
+    egui_renderer: Option<egui_ash_renderer::Renderer>,
+    // Staged by queue_egui(), consumed by the next render() call.
+    egui_pending: Option<EguiFrame>,
+}
+
+struct EguiFrame {
+    textures_delta: egui::TexturesDelta,
+    paint_jobs: Vec<egui::ClippedPrimitive>,
+    screen_width: u32,
+    screen_height: u32,
+    pixels_per_point: f32,
 }
 
 // STRICT TEARDOWN ORDER:
@@ -246,6 +262,12 @@ impl Drop for VkRenderer {
             // 2) QUIESCE DEVICE (covers any remaining queue work)
             d.device_wait_idle().ok();
         }
+
+        // Drop the egui overlay renderer before the device: it owns a
+        // pipeline, descriptor pool/layout, and any managed textures
+        // (allocated via its own private gpu-allocator instance), all of
+        // which must be torn down against a still-valid device.
+        self.egui_renderer.take();
 
         // Device is fully idle, so every trashed resource is now safe to
         // destroy regardless of its retirement value.
@@ -521,6 +543,18 @@ fn is_device_lost(e: vk::Result) -> bool {
     e == vk::Result::ERROR_DEVICE_LOST
 }
 
+/// True if `format` needs `Options::srgb_framebuffer = true` for egui:
+/// egui always outputs linear color, so the sRGB conversion must happen
+/// either via the swapchain image's sRGB view (B8G8R8A8/R8G8B8A8_SRGB) or
+/// be treated as already-linear by the shader (R16G16B16A16_SFLOAT scRGB).
+#[inline]
+fn format_needs_srgb_egui(format: vk::Format) -> bool {
+    matches!(
+        format,
+        vk::Format::B8G8R8A8_SRGB | vk::Format::R8G8B8A8_SRGB | vk::Format::R16G16B16A16_SFLOAT
+    )
+}
+
 // 8) Orchestration helpers
 fn make_initial_swapchain_resources(inp: &SwapchainInitInput) -> Result<SwapchainInit> {
     let bundle = create_swapchain_bundle(
@@ -685,6 +719,41 @@ fn build_renderer(
     };
     let (sc, cmd, (pipeline_layout, pipeline), acq_slots, frames) =
         make_initial_swapchain_resources(&init_inp)?;
+
+    // Egui overlay renderer. Uses its own private gpu-allocator instance
+    // (rather than sharing `allocator` above) so wiring this in doesn't
+    // require touching any of that allocator's many existing call sites;
+    // the only owner of this Arc is `egui_renderer` itself once
+    // `with_gpu_allocator` returns, so it's torn down when the renderer is
+    // (see the explicit `egui_renderer.take()` in Drop).
+    let egui_gpu_allocator = Arc::new(Mutex::new(Allocator::new(&AllocatorCreateDesc {
+        instance: instance.clone(),
+        device: device.clone(),
+        physical_device: phys,
+        debug_settings: Default::default(),
+        buffer_device_address: false,
+        allocation_sizes: Default::default(),
+    })?));
+    let egui_renderer = Some(egui_ash_renderer::Renderer::with_gpu_allocator(
+        egui_gpu_allocator,
+        device.clone(),
+        egui_ash_renderer::DynamicRendering {
+            color_attachment_format: sc.format,
+            // egui draws inside the same cmd_begin_rendering scope as the
+            // scene (see record_egui), which always binds the real depth
+            // attachment — Vulkan requires the bound pipeline's declared
+            // depthAttachmentFormat to match whenever one is bound, even if
+            // this pipeline doesn't test/write depth (both disabled via
+            // Options below).
+            depth_attachment_format: Some(depth_format),
+        },
+        egui_ash_renderer::Options {
+            srgb_framebuffer: format_needs_srgb_egui(sc.format),
+            in_flight_frames: sc.image_views.len().max(1),
+            ..Default::default()
+        },
+    )?);
+
     let (depth_image, depth_alloc, depth_view) =
         create_depth_resources(&device, &mut allocator, sc.extent, depth_format)?;
 
@@ -844,6 +913,8 @@ fn build_renderer(
         next_tex_index: 1,
         tex_store: Vec::new(),
         sampler_config,
+        egui_renderer,
+        egui_pending: None,
     };
 
     Ok(r)
@@ -916,6 +987,26 @@ impl VkRenderer {
             max_anisotropy,
             lod_bias,
         };
+    }
+
+    /// Stage an egui frame (tessellated paint jobs + texture updates) to be
+    /// drawn on top of the scene during the next render() call. Consumed
+    /// and cleared by that call; call again each frame you want an overlay.
+    pub fn queue_egui(
+        &mut self,
+        textures_delta: egui::TexturesDelta,
+        paint_jobs: Vec<egui::ClippedPrimitive>,
+        screen_width: u32,
+        screen_height: u32,
+        pixels_per_point: f32,
+    ) {
+        self.egui_pending = Some(EguiFrame {
+            textures_delta,
+            paint_jobs,
+            screen_width,
+            screen_height,
+            pixels_per_point,
+        });
     }
 
     #[inline]
@@ -1375,6 +1466,36 @@ impl VkRenderer {
         unsafe { self.device.cmd_pipeline_barrier2(cmd, &dep_post) };
     }
 
+    /// Draw a staged egui frame (see queue_egui) into `cmd`. Must be called
+    /// while `cmd` is inside an active dynamic-rendering scope (between
+    /// begin_rendering and cmd_end_rendering) targeting the same color
+    /// attachment format the egui renderer was built with, and before that
+    /// image transitions to PRESENT_SRC_KHR. No-op if nothing is staged.
+    fn record_egui(&mut self, cmd: vk::CommandBuffer) -> Result<()> {
+        let Some(frame) = self.egui_pending.take() else {
+            return Ok(());
+        };
+        let Some(renderer) = self.egui_renderer.as_mut() else {
+            return Ok(());
+        };
+        // Must run before cmd_draw uploads/binds the textures it references.
+        renderer.set_textures(self.queue, self.cmd_pool, frame.textures_delta.set.as_slice())?;
+        renderer.cmd_draw(
+            cmd,
+            vk::Extent2D {
+                width: frame.screen_width,
+                height: frame.screen_height,
+            },
+            frame.pixels_per_point,
+            &frame.paint_jobs,
+        )?;
+        // Safe to free immediately: cmd_draw only records commands (it
+        // doesn't submit), and set_textures's uploads are already
+        // synchronously complete (queue_wait_idle) by the time it returns.
+        renderer.free_textures(frame.textures_delta.free.as_slice())?;
+        Ok(())
+    }
+
     /// Dispatches the no-op compute pipeline, bracketed by compute<->graphics
     /// barriers, purely to validate the compute pipeline/dispatch/sync path
     /// (see "Add compute pipeline infrastructure"). Does no real work yet;
@@ -1384,7 +1505,7 @@ impl VkRenderer {
     // render()) — safe to reset because acquire_next_image only returns an
     // image index once the GPU is done with its previous use.
     fn record_one_command(
-        &self,
+        &mut self,
         cmd: vk::CommandBuffer,
         image: vk::Image,
         image_view: vk::ImageView,
@@ -1409,6 +1530,9 @@ impl VkRenderer {
         self.begin_rendering(cmd, image_view);
         // Phase 2: indirect draw — inside the render pass.
         self.record_indirect_draws(cmd, image_index)?;
+        // Egui overlay, if queued — still inside the render pass, on top of
+        // the scene, before the image transitions to present.
+        self.record_egui(cmd)?;
         unsafe { self.device.cmd_end_rendering(cmd) };
         self.transition_to_present(cmd, image);
 
@@ -1776,6 +1900,23 @@ impl VkRenderer {
             });
             self.pipeline_layout = new_layout;
             self.pipeline = new_pipeline;
+
+            // The egui pipeline is built against a fixed color format too
+            // (see build_renderer); left stale here, cmd_begin_rendering's
+            // new-format attachment wouldn't match it and every egui draw
+            // would hit VUID-vkCmdDrawIndexed-dynamicRenderingUnusedAttachments-08910.
+            // NB: this doesn't update Options::srgb_framebuffer (baked in at
+            // construction), so if a format change ever crosses the
+            // sRGB-view/HDR10-PQ/UNORM boundary (see format_needs_srgb_egui)
+            // rather than just changing bit layout, egui's colors would be
+            // off (not a crash) until the renderer is fully reconstructed —
+            // not a case this engine's flavor selection hits today.
+            if let Some(egui_renderer) = self.egui_renderer.as_mut() {
+                let _ = egui_renderer.set_dynamic_rendering(egui_ash_renderer::DynamicRendering {
+                    color_attachment_format: self.format,
+                    depth_attachment_format: Some(self.depth_format),
+                });
+            }
         }
 
         // 7) Resize CBs if image count changed
@@ -1957,7 +2098,7 @@ impl Renderer for VkRenderer {
         };
 
         let img = image_index as usize;
-        let f_img = &self.frames[img];
+        let render_finished = self.frames[img].render_finished;
         let cmd = self.cmd_bufs[img];
         let aspect = self.extent.width as f32 / self.extent.height as f32;
         self.update_camera_ubo_for_image(img, &self.camera, aspect)?;
@@ -1975,7 +2116,7 @@ impl Renderer for VkRenderer {
 
         // Build the semaphore infos
         let wait_acquire = semaphore_submit_info_wait(acq_sem, 0, stage2_color);
-        let signal_present = semaphore_submit_info_signal(f_img.render_finished, 0, stage2_color);
+        let signal_present = semaphore_submit_info_signal(render_finished, 0, stage2_color);
         let signal_timeline = semaphore_submit_info_signal(self.timeline, next_value, stage2_color);
 
         // IMPORTANT: store in locals so the pointers in SubmitInfo2 stay valid
@@ -2026,7 +2167,7 @@ impl Renderer for VkRenderer {
         let present = vk::PresentInfoKHR {
             s_type: vk::StructureType::PRESENT_INFO_KHR,
             wait_semaphore_count: 1,
-            p_wait_semaphores: &f_img.render_finished,
+            p_wait_semaphores: &render_finished,
             swapchain_count: 1,
             p_swapchains: &self.swapchain,
             p_image_indices: &image_index,

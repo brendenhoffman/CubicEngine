@@ -32,3 +32,20 @@ mouse_sensitivity = 0.0025
 [game]
 path = "games/cubic-game/game.wasm"
 wasm_memory_mb = 16
+
+[controls]
+forward = "KeyW"
+back = "KeyS"
+left = "KeyA"
+right = "KeyD"
+jump = "Space"
+sneak = "ShiftLeft"
+toggle_diagnostics = "F3"
+
+[launcher]
+# Fixed size of the launcher screen's own window. Not a "setting" — no
+# in-app UI to change this, no per-profile/game override. The game's own
+# windowed-launch size is a separate, per-profile choice made in the
+# launcher's Window section (next to the Launch button).
+width = 800
+height = 600
