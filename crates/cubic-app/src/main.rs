@@ -725,8 +725,7 @@ fn resolve_controls(cfg: &AppCfg) -> ResolvedControls {
         right: str_to_keycode(&cfg.controls.right).unwrap_or(KeyCode::KeyD),
         jump: str_to_keycode(&cfg.controls.jump).unwrap_or(KeyCode::Space),
         sneak: str_to_keycode(&cfg.controls.sneak).unwrap_or(KeyCode::ShiftLeft),
-        toggle_diagnostics: str_to_keycode(&cfg.controls.toggle_diagnostics)
-            .unwrap_or(KeyCode::F3),
+        toggle_diagnostics: str_to_keycode(&cfg.controls.toggle_diagnostics).unwrap_or(KeyCode::F3),
     }
 }
 
@@ -1659,7 +1658,11 @@ impl ApplicationHandler for App {
         let now = std::time::Instant::now();
         if now.duration_since(self.last_fps_instant).as_secs_f32() >= 1.0 {
             self.last_fps = self.frames;
-            info!("fps ~ {} | loaded={}", self.last_fps, self.chunk_meshes.len());
+            info!(
+                "fps ~ {} | loaded={}",
+                self.last_fps,
+                self.chunk_meshes.len()
+            );
             self.frames = 0;
             self.last_fps_instant = now;
         }
@@ -1901,10 +1904,7 @@ impl App {
                         // WindowEvent::Resized handler.
                         window.set_maximized(true);
                         self.pending_windowed_resize =
-                            Some(PendingWindowedResize::AwaitingMaximizeConfirm {
-                                width,
-                                height,
-                            });
+                            Some(PendingWindowedResize::AwaitingMaximizeConfirm { width, height });
                     }
                 }
                 WindowMode::Maximized => {
@@ -1933,7 +1933,10 @@ impl App {
     /// Save the launcher's current window mode/size into the active
     /// profile so it's remembered next time this profile is used.
     fn persist_window_prefs(&mut self) {
-        let prefs = self.current_profile.window.get_or_insert_with(Default::default);
+        let prefs = self
+            .current_profile
+            .window
+            .get_or_insert_with(Default::default);
         prefs.mode = Some(window_mode_to_str(self.launcher.window_mode).to_string());
         prefs.width = self.launcher.window_width_str.parse().ok();
         prefs.height = self.launcher.window_height_str.parse().ok();
@@ -2105,7 +2108,10 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("Anisotropy");
                     changed |= ui
-                        .add(egui::Slider::new(&mut self.cfg.render.anisotropy, 0.0..=16.0))
+                        .add(egui::Slider::new(
+                            &mut self.cfg.render.anisotropy,
+                            0.0..=16.0,
+                        ))
                         .changed();
                 });
 
@@ -2275,7 +2281,10 @@ impl App {
         // Persist into the profile override (not just self.cfg, which is
         // the resolved in-memory config and isn't what gets written to
         // disk) so the remap survives restart.
-        let ctrl = self.current_profile.controls.get_or_insert_with(Default::default);
+        let ctrl = self
+            .current_profile
+            .controls
+            .get_or_insert_with(Default::default);
         match binding {
             "forward" => ctrl.forward = Some(key_name.to_string()),
             "back" => ctrl.back = Some(key_name.to_string()),
@@ -2405,8 +2414,7 @@ fn main() -> Result<()> {
 
     let game_name = "cubic-game".to_string();
     let profile_name = "default".to_string();
-    let current_profile =
-        profile::load_or_create(&game_name, &profile_name).unwrap_or_default();
+    let current_profile = profile::load_or_create(&game_name, &profile_name).unwrap_or_default();
     tracing::info!(
         "profile: {}",
         profile::profile_toml_path(&game_name, &profile_name).display()

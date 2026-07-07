@@ -1479,7 +1479,11 @@ impl VkRenderer {
             return Ok(());
         };
         // Must run before cmd_draw uploads/binds the textures it references.
-        renderer.set_textures(self.queue, self.cmd_pool, frame.textures_delta.set.as_slice())?;
+        renderer.set_textures(
+            self.queue,
+            self.cmd_pool,
+            frame.textures_delta.set.as_slice(),
+        )?;
         renderer.cmd_draw(
             cmd,
             vk::Extent2D {

@@ -108,7 +108,24 @@ allow = [
 confidence-threshold = 0.8
 # Allow 1 or more licenses on a per-crate basis, so that particular licenses
 # aren't accepted for every possible crate as with the normal allow list
-exceptions = []
+exceptions = [
+  # Windows clipboard backend, pulled in transitively via egui-winit ->
+  # arboard. BSL-1.0 is permissive/OSI-approved/FSF-free; scoped to these
+  # two crates rather than blanket-allowed since it's not otherwise used
+  # anywhere in the dependency graph.
+  { allow = ["BSL-1.0"], crate = "clipboard-win" },
+  { allow = ["BSL-1.0"], crate = "error-code" },
+  # Pulled in transitively via dirs -> dirs-sys (XDG directory lookup, used
+  # by the profile system). MPL-2.0 is weak (file-level) copyleft -- it
+  # doesn't affect the rest of this codebase's licensing -- but scoped to
+  # this one crate rather than blanket-allowed since it's the only MPL-2.0
+  # dependency in the graph.
+  { allow = ["MPL-2.0"], crate = "option-ext" },
+  # Bundled default font assets for egui. OFL-1.1/Ubuntu-font-1.0 cover the
+  # font files themselves (the crate's own code is MIT OR Apache-2.0,
+  # already globally allowed above).
+  { allow = ["OFL-1.1", "Ubuntu-font-1.0"], crate = "epaint_default_fonts" },
+]
 
 # Some crates don't have (easily) machine readable licensing information,
 # adding a clarification entry for it allows you to manually specify the
