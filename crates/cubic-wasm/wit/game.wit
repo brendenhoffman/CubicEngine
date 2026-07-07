@@ -46,6 +46,28 @@ interface block-registry {
     register-block-with-faces: func(name: string, faces: face-def) -> u32;
 }
 
+interface physics {
+    record sweep-result {
+        x: f32,
+        y: f32,
+        z: f32,
+        hit-x: bool,
+        hit-y: bool,
+        hit-z: bool,
+    }
+
+    /// Writes SweepResult into out-ptr: [x: f32, y: f32, z: f32, hit_x: i32, hit_y: i32, hit_z: i32]
+    /// Total: 6 * 4 = 24 bytes
+    sweep-aabb: func(
+        ox: f32, oy: f32, oz: f32,
+        dx: f32, dy: f32, dz: f32,
+        half-w: f32, height: f32, half-d: f32,
+        out-ptr: u32,
+    ) -> u32;
+
+    is-solid: func(x: f32, y: f32, z: f32) -> bool;
+}
+
 interface data {
     /// Read a file from the game's data directory into a pre-allocated buffer.
     /// Returns the actual number of bytes written, or 0 if the file doesn't exist.
@@ -54,8 +76,38 @@ interface data {
     list-dir: func(path: string, out-ptr: u32, max-len: u32) -> u32;
 }
 
+interface input {
+    record input-state {
+        move-forward: bool,
+        move-back: bool,
+        move-left: bool,
+        move-right: bool,
+        jump: bool,
+        sneak: bool,
+        look-dx: f32,
+        look-dy: f32,
+    }
+
+    /// Writes an input-state into out-ptr: [move_forward: i32, move_back: i32,
+    /// move_left: i32, move_right: i32, jump: i32, sneak: i32, look_dx: f32,
+    /// look_dy: f32]. Total: 8 * 4 = 32 bytes.
+    get-input: func(out-ptr: u32) -> u32;
+}
+
+interface camera {
+    set-camera: func(x: f32, y: f32, z: f32, yaw: f32, pitch: f32);
+}
+
+interface tick {
+    on-tick: func(dt: f32);
+}
+
 world game {
     export world-gen;
+    export tick;
     import block-registry;
     import data;
+    import physics;
+    import input;
+    import camera;
 }

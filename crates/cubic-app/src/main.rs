@@ -22,7 +22,10 @@ use cubic_platform::winit::{
 use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
 use cubic_render_gl::GlRenderer;
 use cubic_render_vk::{Filter, HdrFlavor, SamplerMipmapMode, VkRenderer, VkVsyncMode};
-use cubic_wasm::{WasmPlugin, WasmWorldGenerator};
+use cubic_wasm::{
+    clear_tick_query, set_tick_input, set_tick_query, take_camera_update, InputSnapshot,
+    WasmPlugin, WasmWorldGenerator,
+};
 use cubic_world::{
     mesh_chunk, world_pos_to_chunk, AsyncWorldStream, BlockFaceTextures, ChunkPos, WorldGenerator,
     CHUNK_SIZE, VOXEL_SIZE,
@@ -1129,6 +1132,10 @@ struct App {
     // plugin (and generator, which just wraps it) fresh on every launch.
     generator: Option<Arc<dyn WorldGenerator>>,
     plugin: Option<Arc<WasmPlugin>>,
+    // Same generator as `generator`, but concretely typed so on_tick can be
+    // called — `Arc<dyn WorldGenerator>` doesn't expose `tick`. Both are set
+    // together in load_world().
+    wasm_game: Option<Arc<WasmWorldGenerator>>,
     chunk_meshes: HashMap<ChunkPos, MeshHandle>,
     seed: u64,
     camera: Camera,
@@ -1451,6 +1458,44 @@ impl ApplicationHandler for App {
                 if let Some(backend) = &mut self.backend {
                     // Scene render only when world is active
                     if self.state == AppState::InGame || self.state == AppState::Paused {
+                        // --- Physics tick ---
+                        // Bracket on_tick with a chunk-query view borrowed
+                        // from self.stream: queries happen on the main
+                        // thread, sequentially, before the streaming update
+                        // below mutates chunks, so no locking or copying is
+                        // needed — just a borrow scoped to this call.
+                        let view = self.stream.query_view();
+                        set_tick_query(&view);
+
+                        // take_mouse_delta() is consumed here for the game
+                        // tick — apply_input() skips its own yaw/pitch
+                        // update whenever wasm_game is active (see its doc
+                        // comment) so the delta isn't double-applied.
+                        let (look_dx, look_dy) = self.input.take_mouse_delta();
+                        let snap = InputSnapshot {
+                            move_forward: self.input.is_held(self.controls.forward),
+                            move_back: self.input.is_held(self.controls.back),
+                            move_left: self.input.is_held(self.controls.left),
+                            move_right: self.input.is_held(self.controls.right),
+                            jump: self.input.is_held(self.controls.jump),
+                            sneak: self.input.is_held(self.controls.sneak),
+                            look_dx: look_dx * self.cfg.camera.mouse_sensitivity,
+                            look_dy: look_dy * self.cfg.camera.mouse_sensitivity,
+                        };
+                        set_tick_input(snap);
+
+                        if let Some(game) = &self.wasm_game {
+                            game.tick(dt);
+                        }
+
+                        if let Some(cam) = take_camera_update() {
+                            self.camera.position = Vec3::new(cam.x, cam.y, cam.z);
+                            self.camera.yaw = cam.yaw;
+                            self.camera.pitch = cam.pitch;
+                        }
+
+                        clear_tick_query();
+
                         // --- Stream update ---
                         let center = world_pos_to_chunk(self.camera.position);
                         let delta = self.stream.update(
@@ -1677,36 +1722,46 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// Free-fly camera controls, used only while no WASM game is loaded
+    /// (`wasm_game.is_none()`) — once one is, RedrawRequested's tick handler
+    /// feeds input/mouse-look into the guest via on-tick instead, and the
+    /// guest owns the camera via set-camera. Skipping both blocks here below
+    /// avoids double-applying the same mouse delta to the camera.
     fn apply_input(&mut self, dt: f32) {
-        let (dx, dy) = self.input.take_mouse_delta();
-        self.camera.yaw -= dx * self.cfg.camera.mouse_sensitivity;
-        self.camera.pitch = (self.camera.pitch - dy * self.cfg.camera.mouse_sensitivity)
-            .clamp(-MAX_PITCH, MAX_PITCH);
-
-        let forward = self.camera.forward();
-        let right = forward.cross(Vec3::Y).normalize_or_zero();
-        let mut movement = Vec3::ZERO;
-
-        if self.input.is_held(self.controls.forward) {
-            movement += forward;
-        }
-        if self.input.is_held(self.controls.back) {
-            movement -= forward;
-        }
-        if self.input.is_held(self.controls.right) {
-            movement += right;
-        }
-        if self.input.is_held(self.controls.left) {
-            movement -= right;
-        }
-        if self.input.is_held(self.controls.jump) {
-            movement += Vec3::Y;
-        }
-        if self.input.is_held(self.controls.sneak) {
-            movement -= Vec3::Y;
+        if self.wasm_game.is_none() {
+            let (dx, dy) = self.input.take_mouse_delta();
+            self.camera.yaw -= dx * self.cfg.camera.mouse_sensitivity;
+            self.camera.pitch = (self.camera.pitch - dy * self.cfg.camera.mouse_sensitivity)
+                .clamp(-MAX_PITCH, MAX_PITCH);
         }
 
-        self.camera.position += movement.normalize_or_zero() * self.cfg.camera.move_speed * dt;
+        if self.wasm_game.is_none() {
+            let forward = self.camera.forward();
+            let right = forward.cross(Vec3::Y).normalize_or_zero();
+            let mut movement = Vec3::ZERO;
+
+            if self.input.is_held(self.controls.forward) {
+                movement += forward;
+            }
+            if self.input.is_held(self.controls.back) {
+                movement -= forward;
+            }
+            if self.input.is_held(self.controls.right) {
+                movement += right;
+            }
+            if self.input.is_held(self.controls.left) {
+                movement -= right;
+            }
+            if self.input.is_held(self.controls.jump) {
+                movement += Vec3::Y;
+            }
+            if self.input.is_held(self.controls.sneak) {
+                movement -= Vec3::Y;
+            }
+
+            self.camera.position +=
+                movement.normalize_or_zero() * self.cfg.camera.move_speed * dt;
+        }
     }
 
     /// Apply a new window size to render_size/paused/backend — shared by
@@ -1807,8 +1862,9 @@ impl App {
         // loading below sees a populated registry immediately.
         plugin.warm_up();
         self.plugin = Some(Arc::clone(&plugin));
-        self.generator =
-            Some(Arc::new(WasmWorldGenerator::new(Arc::clone(&plugin))) as Arc<dyn WorldGenerator>);
+        let wasm_gen = Arc::new(WasmWorldGenerator::new(Arc::clone(&plugin)));
+        self.generator = Some(Arc::clone(&wasm_gen) as Arc<dyn WorldGenerator>);
+        self.wasm_game = Some(wasm_gen);
 
         // Load textures
         if let Some(backend) = &mut self.backend {
@@ -2504,6 +2560,7 @@ fn main() -> Result<()> {
         ),
         generator: None,
         plugin: None,
+        wasm_game: None,
         chunk_meshes: HashMap::new(),
         seed,
         cfg,

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use crate::physics::ChunkQuery;
 use crate::{
-    mesh_chunk, BlockFaceTextures, Chunk, ChunkPos, StreamDelta, WorldGenerator, WorldStream,
+    mesh_chunk, BlockFaceTextures, BlockTypeId, Chunk, ChunkPos, StreamDelta, WorldGenerator,
+    WorldStream,
 };
 use cubic_render::Vertex;
 use std::collections::{HashMap, HashSet};
@@ -31,6 +33,16 @@ struct WorkResult {
 // ---------------------------------------------------------------------------
 // AsyncWorldStream
 // ---------------------------------------------------------------------------
+
+pub struct ChunkQueryView<'a> {
+    chunks: &'a HashMap<ChunkPos, Chunk>,
+}
+
+impl ChunkQuery for ChunkQueryView<'_> {
+    fn get_block_at(&self, wx: f32, wy: f32, wz: f32) -> BlockTypeId {
+        self.chunks.get_block_at(wx, wy, wz)
+    }
+}
 
 /// Wraps `WorldStream` with a background worker pool so chunk generation
 /// never blocks the main thread. Call `update` each frame exactly like
@@ -277,6 +289,12 @@ impl AsyncWorldStream {
     pub fn mark_remeshed(&mut self, pos: ChunkPos) {
         let mask = neighbor_mask(&self.inner.chunks, pos);
         self.remeshed_with.insert(pos, mask);
+    }
+
+    pub fn query_view(&self) -> ChunkQueryView<'_> {
+        ChunkQueryView {
+            chunks: &self.inner.chunks,
+        }
     }
 }
 

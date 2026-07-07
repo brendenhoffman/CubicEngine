@@ -5,10 +5,14 @@ wit_bindgen::generate!({
     path: "../cubic-wasm/wit/game.wit",
 });
 
+mod player;
+
 use cubic::game::block_registry::{FaceDef, register_block_with_faces};
 use exports::cubic::game::world_gen::Guest;
 use noise::{NoiseFn, OpenSimplex};
+use player::{InputState, Player};
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
@@ -151,6 +155,18 @@ fn load_block(path: &str) -> Option<(String, [String; 6])> {
 
 static GENERATOR: OnceLock<NoiseGenerator> = OnceLock::new();
 
+// RefCell isn't Sync, so it can't sit in a OnceLock static as-is even
+// though this module only ever runs on one thread (no wasm threads
+// proposal in use here). Wrap it so the Sync bound OnceLock's static
+// storage requires is satisfiable.
+struct PlayerCell(RefCell<Player>);
+// Safety: this WASM guest instance is only ever driven from a single
+// thread (see the section comment above), so RefCell's lack of Sync is
+// never actually exercised.
+unsafe impl Sync for PlayerCell {}
+
+static PLAYER: OnceLock<PlayerCell> = OnceLock::new();
+
 fn generator() -> &'static NoiseGenerator {
     GENERATOR
         .get()
@@ -235,6 +251,10 @@ impl Guest for GamePlugin {
             })
             .unwrap_or_else(|_| panic!("on_load called twice"));
 
+        PLAYER
+            .set(PlayerCell(RefCell::new(Player::new())))
+            .unwrap_or_else(|_| panic!("on_load called twice"));
+
         0
     }
 
@@ -283,6 +303,32 @@ impl Guest for GamePlugin {
         let chunk_y_min = (cy as f32) * (CHUNK_SIZE as f32) * VOXEL_SIZE;
         let chunk_y_max = chunk_y_min + (CHUNK_SIZE as f32) * VOXEL_SIZE;
         chunk_y_min > noise_gen.max_possible_height() || chunk_y_max <= 0.0
+    }
+}
+
+impl exports::cubic::game::tick::Guest for GamePlugin {
+    fn on_tick(dt: f32) {
+        // Read input from host — out-ptr pattern, 32 bytes. Stack-allocated
+        // is fine; see the matching note on the sweep-aabb buffer in
+        // player.rs.
+        let mut buf = [0u8; 32];
+        cubic::game::input::get_input(buf.as_mut_ptr() as u32);
+
+        let input_state = InputState {
+            move_forward: i32::from_le_bytes(buf[0..4].try_into().unwrap()) != 0,
+            move_back: i32::from_le_bytes(buf[4..8].try_into().unwrap()) != 0,
+            move_left: i32::from_le_bytes(buf[8..12].try_into().unwrap()) != 0,
+            move_right: i32::from_le_bytes(buf[12..16].try_into().unwrap()) != 0,
+            jump: i32::from_le_bytes(buf[16..20].try_into().unwrap()) != 0,
+            sneak: i32::from_le_bytes(buf[20..24].try_into().unwrap()) != 0,
+            look_dx: f32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            look_dy: f32::from_le_bytes(buf[28..32].try_into().unwrap()),
+        };
+
+        if let Some(player_cell) = PLAYER.get() {
+            let mut player = player_cell.0.borrow_mut();
+            player.tick(dt, &input_state);
+        }
     }
 }
 

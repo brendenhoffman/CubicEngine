@@ -8,6 +8,8 @@ pub mod stream;
 pub use stream::{world_pos_to_chunk, StreamDelta, WorldStream};
 pub mod stream_pool;
 pub use stream_pool::AsyncWorldStream;
+pub mod physics;
+pub use physics::{sweep_aabb, ChunkQuery, SweepResult};
 
 use cubic_math::Vec3;
 use std::collections::HashMap;

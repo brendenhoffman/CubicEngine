@@ -9,3 +9,4 @@ cubic-world = { path = "../cubic-world" }
 wasmtime = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+cubic-math = { path = "../cubic-math" }
