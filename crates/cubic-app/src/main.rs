@@ -1267,6 +1267,10 @@ impl ApplicationHandler for App {
                 info!("CloseRequested");
                 self.exiting = true;
                 self.backend = None;
+                // Drop before the window: its clipboard wraps a raw pointer
+                // into the window's Wayland display, and destroying that
+                // clipboard after the display is gone segfaults on Wayland.
+                self.egui_winit = None;
                 self.window = None;
                 event_loop.exit();
             }
@@ -1595,6 +1599,9 @@ impl ApplicationHandler for App {
         if self.quit_requested {
             self.exiting = true;
             self.backend = None;
+            // See the CloseRequested handler above for why this must come
+            // before self.window = None.
+            self.egui_winit = None;
             self.window = None;
             event_loop.exit();
             return;
