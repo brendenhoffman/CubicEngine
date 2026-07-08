@@ -47,6 +47,8 @@ pub struct ProfileCfg {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<CameraOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub player: Option<PlayerOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controls: Option<ControlsOverride>,
     // Not an AppCfg override like the sections above — window mode/size are
     // launcher-only UI state with no corresponding engine config field —
@@ -101,21 +103,57 @@ pub struct CameraOverride {
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct PlayerOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub walk_speed: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fly_speed: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jump_velocity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gravity: Option<f32>,
+}
+
+/// Sparse override for one control's binding. All three parts are
+/// independently optional so e.g. changing just the trigger kind in the
+/// launcher doesn't need to also know/rewrite the current key — main.rs's
+/// apply_profile applies whichever parts are present onto the resolved
+/// cubic.toml binding. Plain strings (not main.rs's `ModifierKey`/
+/// `TriggerKind` enums) to keep this crate decoupled from AppCfg's types,
+/// same reasoning as the rest of this sparse-override schema; parsed via
+/// main.rs's parse_cfg_str, same as texture_filter/mipmap_mode overrides.
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct KeyBindingOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modifier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
 pub struct ControlsOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forward: Option<String>,
+    pub forward: Option<KeyBindingOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub back: Option<String>,
+    pub back: Option<KeyBindingOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub left: Option<String>,
+    pub left: Option<KeyBindingOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub right: Option<String>,
+    pub right: Option<KeyBindingOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub jump: Option<String>,
+    pub jump: Option<KeyBindingOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sneak: Option<String>,
+    pub sneak: Option<KeyBindingOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub toggle_diagnostics: Option<String>,
+    pub toggle_diagnostics: Option<KeyBindingOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toggle_third_person: Option<KeyBindingOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spectate: Option<KeyBindingOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fly: Option<KeyBindingOverride>,
 }
 
 // ---------------------------------------------------------------------------

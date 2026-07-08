@@ -15,6 +15,8 @@ pub struct GameOverrideCfg {
     pub world: Option<GameWorldOverride>,
     #[serde(default)]
     pub camera: Option<GameCameraOverride>,
+    #[serde(default)]
+    pub player: Option<GamePlayerOverride>,
     // no controls field — games cannot remap engine controls
 }
 
@@ -51,6 +53,18 @@ pub struct GameCameraOverride {
     pub move_speed: Option<f32>,
     #[serde(default)]
     pub mouse_sensitivity: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+pub struct GamePlayerOverride {
+    #[serde(default)]
+    pub walk_speed: Option<f32>,
+    #[serde(default)]
+    pub fly_speed: Option<f32>,
+    #[serde(default)]
+    pub jump_velocity: Option<f32>,
+    #[serde(default)]
+    pub gravity: Option<f32>,
 }
 
 /// Load game override config from {game_dir}/game_overrides.toml.

@@ -65,3 +65,4 @@ wasmtime = { version = "46.0.1", default-features = false, features = ["cranelif
 wit-bindgen = "0.58"
 noise = "0.9"
 dirs = "5"
+gilrs = "0.11"

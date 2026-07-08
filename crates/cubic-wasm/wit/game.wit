@@ -86,20 +86,53 @@ interface input {
         sneak: bool,
         look-dx: f32,
         look-dy: f32,
+        walk-speed: f32,
+        fly-speed: f32,
+        jump-velocity: f32,
+        gravity: f32,
     }
 
-    /// Writes an input-state into out-ptr: [move_forward: i32, move_back: i32,
-    /// move_left: i32, move_right: i32, jump: i32, sneak: i32, look_dx: f32,
-    /// look_dy: f32]. Total: 8 * 4 = 32 bytes.
+    /// Writes an input-state into out-ptr.
+    /// Layout: [move_forward: i32, move_back: i32, move_left: i32, move_right: i32,
+    ///          jump: i32, sneak: i32, look_dx: f32, look_dy: f32,
+    ///          walk_speed: f32, fly_speed: f32, jump_velocity: f32,
+    ///          gravity: f32] = 12 * 4 = 48 bytes.
+    ///
+    /// Purely discrete/toggle-style controls (toggle-third-person, spectate,
+    /// fly, ...) are deliberately not here — they go through get-events
+    /// instead, since the host only forwards an event once a control's
+    /// configured trigger condition (tap / double-tap) is actually
+    /// satisfied. A continuous boolean here can't express that: it goes
+    /// true the instant the key is pressed no matter how the control is
+    /// configured, which is exactly the bug that toggle-third-person had
+    /// before it moved to this interface.
     get-input: func(out-ptr: u32) -> u32;
+
+    /// Writes discrete input events that occurred this tick into out-ptr.
+    /// Each event is 40 bytes: [name: u8[32] (null-padded), kind: u32, _pad: u32]
+    /// kind: 0=Pressed, 1=Released, 2=DoubleTap
+    /// Returns number of bytes written (multiple of 40).
+    get-events: func(out-ptr: u32, max-bytes: u32) -> u32;
 }
 
 interface camera {
     set-camera: func(x: f32, y: f32, z: f32, yaw: f32, pitch: f32);
+
+    /// Player feet position (pos, not eye) — tracked separately from the
+    /// camera since third-person orbit moves the camera away from the
+    /// player. Used by diagnostics (XYZ / block position) instead of the
+    /// camera position when a WASM game is driving it.
+    set-player-feet: func(x: f32, y: f32, z: f32);
 }
 
 interface tick {
     on-tick: func(dt: f32);
+}
+
+interface render {
+    load-mesh: func(path-ptr: u32, path-len: u32) -> u32;
+    load-texture: func(path-ptr: u32, path-len: u32) -> u32;
+    draw-mesh: func(mesh-handle: u32, tex-index: u32, x: f32, y: f32, z: f32, yaw: f32);
 }
 
 world game {
@@ -110,4 +143,5 @@ world game {
     import physics;
     import input;
     import camera;
+    import render;
 }

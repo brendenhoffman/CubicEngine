@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
 
 use crate::cubic::game::{camera, physics};
 
@@ -6,10 +7,16 @@ const PLAYER_HALF_W: f32 = 0.3; // 0.6m wide = 1.2 voxels
 const PLAYER_HEIGHT: f32 = 1.8; // 1.8m tall = 3.6 voxels
 const PLAYER_HALF_D: f32 = 0.3; // 0.6m deep = 1.2 voxels
 const EYE_HEIGHT: f32 = 1.62; // eye level = 3.24 voxels
-const GRAVITY: f32 = -20.0;
-const JUMP_VELOCITY: f32 = 8.0;
-const MOVE_SPEED: f32 = 4.5;
 const THIRD_PERSON_DIST: f32 = 4.0;
+/// How far below the player to probe for standing contact (see the ground
+/// probe in tick, step 6b) — small enough not to falsely ground someone who
+/// just left the surface, large enough to register a resting player whose
+/// zero-velocity sweep can't detect its own contact.
+const GROUND_PROBE_DIST: f32 = 0.05;
+/// Fallback spawn height for `Player::default()`, which nothing currently
+/// calls — `on_load` in lib.rs always constructs via `Player::new` with a
+/// terrain-aware height instead (see its call site).
+const DEFAULT_SPAWN_Y: f32 = 20.0;
 
 /// Mirrors `cubic_wasm::InputSnapshot` field-for-field — see on_tick in
 /// lib.rs, which decodes the host's get-input out-ptr buffer into this.
@@ -19,14 +26,20 @@ pub struct InputState {
     pub move_left: bool,
     pub move_right: bool,
     pub jump: bool,
-    // Not yet read anywhere: crouch isn't implemented (out of scope for
-    // this card — see the module doc note in lib.rs), but the field stays
-    // to keep this struct's layout matching cubic_wasm::InputSnapshot,
-    // which the host's get-input out-ptr buffer is decoded against.
-    #[allow(dead_code)]
+    // Doubles as flying's descend control (see Player::tick) — crouch
+    // itself isn't implemented while grounded (out of scope for this card).
     pub sneak: bool,
     pub look_dx: f32,
     pub look_dy: f32,
+    /// cfg.player.* from cubic.toml (host-resolved, layered through
+    /// game_overrides.toml / profile.toml) — see lib.rs's on_tick, which
+    /// decodes these from the host's get-input out-ptr buffer. Distinct
+    /// from cfg.camera.move_speed, which only drives the free-fly debug
+    /// camera used when no game is loaded.
+    pub walk_speed: f32,
+    pub fly_speed: f32,
+    pub jump_velocity: f32,
+    pub gravity: f32,
 }
 
 pub struct Player {
@@ -35,27 +48,44 @@ pub struct Player {
     pub yaw: f32,
     pub pitch: f32,
     pub grounded: bool,
-    // Not yet reachable from any input binding — see the module doc note in
-    // lib.rs. Left in place so the camera-placement math below is ready for
-    // it once a toggle exists.
+    // Toggled by a "toggle_third_person" InputEvent — see on_tick in lib.rs.
     pub third_person: bool,
+    // Toggled by a "fly" InputEvent (double-tap Space by default) — see
+    // on_tick in lib.rs.
+    pub flying: bool,
+    // Toggled by a "spectate" InputEvent (pause-menu button or its keybind
+    // — see on_tick in lib.rs). Unlike flying, spectating detaches the
+    // camera from the player entirely: `pos`/`vel`/`grounded` stay frozen
+    // wherever the player physically was, and spectator_pos moves freely
+    // with no collision at all (not even a de-penetration/ground probe).
+    pub spectating: bool,
+    pub spectator_pos: [f32; 3],
 }
 
 impl Default for Player {
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_SPAWN_Y)
     }
 }
 
 impl Player {
-    pub fn new() -> Self {
+    /// `spawn_y` should be the actual queried terrain height at the spawn
+    /// column plus a little clearance (see `on_load`'s call site) — a fixed
+    /// height can end up below the real surface on seeds with tall noise
+    /// output, spawning the player embedded in the ground with no way to
+    /// sweep back out (see `sweep_aabb`'s de-penetration step, which only
+    /// ever helps once already ticking, not for the very first placement).
+    pub fn new(spawn_y: f32) -> Self {
         Self {
-            pos: [0.0, 20.0, 0.0],
+            pos: [0.0, spawn_y, 0.0],
             vel: [0.0; 3],
             yaw: 0.0,
             pitch: 0.0,
             grounded: false,
             third_person: false,
+            flying: false,
+            spectating: false,
+            spectator_pos: [0.0; 3],
         }
     }
 
@@ -64,16 +94,49 @@ impl Player {
     }
 
     pub fn tick(&mut self, dt: f32, input: &InputState) {
-        // 1. Gravity
-        if !self.grounded {
-            self.vel[1] += GRAVITY * dt;
-        }
-        self.vel[1] = self.vel[1].max(-50.0);
+        // Mouse look applies the same way regardless of mode, so it runs
+        // once up front rather than being duplicated in both the spectator
+        // and normal branches below. third_person itself is now toggled
+        // directly by the "toggle_third_person" InputEvent handler in
+        // on_tick (lib.rs) — no edge-detection needed here anymore, since
+        // the host only forwards that event once per configured trigger
+        // (tap/double-tap), not continuously while held.
+        self.yaw -= input.look_dx;
+        self.pitch = (self.pitch - input.look_dy).clamp(
+            -std::f32::consts::FRAC_PI_2 + 0.01,
+            std::f32::consts::FRAC_PI_2 - 0.01,
+        );
 
-        // 2. Jump
-        if input.jump && self.grounded {
-            self.vel[1] = JUMP_VELOCITY;
-            self.grounded = false;
+        if self.spectating {
+            self.tick_spectator(dt, input);
+            return;
+        }
+
+        // 1. Vertical control: flying replaces gravity/ground-jump with
+        // direct jump/sneak-driven ascend/descend (collision still applies
+        // below via sweep_aabb either way — flying only skips gravity, not
+        // the world). Toggled by a double-tap-jump InputEvent; see on_tick
+        // in lib.rs, which also zeroes vel[1] on that same toggle so this
+        // switch is a clean hover instead of carrying over jump/fall speed.
+        if self.flying {
+            let mut vy = 0.0f32;
+            if input.jump {
+                vy += input.fly_speed;
+            }
+            if input.sneak {
+                vy -= input.fly_speed;
+            }
+            self.vel[1] = vy;
+        } else {
+            if !self.grounded {
+                self.vel[1] += input.gravity * dt;
+            }
+            self.vel[1] = self.vel[1].max(-50.0);
+
+            if input.jump && self.grounded {
+                self.vel[1] = input.jump_velocity;
+                self.grounded = false;
+            }
         }
 
         // 3. Horizontal movement relative to yaw
@@ -99,20 +162,18 @@ impl Player {
             mx -= right[0];
             mz -= right[2];
         }
+        let horiz_speed = if self.flying {
+            input.fly_speed
+        } else {
+            input.walk_speed
+        };
         let len = (mx * mx + mz * mz).sqrt();
         if len > 0.0 {
-            mx = mx / len * MOVE_SPEED;
-            mz = mz / len * MOVE_SPEED;
+            mx = mx / len * horiz_speed;
+            mz = mz / len * horiz_speed;
         }
         self.vel[0] = mx;
         self.vel[2] = mz;
-
-        // 4. Mouse look
-        self.yaw -= input.look_dx;
-        self.pitch = (self.pitch - input.look_dy).clamp(
-            -std::f32::consts::FRAC_PI_2 + 0.01,
-            std::f32::consts::FRAC_PI_2 - 0.01,
-        );
 
         // 5. Sweep through world
         let dx = self.vel[0] * dt;
@@ -163,22 +224,140 @@ impl Player {
             self.vel[2] = 0.0;
         }
 
+        // 6b. Ground probe: a resting player has dy == 0, and a zero-delta
+        // sweep tests movement *into* solid ground, not "is something
+        // already touching me" — sitting exactly at the surface boundary
+        // therefore reports hit_y = false every tick with no downward
+        // velocity, flickering `grounded` false right after it was set true
+        // (position doesn't visibly change since the very next tick's
+        // gravity nudge re-triggers hit_y=true and reverts it, but any
+        // input read on a false tick — jump, or flying's ascend — is
+        // silently dropped). Independently probe a hair below the resolved
+        // position; unlike the real sweep this always has a small nonzero
+        // downward delta, so it actually detects standing contact.
+        if !self.flying && !self.grounded {
+            let mut probe_buf = [0u8; 24];
+            let probe_ptr = probe_buf.as_mut_ptr() as u32;
+            physics::sweep_aabb(
+                self.pos[0],
+                self.pos[1],
+                self.pos[2],
+                0.0,
+                -GROUND_PROBE_DIST,
+                0.0,
+                PLAYER_HALF_W,
+                PLAYER_HEIGHT,
+                PLAYER_HALF_D,
+                probe_ptr,
+            );
+            let probe_hit_y = i32::from_le_bytes(probe_buf[16..20].try_into().unwrap()) != 0;
+            if probe_hit_y {
+                self.grounded = true;
+            }
+        }
+
         // 7. Set camera
         let (cx, cy, cz, cyaw, cpitch) = if self.third_person {
-            let eye = self.eye_pos();
-            let bx = self.yaw.sin() * THIRD_PERSON_DIST;
-            let bz = self.yaw.cos() * THIRD_PERSON_DIST;
-            (
-                eye[0] + bx,
-                eye[1] + THIRD_PERSON_DIST * 0.3,
-                eye[2] + bz,
-                self.yaw,
-                self.pitch - 0.2,
-            )
+            let (pos, yaw, pitch) = self.third_person_camera();
+            (pos[0], pos[1], pos[2], yaw, pitch)
         } else {
             let eye = self.eye_pos();
             (eye[0], eye[1], eye[2], self.yaw, self.pitch)
         };
         camera::set_camera(cx, cy, cz, cyaw, cpitch);
+
+        // Feet position, tracked separately from the camera — third-person
+        // orbit moves the camera away from the player, so diagnostics need
+        // this to keep showing where the player actually is.
+        camera::set_player_feet(self.pos[0], self.pos[1], self.pos[2]);
+    }
+
+    /// Spectator update: free camera movement (same yaw-relative WASD +
+    /// jump/sneak-for-vertical scheme as flying, reusing fly_speed since
+    /// spectating is conceptually "flying, but detached and unsolid") with
+    /// no collision at all and no effect on the actual player — `pos`/`vel`/
+    /// `grounded` are left exactly as they were, so un-spectating drops the
+    /// player right back where they physically stood the whole time.
+    fn tick_spectator(&mut self, dt: f32, input: &InputState) {
+        let sin_yaw = self.yaw.sin();
+        let cos_yaw = self.yaw.cos();
+        let forward = [-sin_yaw, 0.0, -cos_yaw];
+        let right = [cos_yaw, 0.0, -sin_yaw];
+        let mut mx = 0.0f32;
+        let mut mz = 0.0f32;
+        if input.move_forward {
+            mx += forward[0];
+            mz += forward[2];
+        }
+        if input.move_back {
+            mx -= forward[0];
+            mz -= forward[2];
+        }
+        if input.move_right {
+            mx += right[0];
+            mz += right[2];
+        }
+        if input.move_left {
+            mx -= right[0];
+            mz -= right[2];
+        }
+        let len = (mx * mx + mz * mz).sqrt();
+        if len > 0.0 {
+            mx = mx / len * input.fly_speed;
+            mz = mz / len * input.fly_speed;
+        }
+        let mut my = 0.0f32;
+        if input.jump {
+            my += input.fly_speed;
+        }
+        if input.sneak {
+            my -= input.fly_speed;
+        }
+
+        // No sweep_aabb call at all: spectating is explicitly unsolid, so
+        // this is a plain kinematic integration, not even a de-penetration
+        // check.
+        self.spectator_pos[0] += mx * dt;
+        self.spectator_pos[1] += my * dt;
+        self.spectator_pos[2] += mz * dt;
+
+        camera::set_camera(
+            self.spectator_pos[0],
+            self.spectator_pos[1],
+            self.spectator_pos[2],
+            self.yaw,
+            self.pitch,
+        );
+        // Report the spectator's own position here, not the frozen player
+        // — while spectating, "where am I" (for diagnostics) means the free
+        // camera, not the body left behind.
+        camera::set_player_feet(
+            self.spectator_pos[0],
+            self.spectator_pos[1],
+            self.spectator_pos[2],
+        );
+    }
+
+    /// Orbit camera position for third-person view: sits behind the eye
+    /// point on a sphere of radius THIRD_PERSON_DIST, opposite the look
+    /// direction, so looking up/down swings the camera over/under the
+    /// player instead of just sliding it up and re-angling (which is what
+    /// the old fixed-height-offset version did).
+    fn third_person_camera(&self) -> ([f32; 3], f32, f32) {
+        let eye = self.eye_pos();
+
+        let horiz = THIRD_PERSON_DIST * self.pitch.cos();
+        let back_x = self.yaw.sin() * horiz;
+        let back_y = -self.pitch.sin() * THIRD_PERSON_DIST;
+        let back_z = self.yaw.cos() * horiz;
+
+        let cam_pos = [
+            eye[0] + back_x,
+            eye[1] + back_y + 0.5, // small upward bias so head is visible at flat pitch
+            eye[2] + back_z,
+        ];
+
+        // Camera looks toward eye — same yaw and pitch as player
+        (cam_pos, self.yaw, self.pitch)
     }
 }

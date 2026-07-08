@@ -4,6 +4,7 @@
 mod flat_generator;
 mod frustum;
 mod game_override;
+mod loader;
 mod profile;
 
 use anyhow::Result;
@@ -13,7 +14,7 @@ use cubic_math::{Camera, Vec3};
 use cubic_platform::winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::{DeviceEvent, DeviceId, ElementState, WindowEvent},
+    event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
@@ -201,6 +202,8 @@ struct AppCfg {
     #[serde(default)]
     camera: CameraCfg,
     #[serde(default)]
+    player: PlayerCfg,
+    #[serde(default)]
     game: GameCfg,
     #[serde(default)]
     controls: ControlsCfg,
@@ -328,6 +331,27 @@ fn parse_cfg_str<T: for<'de> Deserialize<'de>>(s: &str) -> Option<T> {
     toml::Value::String(s.to_string()).try_into().ok()
 }
 
+/// Apply a sparse profile-override onto a resolved `KeyBinding`, one part
+/// (key/modifier/trigger) at a time — same "only touch what's actually
+/// overridden" contract as every other profile override in this file.
+fn apply_key_binding_override(binding: &mut KeyBinding, ov: &profile::KeyBindingOverride) {
+    if let Some(k) = &ov.key {
+        binding.key = if k.is_empty() { None } else { Some(k.clone()) };
+    }
+    if let Some(m) = &ov.modifier {
+        match parse_cfg_str::<ModifierKey>(m) {
+            Some(modifier) => binding.modifier = modifier,
+            None => tracing::warn!("unknown modifier in profile: {m}"),
+        }
+    }
+    if let Some(t) = &ov.trigger {
+        match parse_cfg_str::<TriggerKind>(t) {
+            Some(trigger) => binding.trigger = trigger,
+            None => tracing::warn!("unknown trigger kind in profile: {t}"),
+        }
+    }
+}
+
 /// Apply game_overrides.toml onto a resolved AppCfg (which already has
 /// global cubic.toml applied). Kept here rather than in game_override.rs,
 /// which only owns disk I/O and the sparse override schema —
@@ -372,6 +396,20 @@ fn apply_game_override(mut cfg: AppCfg, overrides: &game_override::GameOverrideC
         }
         if let Some(v) = c.mouse_sensitivity {
             cfg.camera.mouse_sensitivity = v;
+        }
+    }
+    if let Some(p) = &overrides.player {
+        if let Some(v) = p.walk_speed {
+            cfg.player.walk_speed = v;
+        }
+        if let Some(v) = p.fly_speed {
+            cfg.player.fly_speed = v;
+        }
+        if let Some(v) = p.jump_velocity {
+            cfg.player.jump_velocity = v;
+        }
+        if let Some(v) = p.gravity {
+            cfg.player.gravity = v;
         }
     }
     cfg
@@ -429,27 +467,50 @@ fn apply_profile(mut cfg: AppCfg, profile: &profile::ProfileCfg) -> AppCfg {
             cfg.camera.mouse_sensitivity = v;
         }
     }
+    if let Some(p) = &profile.player {
+        if let Some(v) = p.walk_speed {
+            cfg.player.walk_speed = v;
+        }
+        if let Some(v) = p.fly_speed {
+            cfg.player.fly_speed = v;
+        }
+        if let Some(v) = p.jump_velocity {
+            cfg.player.jump_velocity = v;
+        }
+        if let Some(v) = p.gravity {
+            cfg.player.gravity = v;
+        }
+    }
     if let Some(ctrl) = &profile.controls {
         if let Some(v) = &ctrl.forward {
-            cfg.controls.forward = v.clone();
+            apply_key_binding_override(&mut cfg.controls.forward, v);
         }
         if let Some(v) = &ctrl.back {
-            cfg.controls.back = v.clone();
+            apply_key_binding_override(&mut cfg.controls.back, v);
         }
         if let Some(v) = &ctrl.left {
-            cfg.controls.left = v.clone();
+            apply_key_binding_override(&mut cfg.controls.left, v);
         }
         if let Some(v) = &ctrl.right {
-            cfg.controls.right = v.clone();
+            apply_key_binding_override(&mut cfg.controls.right, v);
         }
         if let Some(v) = &ctrl.jump {
-            cfg.controls.jump = v.clone();
+            apply_key_binding_override(&mut cfg.controls.jump, v);
         }
         if let Some(v) = &ctrl.sneak {
-            cfg.controls.sneak = v.clone();
+            apply_key_binding_override(&mut cfg.controls.sneak, v);
         }
         if let Some(v) = &ctrl.toggle_diagnostics {
-            cfg.controls.toggle_diagnostics = v.clone();
+            apply_key_binding_override(&mut cfg.controls.toggle_diagnostics, v);
+        }
+        if let Some(v) = &ctrl.toggle_third_person {
+            apply_key_binding_override(&mut cfg.controls.toggle_third_person, v);
+        }
+        if let Some(v) = &ctrl.spectate {
+            apply_key_binding_override(&mut cfg.controls.spectate, v);
+        }
+        if let Some(v) = &ctrl.fly {
+            apply_key_binding_override(&mut cfg.controls.fly, v);
         }
     }
     cfg
@@ -506,6 +567,46 @@ impl Default for CameraCfg {
         CameraCfg {
             move_speed: default_move_speed(),
             mouse_sensitivity: default_mouse_sensitivity(),
+        }
+    }
+}
+
+fn default_walk_speed() -> f32 {
+    4.5
+}
+fn default_fly_speed() -> f32 {
+    10.0
+}
+fn default_jump_velocity() -> f32 {
+    8.0
+}
+fn default_gravity() -> f32 {
+    -20.0
+}
+
+/// In-game player movement/physics — distinct from `CameraCfg`, which only
+/// drives the free-fly debug camera shown before a game is loaded. Sent to
+/// the guest every tick via `InputSnapshot` (see RedrawRequested), so
+/// Settings-tab edits apply immediately without a relaunch.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy)]
+struct PlayerCfg {
+    #[serde(default = "default_walk_speed")]
+    walk_speed: f32,
+    #[serde(default = "default_fly_speed")]
+    fly_speed: f32,
+    #[serde(default = "default_jump_velocity")]
+    jump_velocity: f32,
+    #[serde(default = "default_gravity")]
+    gravity: f32,
+}
+
+impl Default for PlayerCfg {
+    fn default() -> Self {
+        PlayerCfg {
+            walk_speed: default_walk_speed(),
+            fly_speed: default_fly_speed(),
+            jump_velocity: default_jump_velocity(),
+            gravity: default_gravity(),
         }
     }
 }
@@ -572,44 +673,225 @@ impl Default for LauncherCfg {
     }
 }
 
+/// Optional modifier layered on top of a control's base key (e.g. "F6" +
+/// Shift). Deliberately side-agnostic (not ShiftLeft-vs-ShiftRight) — unlike
+/// a control's own base key, which can legitimately be bound to a specific
+/// physical modifier key (sneak defaults to ShiftLeft), a *combo* modifier
+/// just means "shift is down, either side", matching how most games treat
+/// Ctrl/Shift/Alt combos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum ModifierKey {
+    #[default]
+    None,
+    Shift,
+    Control,
+    Alt,
+}
+
+impl ModifierKey {
+    fn label(self) -> &'static str {
+        match self {
+            ModifierKey::None => "none",
+            ModifierKey::Shift => "Shift",
+            ModifierKey::Control => "Control",
+            ModifierKey::Alt => "Alt",
+        }
+    }
+
+    /// Config-string form — must match the `#[serde(rename_all =
+    /// "snake_case")]` on this enum, since it's round-tripped through
+    /// `parse_cfg_str` (profile.toml overrides store plain strings, not
+    /// this enum directly — see KeyBindingOverride's doc comment).
+    fn cfg_str(self) -> &'static str {
+        match self {
+            ModifierKey::None => "none",
+            ModifierKey::Shift => "shift",
+            ModifierKey::Control => "control",
+            ModifierKey::Alt => "alt",
+        }
+    }
+}
+
+/// How a control's key press turns into activation. Only meaningfully
+/// distinct for the discrete-event path (see InputTracker::update): Tap
+/// fires immediately on press (and additionally reports a DoubleTap-kind
+/// event if the press really was rapid enough, same as always) — this is
+/// also what movement-style controls use under the hood, since those are
+/// read continuously via `InputState::binding_active` and never consult
+/// this enum at all. DoubleTap is different in kind, not just labeling: a
+/// lone tap is suppressed rather than forwarded, so the bound action only
+/// ever fires on a genuine rapid double-press. There used to be a separate
+/// Hold variant, but it fired identically to Tap (both act on press, not on
+/// release) and every control that actually cares about held-vs-not reads
+/// input continuously instead of through this trigger system — so it was
+/// removed rather than kept as a confusing no-op option.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+enum TriggerKind {
+    #[default]
+    Tap,
+    DoubleTap,
+}
+
+impl TriggerKind {
+    fn label(self) -> &'static str {
+        match self {
+            TriggerKind::Tap => "tap",
+            TriggerKind::DoubleTap => "double tap",
+        }
+    }
+
+    /// Config-string form — see ModifierKey::cfg_str's doc comment.
+    fn cfg_str(self) -> &'static str {
+        match self {
+            TriggerKind::Tap => "tap",
+            TriggerKind::DoubleTap => "double_tap",
+        }
+    }
+}
+
+/// A control's full binding: base input source (None = unbound), optional
+/// modifier, and trigger kind. `key` is a misnomer kept for config-file
+/// compatibility — despite the name it can hold a keyboard key, mouse
+/// button, or gamepad button name (see `str_to_input_source`). Deserializes
+/// from either the legacy plain-string form (`forward = "KeyW"`, still
+/// written by older cubic.toml/profile.toml files — treated as that key
+/// with no modifier and Tap trigger) or the full table form (`forward =
+/// { key = "KeyW", modifier = "shift" }`), so existing configs keep loading
+/// unchanged.
+#[derive(Debug, Clone, Serialize)]
+struct KeyBinding {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    #[serde(default, skip_serializing_if = "is_default_modifier")]
+    modifier: ModifierKey,
+    #[serde(default, skip_serializing_if = "is_default_trigger")]
+    trigger: TriggerKind,
+}
+
+fn is_default_modifier(m: &ModifierKey) -> bool {
+    *m == ModifierKey::None
+}
+fn is_default_trigger(t: &TriggerKind) -> bool {
+    *t == TriggerKind::Tap
+}
+
+impl KeyBinding {
+    fn unbound(trigger: TriggerKind) -> Self {
+        KeyBinding {
+            key: None,
+            modifier: ModifierKey::None,
+            trigger,
+        }
+    }
+    fn key(key: &str) -> Self {
+        KeyBinding {
+            key: Some(key.to_string()),
+            modifier: ModifierKey::None,
+            trigger: TriggerKind::Tap,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Legacy(String),
+            Full {
+                #[serde(default)]
+                key: Option<String>,
+                #[serde(default)]
+                modifier: ModifierKey,
+                #[serde(default)]
+                trigger: TriggerKind,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Legacy(s) if s.is_empty() => KeyBinding::unbound(TriggerKind::Tap),
+            Repr::Legacy(s) => KeyBinding::key(&s),
+            Repr::Full {
+                key,
+                modifier,
+                trigger,
+            } => KeyBinding {
+                key,
+                modifier,
+                trigger,
+            },
+        })
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 struct ControlsCfg {
     #[serde(default = "default_forward")]
-    forward: String,
+    forward: KeyBinding,
     #[serde(default = "default_back")]
-    back: String,
+    back: KeyBinding,
     #[serde(default = "default_left")]
-    left: String,
+    left: KeyBinding,
     #[serde(default = "default_right")]
-    right: String,
+    right: KeyBinding,
     #[serde(default = "default_jump")]
-    jump: String,
+    jump: KeyBinding,
     #[serde(default = "default_sneak")]
-    sneak: String,
+    sneak: KeyBinding,
     #[serde(default = "default_toggle_diagnostics")]
-    toggle_diagnostics: String,
+    toggle_diagnostics: KeyBinding,
+    #[serde(default = "default_toggle_third_person")]
+    toggle_third_person: KeyBinding,
+    // Deliberately unbound by default — a nice-to-have utility mode, not
+    // something every player needs a key eaten for out of the box. The
+    // pause-menu "Toggle Spectate" button works regardless.
+    #[serde(default = "default_spectate")]
+    spectate: KeyBinding,
+    // Same physical key as jump by default, and that's fine — jump's own
+    // ResolvedBinding is checked independently for the continuous
+    // ascend/grounded-jump boolean; this is a separate DoubleTap-triggered
+    // binding on top, not a conflict.
+    #[serde(default = "default_fly")]
+    fly: KeyBinding,
 }
 
-fn default_forward() -> String {
-    "KeyW".to_string()
+fn default_forward() -> KeyBinding {
+    KeyBinding::key("KeyW")
 }
-fn default_back() -> String {
-    "KeyS".to_string()
+fn default_back() -> KeyBinding {
+    KeyBinding::key("KeyS")
 }
-fn default_left() -> String {
-    "KeyA".to_string()
+fn default_left() -> KeyBinding {
+    KeyBinding::key("KeyA")
 }
-fn default_right() -> String {
-    "KeyD".to_string()
+fn default_right() -> KeyBinding {
+    KeyBinding::key("KeyD")
 }
-fn default_jump() -> String {
-    "Space".to_string()
+fn default_jump() -> KeyBinding {
+    KeyBinding::key("Space")
 }
-fn default_sneak() -> String {
-    "ShiftLeft".to_string()
+fn default_sneak() -> KeyBinding {
+    KeyBinding::key("ShiftLeft")
 }
-fn default_toggle_diagnostics() -> String {
-    "F3".to_string()
+fn default_toggle_diagnostics() -> KeyBinding {
+    KeyBinding::key("F3")
+}
+fn default_toggle_third_person() -> KeyBinding {
+    KeyBinding::key("F5")
+}
+fn default_spectate() -> KeyBinding {
+    KeyBinding::unbound(TriggerKind::Tap)
+}
+fn default_fly() -> KeyBinding {
+    KeyBinding {
+        key: Some("Space".to_string()),
+        modifier: ModifierKey::None,
+        trigger: TriggerKind::DoubleTap,
+    }
 }
 
 impl Default for ControlsCfg {
@@ -622,6 +904,9 @@ impl Default for ControlsCfg {
             jump: default_jump(),
             sneak: default_sneak(),
             toggle_diagnostics: default_toggle_diagnostics(),
+            toggle_third_person: default_toggle_third_person(),
+            spectate: default_spectate(),
+            fly: default_fly(),
         }
     }
 }
@@ -707,28 +992,247 @@ fn str_to_keycode(s: &str) -> Option<KeyCode> {
     }
 }
 
-/// Config strings resolved to `KeyCode`s once at startup (see
-/// `resolve_controls`), so `apply_input`'s hot path doesn't re-parse
-/// strings every frame.
+/// Reverse of `str_to_keycode` — used by the Controls tab's remap capture
+/// (see `WindowEvent::KeyboardInput`) to turn a captured `KeyCode` back into
+/// the string stored in config. Deliberately exhaustive over the same set
+/// `str_to_keycode` accepts, including modifiers (ShiftLeft/ControlLeft/
+/// AltLeft/etc): unlike egui's `Key` enum, winit's `KeyCode` reports bare
+/// modifier presses as ordinary keys with a precise left/right physical
+/// side, which is what makes capturing them for a binding possible at all.
+fn keycode_to_str(code: KeyCode) -> Option<&'static str> {
+    Some(match code {
+        KeyCode::KeyA => "KeyA",
+        KeyCode::KeyB => "KeyB",
+        KeyCode::KeyC => "KeyC",
+        KeyCode::KeyD => "KeyD",
+        KeyCode::KeyE => "KeyE",
+        KeyCode::KeyF => "KeyF",
+        KeyCode::KeyG => "KeyG",
+        KeyCode::KeyH => "KeyH",
+        KeyCode::KeyI => "KeyI",
+        KeyCode::KeyJ => "KeyJ",
+        KeyCode::KeyK => "KeyK",
+        KeyCode::KeyL => "KeyL",
+        KeyCode::KeyM => "KeyM",
+        KeyCode::KeyN => "KeyN",
+        KeyCode::KeyO => "KeyO",
+        KeyCode::KeyP => "KeyP",
+        KeyCode::KeyQ => "KeyQ",
+        KeyCode::KeyR => "KeyR",
+        KeyCode::KeyS => "KeyS",
+        KeyCode::KeyT => "KeyT",
+        KeyCode::KeyU => "KeyU",
+        KeyCode::KeyV => "KeyV",
+        KeyCode::KeyW => "KeyW",
+        KeyCode::KeyX => "KeyX",
+        KeyCode::KeyY => "KeyY",
+        KeyCode::KeyZ => "KeyZ",
+        KeyCode::Digit0 => "Digit0",
+        KeyCode::Digit1 => "Digit1",
+        KeyCode::Digit2 => "Digit2",
+        KeyCode::Digit3 => "Digit3",
+        KeyCode::Digit4 => "Digit4",
+        KeyCode::Digit5 => "Digit5",
+        KeyCode::Digit6 => "Digit6",
+        KeyCode::Digit7 => "Digit7",
+        KeyCode::Digit8 => "Digit8",
+        KeyCode::Digit9 => "Digit9",
+        KeyCode::Space => "Space",
+        KeyCode::ShiftLeft => "ShiftLeft",
+        KeyCode::ShiftRight => "ShiftRight",
+        KeyCode::ControlLeft => "ControlLeft",
+        KeyCode::ControlRight => "ControlRight",
+        KeyCode::AltLeft => "AltLeft",
+        KeyCode::AltRight => "AltRight",
+        KeyCode::CapsLock => "CapsLock",
+        KeyCode::Insert => "Insert",
+        KeyCode::F1 => "F1",
+        KeyCode::F2 => "F2",
+        KeyCode::F3 => "F3",
+        KeyCode::F4 => "F4",
+        KeyCode::F5 => "F5",
+        KeyCode::F6 => "F6",
+        KeyCode::F7 => "F7",
+        KeyCode::F8 => "F8",
+        KeyCode::F9 => "F9",
+        KeyCode::F10 => "F10",
+        KeyCode::F11 => "F11",
+        KeyCode::F12 => "F12",
+        KeyCode::ArrowUp => "ArrowUp",
+        KeyCode::ArrowDown => "ArrowDown",
+        KeyCode::ArrowLeft => "ArrowLeft",
+        KeyCode::ArrowRight => "ArrowRight",
+        KeyCode::Enter => "Enter",
+        KeyCode::Tab => "Tab",
+        KeyCode::Backspace => "Backspace",
+        KeyCode::Delete => "Delete",
+        KeyCode::Home => "Home",
+        KeyCode::End => "End",
+        KeyCode::PageUp => "PageUp",
+        KeyCode::PageDown => "PageDown",
+        _ => return None,
+    })
+}
+
+/// Any physical input that can be captured as a control's base binding —
+/// keyboard key, mouse button, or gamepad button. A binding's modifier
+/// (ModifierKey::Shift/Control/Alt) is always keyboard-only regardless of
+/// which source this is, same as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum InputSource {
+    Key(KeyCode),
+    Mouse(MouseButton),
+    Gamepad(gilrs::Button),
+}
+
+fn mouse_button_to_string(button: MouseButton) -> String {
+    match button {
+        MouseButton::Left => "MouseLeft".to_string(),
+        MouseButton::Right => "MouseRight".to_string(),
+        MouseButton::Middle => "MouseMiddle".to_string(),
+        MouseButton::Back => "MouseBack".to_string(),
+        MouseButton::Forward => "MouseForward".to_string(),
+        MouseButton::Other(n) => format!("MouseOther{n}"),
+    }
+}
+
+fn str_to_mouse_button(s: &str) -> Option<MouseButton> {
+    Some(match s {
+        "MouseLeft" => MouseButton::Left,
+        "MouseRight" => MouseButton::Right,
+        "MouseMiddle" => MouseButton::Middle,
+        "MouseBack" => MouseButton::Back,
+        "MouseForward" => MouseButton::Forward,
+        other => {
+            let n: u16 = other.strip_prefix("MouseOther")?.parse().ok()?;
+            MouseButton::Other(n)
+        }
+    })
+}
+
+/// gilrs::Button::Unknown deliberately has no string form — a binding can't
+/// meaningfully be restored to "some unrecognized button", so it's simply
+/// not capturable/round-trippable, same as an unrecognized KeyCode.
+fn gamepad_button_to_str(button: gilrs::Button) -> Option<&'static str> {
+    use gilrs::Button::*;
+    Some(match button {
+        South => "GamepadSouth",
+        East => "GamepadEast",
+        North => "GamepadNorth",
+        West => "GamepadWest",
+        C => "GamepadC",
+        Z => "GamepadZ",
+        LeftTrigger => "GamepadLeftTrigger",
+        LeftTrigger2 => "GamepadLeftTrigger2",
+        RightTrigger => "GamepadRightTrigger",
+        RightTrigger2 => "GamepadRightTrigger2",
+        Select => "GamepadSelect",
+        Start => "GamepadStart",
+        Mode => "GamepadMode",
+        LeftThumb => "GamepadLeftThumb",
+        RightThumb => "GamepadRightThumb",
+        DPadUp => "GamepadDPadUp",
+        DPadDown => "GamepadDPadDown",
+        DPadLeft => "GamepadDPadLeft",
+        DPadRight => "GamepadDPadRight",
+        Unknown => return None,
+    })
+}
+
+fn str_to_gamepad_button(s: &str) -> Option<gilrs::Button> {
+    use gilrs::Button::*;
+    Some(match s {
+        "GamepadSouth" => South,
+        "GamepadEast" => East,
+        "GamepadNorth" => North,
+        "GamepadWest" => West,
+        "GamepadC" => C,
+        "GamepadZ" => Z,
+        "GamepadLeftTrigger" => LeftTrigger,
+        "GamepadLeftTrigger2" => LeftTrigger2,
+        "GamepadRightTrigger" => RightTrigger,
+        "GamepadRightTrigger2" => RightTrigger2,
+        "GamepadSelect" => Select,
+        "GamepadStart" => Start,
+        "GamepadMode" => Mode,
+        "GamepadLeftThumb" => LeftThumb,
+        "GamepadRightThumb" => RightThumb,
+        "GamepadDPadUp" => DPadUp,
+        "GamepadDPadDown" => DPadDown,
+        "GamepadDPadLeft" => DPadLeft,
+        "GamepadDPadRight" => DPadRight,
+        _ => return None,
+    })
+}
+
+/// Config-string form of an `InputSource`, for writing a freshly captured
+/// binding back into cubic.toml/profile.toml (see `apply_control_remap`).
+fn input_source_to_string(source: InputSource) -> Option<String> {
+    match source {
+        InputSource::Key(code) => keycode_to_str(code).map(str::to_string),
+        InputSource::Mouse(button) => Some(mouse_button_to_string(button)),
+        InputSource::Gamepad(button) => gamepad_button_to_str(button).map(str::to_string),
+    }
+}
+
+/// Reverse of `input_source_to_string`, tried in Mouse/Gamepad/Key order
+/// since those prefixes are mutually exclusive with keyboard key names.
+fn str_to_input_source(s: &str) -> Option<InputSource> {
+    if s.starts_with("Mouse") {
+        return str_to_mouse_button(s).map(InputSource::Mouse);
+    }
+    if s.starts_with("Gamepad") {
+        return str_to_gamepad_button(s).map(InputSource::Gamepad);
+    }
+    str_to_keycode(s).map(InputSource::Key)
+}
+
+/// A control's binding resolved once at startup (see `resolve_controls`), so
+/// the hot path doesn't re-parse strings every frame. `source: None` means
+/// unbound — the control simply never activates, rather than silently
+/// falling back to some default key (which would hide a broken/cleared
+/// binding instead of surfacing it).
+#[derive(Copy, Clone)]
+struct ResolvedBinding {
+    source: Option<InputSource>,
+    modifier: ModifierKey,
+    trigger: TriggerKind,
+}
+
+fn resolve_binding(b: &KeyBinding) -> ResolvedBinding {
+    ResolvedBinding {
+        source: b.key.as_deref().and_then(str_to_input_source),
+        modifier: b.modifier,
+        trigger: b.trigger,
+    }
+}
+
+#[derive(Copy, Clone)]
 struct ResolvedControls {
-    forward: KeyCode,
-    back: KeyCode,
-    left: KeyCode,
-    right: KeyCode,
-    jump: KeyCode,
-    sneak: KeyCode,
-    toggle_diagnostics: KeyCode,
+    forward: ResolvedBinding,
+    back: ResolvedBinding,
+    left: ResolvedBinding,
+    right: ResolvedBinding,
+    jump: ResolvedBinding,
+    sneak: ResolvedBinding,
+    toggle_diagnostics: ResolvedBinding,
+    toggle_third_person: ResolvedBinding,
+    spectate: ResolvedBinding,
+    fly: ResolvedBinding,
 }
 
 fn resolve_controls(cfg: &AppCfg) -> ResolvedControls {
     ResolvedControls {
-        forward: str_to_keycode(&cfg.controls.forward).unwrap_or(KeyCode::KeyW),
-        back: str_to_keycode(&cfg.controls.back).unwrap_or(KeyCode::KeyS),
-        left: str_to_keycode(&cfg.controls.left).unwrap_or(KeyCode::KeyA),
-        right: str_to_keycode(&cfg.controls.right).unwrap_or(KeyCode::KeyD),
-        jump: str_to_keycode(&cfg.controls.jump).unwrap_or(KeyCode::Space),
-        sneak: str_to_keycode(&cfg.controls.sneak).unwrap_or(KeyCode::ShiftLeft),
-        toggle_diagnostics: str_to_keycode(&cfg.controls.toggle_diagnostics).unwrap_or(KeyCode::F3),
+        forward: resolve_binding(&cfg.controls.forward),
+        back: resolve_binding(&cfg.controls.back),
+        left: resolve_binding(&cfg.controls.left),
+        right: resolve_binding(&cfg.controls.right),
+        jump: resolve_binding(&cfg.controls.jump),
+        sneak: resolve_binding(&cfg.controls.sneak),
+        toggle_diagnostics: resolve_binding(&cfg.controls.toggle_diagnostics),
+        toggle_third_person: resolve_binding(&cfg.controls.toggle_third_person),
+        spectate: resolve_binding(&cfg.controls.spectate),
+        fly: resolve_binding(&cfg.controls.fly),
     }
 }
 
@@ -740,21 +1244,54 @@ const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
 
 #[derive(Default)]
 struct InputState {
-    held_keys: HashSet<KeyCode>,
+    held: HashSet<InputSource>,
     mouse_delta: (f32, f32),
 }
 
 impl InputState {
-    fn set_key(&mut self, code: KeyCode, pressed: bool) {
+    fn set_source(&mut self, source: InputSource, pressed: bool) {
         if pressed {
-            self.held_keys.insert(code);
+            self.held.insert(source);
         } else {
-            self.held_keys.remove(&code);
+            self.held.remove(&source);
         }
     }
 
-    fn is_held(&self, code: KeyCode) -> bool {
-        self.held_keys.contains(&code)
+    fn is_held(&self, source: InputSource) -> bool {
+        self.held.contains(&source)
+    }
+
+    /// Whether the given modifier is currently held, side-agnostic (either
+    /// ShiftLeft or ShiftRight counts as "Shift"). `ModifierKey::None`
+    /// trivially always holds — a binding with no modifier configured
+    /// shouldn't require one. Modifiers are always keyboard keys regardless
+    /// of what source the binding's own base key uses.
+    fn modifier_held(&self, modifier: ModifierKey) -> bool {
+        match modifier {
+            ModifierKey::None => true,
+            ModifierKey::Shift => {
+                self.is_held(InputSource::Key(KeyCode::ShiftLeft))
+                    || self.is_held(InputSource::Key(KeyCode::ShiftRight))
+            }
+            ModifierKey::Control => {
+                self.is_held(InputSource::Key(KeyCode::ControlLeft))
+                    || self.is_held(InputSource::Key(KeyCode::ControlRight))
+            }
+            ModifierKey::Alt => {
+                self.is_held(InputSource::Key(KeyCode::AltLeft))
+                    || self.is_held(InputSource::Key(KeyCode::AltRight))
+            }
+        }
+    }
+
+    /// Whether a resolved binding is currently "held": its base input
+    /// source is down (if any — unbound bindings never activate) and its
+    /// configured modifier, if any, is also down.
+    fn binding_active(&self, binding: &ResolvedBinding) -> bool {
+        match binding.source {
+            Some(source) => self.is_held(source) && self.modifier_held(binding.modifier),
+            None => false,
+        }
     }
 
     fn accumulate_mouse_delta(&mut self, dx: f32, dy: f32) {
@@ -765,6 +1302,107 @@ impl InputState {
     /// Returns the accumulated delta and resets it to zero.
     fn take_mouse_delta(&mut self) -> (f32, f32) {
         std::mem::take(&mut self.mouse_delta)
+    }
+}
+
+struct ActionTracker {
+    was_held: bool,
+    last_press_time: f32,
+}
+
+/// Tracks the purely discrete/toggle-style controls only (movement's
+/// forward/back/left/right/jump/sneak are read continuously via
+/// `InputState::binding_active` directly into `InputSnapshot` instead —
+/// they have no use for tap/double-tap/hold gating, so pushing events for
+/// them would just be wasted WASM-boundary traffic).
+struct InputTracker {
+    // (action_name, binding, state)
+    actions: Vec<(String, ResolvedBinding, ActionTracker)>,
+    elapsed: f32,
+}
+
+impl InputTracker {
+    fn new(controls: &ResolvedControls) -> Self {
+        Self {
+            actions: vec![
+                (
+                    "toggle_diagnostics".into(),
+                    controls.toggle_diagnostics,
+                    ActionTracker {
+                        was_held: false,
+                        last_press_time: -1.0,
+                    },
+                ),
+                (
+                    "toggle_third_person".into(),
+                    controls.toggle_third_person,
+                    ActionTracker {
+                        was_held: false,
+                        last_press_time: -1.0,
+                    },
+                ),
+                (
+                    "spectate".into(),
+                    controls.spectate,
+                    ActionTracker {
+                        was_held: false,
+                        last_press_time: -1.0,
+                    },
+                ),
+                (
+                    "fly".into(),
+                    controls.fly,
+                    ActionTracker {
+                        was_held: false,
+                        last_press_time: -1.0,
+                    },
+                ),
+            ],
+            elapsed: 0.0,
+        }
+    }
+
+    /// Advances edge/double-tap detection for every tracked action and
+    /// returns the names of any whose configured trigger condition (see
+    /// TriggerKind) was satisfied this tick — a lone tap on a
+    /// DoubleTap-configured control is *not* included, only a genuine rapid
+    /// double-press is. Every fired action is also forwarded to the guest
+    /// as an InputEvent (kind 0, or 2 if it happened to be a double-tap);
+    /// callers that only care about something host-side (toggle_diagnostics)
+    /// use the returned names instead of waiting on a guest round-trip.
+    fn update(&mut self, input: &InputState, dt: f32) -> Vec<String> {
+        self.elapsed += dt;
+        let mut fired = Vec::new();
+        for (name, binding, state) in &mut self.actions {
+            let is_held = input.binding_active(binding);
+            if is_held && !state.was_held {
+                let is_double_tap = self.elapsed - state.last_press_time < 0.3;
+                state.last_press_time = self.elapsed;
+                // DoubleTap is the one case that actually changes *whether*
+                // the action fires, not just which kind is reported: a lone
+                // tap is swallowed here rather than forwarded, so a
+                // DoubleTap-configured control (unlike Hold/Tap) never
+                // activates on a single press.
+                let should_fire = match binding.trigger {
+                    TriggerKind::DoubleTap => is_double_tap,
+                    TriggerKind::Tap => true,
+                };
+                if should_fire {
+                    cubic_wasm::push_input_event(cubic_wasm::InputEvent {
+                        name: name.clone(),
+                        kind: if is_double_tap { 2 } else { 0 },
+                    });
+                    fired.push(name.clone());
+                }
+            } else if !is_held && state.was_held {
+                cubic_wasm::push_input_event(cubic_wasm::InputEvent {
+                    name: name.clone(),
+                    kind: 1, // Released
+                });
+            }
+            state.was_held = is_held;
+        }
+        fired
     }
 }
 
@@ -789,8 +1427,14 @@ struct LauncherState {
     // Settings tab already wired up below.
     #[allow(dead_code)]
     settings_open: bool,
-    remapping: Option<String>, // which control is being remapped, if any
+    // Which control is being remapped, if any, plus when capture started —
+    // capture accepts a key, mouse button, or gamepad button (see
+    // window_event's pre-egui interception and App::poll_gamepads) and
+    // auto-cancels after REMAP_TIMEOUT if nothing is pressed.
+    remapping: Option<(String, std::time::Instant)>,
 }
+
+const REMAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[derive(Clone)]
 struct GameEntry {
@@ -904,82 +1548,6 @@ fn read_game_display_name(game_dir: &std::path::Path) -> Option<String> {
     let s = std::fs::read_to_string(game_dir.join("game.toml")).ok()?;
     let v: toml::Value = toml::from_str(&s).ok()?;
     v.get("game")?.get("name")?.as_str().map(|s| s.to_owned())
-}
-
-/// Convert an egui `Key` (used by the in-launcher remap capture) to the
-/// winit-style string names `ControlsCfg`/`str_to_keycode` expect. egui and
-/// winit disagree on names for letters ("W" vs "KeyW") and digits ("Num0" vs
-/// "Digit0"); everything else (Space, Enter, arrows, F-keys, ...) already
-/// matches. Returns None for egui keys with no winit-string mapping (e.g.
-/// punctuation) — those simply can't be bound through this UI.
-fn egui_key_to_str(key: egui::Key) -> Option<String> {
-    use egui::Key;
-    let s = match key {
-        Key::A => "KeyA",
-        Key::B => "KeyB",
-        Key::C => "KeyC",
-        Key::D => "KeyD",
-        Key::E => "KeyE",
-        Key::F => "KeyF",
-        Key::G => "KeyG",
-        Key::H => "KeyH",
-        Key::I => "KeyI",
-        Key::J => "KeyJ",
-        Key::K => "KeyK",
-        Key::L => "KeyL",
-        Key::M => "KeyM",
-        Key::N => "KeyN",
-        Key::O => "KeyO",
-        Key::P => "KeyP",
-        Key::Q => "KeyQ",
-        Key::R => "KeyR",
-        Key::S => "KeyS",
-        Key::T => "KeyT",
-        Key::U => "KeyU",
-        Key::V => "KeyV",
-        Key::W => "KeyW",
-        Key::X => "KeyX",
-        Key::Y => "KeyY",
-        Key::Z => "KeyZ",
-        Key::Num0 => "Digit0",
-        Key::Num1 => "Digit1",
-        Key::Num2 => "Digit2",
-        Key::Num3 => "Digit3",
-        Key::Num4 => "Digit4",
-        Key::Num5 => "Digit5",
-        Key::Num6 => "Digit6",
-        Key::Num7 => "Digit7",
-        Key::Num8 => "Digit8",
-        Key::Num9 => "Digit9",
-        Key::Space => "Space",
-        Key::Enter => "Enter",
-        Key::Tab => "Tab",
-        Key::Backspace => "Backspace",
-        Key::Delete => "Delete",
-        Key::Insert => "Insert",
-        Key::Home => "Home",
-        Key::End => "End",
-        Key::PageUp => "PageUp",
-        Key::PageDown => "PageDown",
-        Key::ArrowUp => "ArrowUp",
-        Key::ArrowDown => "ArrowDown",
-        Key::ArrowLeft => "ArrowLeft",
-        Key::ArrowRight => "ArrowRight",
-        Key::F1 => "F1",
-        Key::F2 => "F2",
-        Key::F3 => "F3",
-        Key::F4 => "F4",
-        Key::F5 => "F5",
-        Key::F6 => "F6",
-        Key::F7 => "F7",
-        Key::F8 => "F8",
-        Key::F9 => "F9",
-        Key::F10 => "F10",
-        Key::F11 => "F11",
-        Key::F12 => "F12",
-        _ => return None,
-    };
-    Some(s.to_string())
 }
 
 /// Merge `new` into `existing` in place, preserving `existing`'s comments
@@ -1151,6 +1719,14 @@ struct App {
     // Per-block-per-face bindless texture index lookup built from tex_map
     // once in resumed(); Arc'd so streaming worker threads can share it.
     face_textures: Arc<BlockFaceTextures>,
+    entity_meshes: HashMap<u32, MeshHandle>,
+    next_entity_mesh_id: u32,
+    input_tracker: InputTracker,
+    // None if no gamepad backend is available on this platform (Gilrs::new
+    // can fail, e.g. no udev) — gamepad support is then simply absent
+    // rather than a hard error, same spirit as backend/render fallbacks
+    // elsewhere in this file.
+    gilrs: Option<gilrs::Gilrs>,
 }
 
 impl ApplicationHandler for App {
@@ -1256,6 +1832,45 @@ impl ApplicationHandler for App {
             }
         }
 
+        // While the Controls tab is capturing a new binding (see
+        // build_controls_tab), intercept keyboard/mouse presses here,
+        // before egui or the normal match below ever sees them. This has
+        // to happen pre-egui because otherwise most mouse clicks would
+        // already be consumed by whatever panel/button is under the
+        // cursor (egui covers the whole window in Launcher/Paused state),
+        // and it has to use the raw winit event streams rather than
+        // egui's because egui's `Key` enum has no variants for bare
+        // modifier presses and its event stream doesn't expose mouse
+        // buttons the same way — see keycode_to_str's doc comment for the
+        // same reasoning applied to keyboard alone. Gamepad button
+        // capture is handled separately in poll_gamepads, since gilrs
+        // events don't arrive as WindowEvents.
+        if let Some((binding, _)) = self.launcher.remapping.clone() {
+            match &event {
+                WindowEvent::KeyboardInput {
+                    event: key_event, ..
+                } if key_event.state == ElementState::Pressed => {
+                    if let PhysicalKey::Code(code) = key_event.physical_key {
+                        if code == KeyCode::Escape {
+                            self.launcher.remapping = None;
+                        } else {
+                            self.complete_remap(&binding, InputSource::Key(code));
+                        }
+                    }
+                    return;
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button,
+                    ..
+                } => {
+                    self.complete_remap(&binding, InputSource::Mouse(*button));
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Feed event to egui first
         if let Some(egui_winit) = &mut self.egui_winit {
             if let Some(window) = &self.window {
@@ -1341,21 +1956,36 @@ impl ApplicationHandler for App {
                     } else {
                         // Can't reliably observe key-up events while unfocused;
                         // clear held keys so movement doesn't get stuck on alt-tab.
-                        self.input.held_keys.clear();
+                        self.input.held.clear();
                     }
                 }
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                // A press that started/completed a remap capture is
+                // already handled (and consumed) above, before egui and
+                // before this match — this only ever sees ordinary clicks.
+                self.input
+                    .set_source(InputSource::Mouse(button), state == ElementState::Pressed);
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     self.input
-                        .set_key(code, event.state == ElementState::Pressed);
+                        .set_source(InputSource::Key(code), event.state == ElementState::Pressed);
                 }
 
                 if event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
-                        match code {
-                            KeyCode::Escape => match self.state {
+                        // toggle_diagnostics used to be special-cased here
+                        // too, but that bypassed trigger-kind gating
+                        // entirely (any press toggled it, regardless of
+                        // Tap/DoubleTap) — it's now handled generically
+                        // through InputTracker instead, same as
+                        // toggle_third_person/spectate/fly. See its
+                        // RedrawRequested call site.
+                        if code == KeyCode::Escape {
+                            match self.state {
                                 AppState::InGame => {
                                     self.state = AppState::Paused;
                                     self.apply_cursor_state();
@@ -1365,11 +1995,7 @@ impl ApplicationHandler for App {
                                     self.apply_cursor_state();
                                 }
                                 AppState::Launcher => {} // egui handles escape
-                            },
-                            key if key == self.controls.toggle_diagnostics => {
-                                self.show_diagnostics = !self.show_diagnostics;
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -1384,6 +2010,18 @@ impl ApplicationHandler for App {
                 let dt = now.duration_since(self.last_frame_instant).as_secs_f32();
                 self.last_frame_instant = now;
                 self.last_frame_dt = dt;
+
+                self.poll_gamepads();
+
+                // Auto-cancel an in-progress remap capture that's gone
+                // unanswered too long — without this, clicking the capture
+                // button and walking away would leave the Controls tab
+                // stuck showing "Press a key..." forever.
+                if let Some((_, started)) = &self.launcher.remapping {
+                    if started.elapsed() > REMAP_TIMEOUT {
+                        self.launcher.remapping = None;
+                    }
+                }
 
                 // Advance the maximize/unmaximize dance one step, if the
                 // previous step's resize was confirmed on a prior
@@ -1473,15 +2111,32 @@ impl ApplicationHandler for App {
                         // comment) so the delta isn't double-applied.
                         let (look_dx, look_dy) = self.input.take_mouse_delta();
                         let snap = InputSnapshot {
-                            move_forward: self.input.is_held(self.controls.forward),
-                            move_back: self.input.is_held(self.controls.back),
-                            move_left: self.input.is_held(self.controls.left),
-                            move_right: self.input.is_held(self.controls.right),
-                            jump: self.input.is_held(self.controls.jump),
-                            sneak: self.input.is_held(self.controls.sneak),
+                            move_forward: self.input.binding_active(&self.controls.forward),
+                            move_back: self.input.binding_active(&self.controls.back),
+                            move_left: self.input.binding_active(&self.controls.left),
+                            move_right: self.input.binding_active(&self.controls.right),
+                            jump: self.input.binding_active(&self.controls.jump),
+                            sneak: self.input.binding_active(&self.controls.sneak),
                             look_dx: look_dx * self.cfg.camera.mouse_sensitivity,
                             look_dy: look_dy * self.cfg.camera.mouse_sensitivity,
+                            walk_speed: self.cfg.player.walk_speed,
+                            fly_speed: self.cfg.player.fly_speed,
+                            jump_velocity: self.cfg.player.jump_velocity,
+                            gravity: self.cfg.player.gravity,
                         };
+                        // toggle_diagnostics is host-only (no guest round
+                        // trip needed) — InputTracker still applies its
+                        // configured trigger gating (tap/double-tap/hold)
+                        // the same as toggle_third_person/spectate/fly, just
+                        // acted on directly here instead of via InputEvent.
+                        if self
+                            .input_tracker
+                            .update(&self.input, dt)
+                            .iter()
+                            .any(|name| name == "toggle_diagnostics")
+                        {
+                            self.show_diagnostics = !self.show_diagnostics;
+                        }
                         set_tick_input(snap);
 
                         if let Some(game) = &self.wasm_game {
@@ -1495,6 +2150,44 @@ impl ApplicationHandler for App {
                         }
 
                         clear_tick_query();
+
+                        // Flush entity draw queue from game tick
+                        let cam_pos = self.camera.position;
+                        for req in cubic_wasm::take_draw_queue() {
+                            if let Some(&handle) = self.entity_meshes.get(&req.mesh_handle) {
+                                let relative = Vec3::new(req.x, req.y, req.z) - cam_pos;
+                                let cos_y = req.yaw.cos();
+                                // Negated (not req.yaw + PI): at yaw=0 this
+                                // matrix already maps the model's -Z front
+                                // (see player.obj) to world -Z correctly, so
+                                // adding PI would just turn the model to
+                                // face backward. The bug is a mirroring, not
+                                // a 180 offset — cubic_math::Camera::forward()
+                                // (and player.rs's own forward/right vectors)
+                                // define yaw such that local -Z rotates to
+                                // world (-sin(yaw), 0, -cos(yaw)), but this
+                                // matrix without the negation rotates it to
+                                // (sin(yaw), 0, -cos(yaw)) instead — correct
+                                // only at yaw = 0 or PI, mirrored everywhere
+                                // else. Negating sin_y (equivalent to using
+                                // -yaw) matches the engine's convention for
+                                // every yaw, not just the yaw=0 case a single
+                                // visual check at spawn would catch.
+                                let sin_y = -req.yaw.sin();
+                                let push = PushData {
+                                    model: [
+                                        [cos_y, 0.0, sin_y, 0.0],
+                                        [0.0, 1.0, 0.0, 0.0],
+                                        [-sin_y, 0.0, cos_y, 0.0],
+                                        [relative.x, relative.y, relative.z, 1.0],
+                                    ],
+                                    tint: [1.0, 1.0, 1.0, 1.0],
+                                    tex_index: req.tex_index,
+                                    _pad: [0; 3],
+                                };
+                                backend.draw_mesh(handle, push);
+                            }
+                        }
 
                         // --- Stream update ---
                         let center = world_pos_to_chunk(self.camera.position);
@@ -1740,27 +2433,26 @@ impl App {
             let right = forward.cross(Vec3::Y).normalize_or_zero();
             let mut movement = Vec3::ZERO;
 
-            if self.input.is_held(self.controls.forward) {
+            if self.input.binding_active(&self.controls.forward) {
                 movement += forward;
             }
-            if self.input.is_held(self.controls.back) {
+            if self.input.binding_active(&self.controls.back) {
                 movement -= forward;
             }
-            if self.input.is_held(self.controls.right) {
+            if self.input.binding_active(&self.controls.right) {
                 movement += right;
             }
-            if self.input.is_held(self.controls.left) {
+            if self.input.binding_active(&self.controls.left) {
                 movement -= right;
             }
-            if self.input.is_held(self.controls.jump) {
+            if self.input.binding_active(&self.controls.jump) {
                 movement += Vec3::Y;
             }
-            if self.input.is_held(self.controls.sneak) {
+            if self.input.binding_active(&self.controls.sneak) {
                 movement -= Vec3::Y;
             }
 
-            self.camera.position +=
-                movement.normalize_or_zero() * self.cfg.camera.move_speed * dt;
+            self.camera.position += movement.normalize_or_zero() * self.cfg.camera.move_speed * dt;
         }
     }
 
@@ -1858,6 +2550,74 @@ impl App {
             )
             .expect("failed to load game plugin"),
         );
+
+        // Set up asset loading callbacks before warm_up so on_load can call
+        // load-mesh/load-texture synchronously during the guest's on_load.
+        // Safety: warm_up() is synchronous and returns before these closures
+        // go out of scope. The pointers are valid for the duration of the call.
+        {
+            let backend_ptr = self.backend.as_mut().unwrap() as *mut Backend;
+            let entity_meshes_ptr = &mut self.entity_meshes as *mut HashMap<u32, MeshHandle>;
+            let next_id_ptr = &mut self.next_entity_mesh_id as *mut u32;
+            let game_dir = std::path::Path::new(&self.cfg.game.path)
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf();
+            let game_dir2 = game_dir.clone();
+
+            cubic_wasm::set_load_fns(
+                move |path: &str| {
+                    let full = game_dir.join(path);
+                    let backend = unsafe { &mut *backend_ptr };
+                    let entity_meshes = unsafe { &mut *entity_meshes_ptr };
+                    let next_id = unsafe { &mut *next_id_ptr };
+                    match crate::loader::load_obj_mesh(&full) {
+                        Ok((verts, idxs)) => match backend.upload_mesh(&verts, &idxs) {
+                            Ok(handle) => {
+                                let id = *next_id;
+                                *next_id += 1;
+                                entity_meshes.insert(id, handle);
+                                tracing::info!("loaded mesh: {path} -> handle {id}");
+                                id
+                            }
+                            Err(e) => {
+                                tracing::error!("load-mesh upload failed: {e}");
+                                0
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!("load-mesh failed for {path}: {e}");
+                            0
+                        }
+                    }
+                },
+                move |path: &str| {
+                    let full = game_dir2.join(path);
+                    let backend = unsafe { &mut *backend_ptr };
+                    match image::open(&full) {
+                        Ok(img) => {
+                            let rgba = img.to_rgba8();
+                            let (w, h) = rgba.dimensions();
+                            match backend.upload_texture(rgba.as_raw(), w, h) {
+                                Ok(idx) => {
+                                    tracing::info!("loaded texture: {path} -> index {idx}");
+                                    idx
+                                }
+                                Err(e) => {
+                                    tracing::error!("load-texture upload failed: {e}");
+                                    0
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("load-texture failed for {path}: {e}");
+                            0
+                        }
+                    }
+                },
+            );
+        }
+
         // Warm up (runs on_load, populates block registry) so the texture
         // loading below sees a populated registry immediately.
         plugin.warm_up();
@@ -2255,6 +3015,49 @@ impl App {
                     save_global_cfg(&self.cfg);
                 }
             });
+
+            ui.collapsing("Player", |ui| {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Walk speed (m/s)");
+                    changed |= ui
+                        .add(egui::Slider::new(
+                            &mut self.cfg.player.walk_speed,
+                            0.5..=20.0,
+                        ))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Fly speed (m/s)");
+                    changed |= ui
+                        .add(egui::Slider::new(
+                            &mut self.cfg.player.fly_speed,
+                            0.5..=50.0,
+                        ))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Jump velocity (m/s)");
+                    changed |= ui
+                        .add(egui::Slider::new(
+                            &mut self.cfg.player.jump_velocity,
+                            1.0..=20.0,
+                        ))
+                        .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Gravity (m/s\u{b2})");
+                    changed |= ui
+                        .add(egui::Slider::new(
+                            &mut self.cfg.player.gravity,
+                            -40.0..=-1.0,
+                        ))
+                        .changed();
+                });
+                if changed {
+                    save_global_cfg(&self.cfg);
+                }
+            });
         });
     }
 
@@ -2279,96 +3082,262 @@ impl App {
                 "toggle_diagnostics",
                 self.cfg.controls.toggle_diagnostics.clone(),
             ),
+            (
+                "Toggle third person",
+                "toggle_third_person",
+                self.cfg.controls.toggle_third_person.clone(),
+            ),
+            ("Spectate", "spectate", self.cfg.controls.spectate.clone()),
+            ("Fly", "fly", self.cfg.controls.fly.clone()),
         ];
 
-        for (label, key, current) in &controls {
+        for (label, action, current) in &controls {
             ui.horizontal(|ui| {
                 ui.label(*label);
-                let btn_label = if self.launcher.remapping.as_deref() == Some(key) {
-                    "Press a key...".to_string()
-                } else {
-                    current.clone()
-                };
-                if ui.button(&btn_label).clicked() {
-                    self.launcher.remapping = Some(key.to_string());
-                }
-            });
-        }
-        // Modifier keys (Shift/Ctrl/Alt) can't be captured this way: egui's
-        // `Key` enum has no variants for bare modifiers (they're only ever
-        // reported via `Modifiers` alongside another key), so binding a
-        // control to e.g. a lone ShiftLeft press isn't possible through this
-        // UI. Existing modifier bindings (sneak defaults to ShiftLeft) still
-        // work fine until the user tries to remap them here.
 
-        // Capture remapping key press
-        if self.launcher.remapping.is_some() {
-            ui.ctx().input(|i| {
-                for event in &i.events {
-                    if let egui::Event::Key {
-                        key, pressed: true, ..
-                    } = event
-                    {
-                        // Escape is reserved for pause/menu; don't let it be
-                        // bound to a control. Cancel the remap instead.
-                        if *key == egui::Key::Escape {
-                            self.launcher.remapping = None;
-                            continue;
+                // Base binding: captured by pressing/clicking it, via the
+                // raw winit event streams intercepted at the top of
+                // window_event (see that comment) rather than egui's own
+                // event stream — that's what makes modifier keys (ShiftLeft,
+                // ControlLeft, AltLeft, ...) usable as a control's own base
+                // key at all, and what lets a mouse button or gamepad
+                // button be captured too: egui's `Key` enum has no variants
+                // for bare modifier presses (they only ever show up via a
+                // `Modifiers` bitset alongside some other key, which can't
+                // tell ShiftLeft from ShiftRight anyway) and has no concept
+                // of mouse/gamepad buttons as bindable at all. This is
+                // unambiguous for a *base* key (there's only ever one, and
+                // it's the whole point of pressing it) — unlike the *combo*
+                // modifier below, which must not be captured this way (see
+                // its comment).
+                let capturing = matches!(&self.launcher.remapping, Some((a, _)) if a == action);
+                let btn_label = if capturing {
+                    "Press a key, click, or button... (Esc to cancel)".to_string()
+                } else {
+                    current.key.clone().unwrap_or_else(|| "unbound".to_string())
+                };
+                let btn = ui
+                    .button(&btn_label)
+                    .on_hover_text("Click to bind, right-click to clear");
+                if btn.clicked() {
+                    self.launcher.remapping = Some((action.to_string(), std::time::Instant::now()));
+                }
+                if btn.secondary_clicked() {
+                    self.clear_control_binding(action);
+                }
+
+                // Combo modifier: an explicit dropdown, not press-to-capture
+                // — "wait for the next key" can't distinguish "the user
+                // wants Shift+F6" from "the user wants to bind Shift
+                // itself," since the modifier's own key-down event arrives
+                // first either way. Selecting it here instead means nothing
+                // is reserved: any key can still be the base key (above),
+                // and any of Shift/Control/Alt can independently gate it.
+                let mut modifier = current.modifier;
+                egui::ComboBox::from_id_salt(format!("modifier_{action}"))
+                    .selected_text(if modifier == ModifierKey::None {
+                        "+ modifier".to_string()
+                    } else {
+                        modifier.label().to_string()
+                    })
+                    .show_ui(ui, |ui| {
+                        for m in [
+                            ModifierKey::None,
+                            ModifierKey::Shift,
+                            ModifierKey::Control,
+                            ModifierKey::Alt,
+                        ] {
+                            ui.selectable_value(&mut modifier, m, m.label());
                         }
-                        let Some(key_name) = egui_key_to_str(*key) else {
-                            tracing::warn!("unsupported key for remapping: {key:?}");
-                            continue;
-                        };
-                        if let Some(binding) = self.launcher.remapping.clone() {
-                            self.apply_control_remap(&binding, &key_name);
-                            self.launcher.remapping = None;
-                        }
+                    });
+                if modifier != current.modifier {
+                    self.set_control_modifier(action, modifier);
+                }
+
+                // Trigger kind — see TriggerKind's doc comment for what
+                // each option actually changes. Only shown for controls
+                // actually routed through InputTracker (toggle_diagnostics/
+                // toggle_third_person/spectate/fly); movement controls are
+                // read continuously via InputState::binding_active and
+                // never consult a trigger kind at all, so the dropdown
+                // would just be a confusing no-op there.
+                if matches!(
+                    *action,
+                    "toggle_diagnostics" | "toggle_third_person" | "spectate" | "fly"
+                ) {
+                    let mut trigger = current.trigger;
+                    egui::ComboBox::from_id_salt(format!("trigger_{action}"))
+                        .selected_text(trigger.label())
+                        .show_ui(ui, |ui| {
+                            for t in [TriggerKind::Tap, TriggerKind::DoubleTap] {
+                                ui.selectable_value(&mut trigger, t, t.label());
+                            }
+                        });
+                    if trigger != current.trigger {
+                        self.set_control_trigger(action, trigger);
                     }
                 }
             });
         }
     }
 
-    fn apply_control_remap(&mut self, binding: &str, key_name: &str) {
-        match binding {
-            "forward" => self.cfg.controls.forward = key_name.to_string(),
-            "back" => self.cfg.controls.back = key_name.to_string(),
-            "left" => self.cfg.controls.left = key_name.to_string(),
-            "right" => self.cfg.controls.right = key_name.to_string(),
-            "jump" => self.cfg.controls.jump = key_name.to_string(),
-            "sneak" => self.cfg.controls.sneak = key_name.to_string(),
-            "toggle_diagnostics" => self.cfg.controls.toggle_diagnostics = key_name.to_string(),
-            _ => {}
+    /// The live `KeyBinding` for a control named the same way the Controls
+    /// tab / InputTracker / InputEvent system already names actions
+    /// ("forward", "spectate", ...). Centralizing this name->field lookup
+    /// here is what lets remap/modifier/trigger changes share one small
+    /// generic setter each instead of three parallel match statements.
+    fn control_binding_mut(&mut self, name: &str) -> Option<&mut KeyBinding> {
+        match name {
+            "forward" => Some(&mut self.cfg.controls.forward),
+            "back" => Some(&mut self.cfg.controls.back),
+            "left" => Some(&mut self.cfg.controls.left),
+            "right" => Some(&mut self.cfg.controls.right),
+            "jump" => Some(&mut self.cfg.controls.jump),
+            "sneak" => Some(&mut self.cfg.controls.sneak),
+            "toggle_diagnostics" => Some(&mut self.cfg.controls.toggle_diagnostics),
+            "toggle_third_person" => Some(&mut self.cfg.controls.toggle_third_person),
+            "spectate" => Some(&mut self.cfg.controls.spectate),
+            "fly" => Some(&mut self.cfg.controls.fly),
+            _ => None,
         }
+    }
 
-        // Persist into the profile override (not just self.cfg, which is
-        // the resolved in-memory config and isn't what gets written to
-        // disk) so the remap survives restart.
+    /// The profile-override sparse entry for a control, creating it (and
+    /// its parent `ControlsOverride`) if this is the first time any part of
+    /// this control has been overridden.
+    fn control_override_mut(&mut self, name: &str) -> Option<&mut profile::KeyBindingOverride> {
         let ctrl = self
             .current_profile
             .controls
             .get_or_insert_with(Default::default);
-        match binding {
-            "forward" => ctrl.forward = Some(key_name.to_string()),
-            "back" => ctrl.back = Some(key_name.to_string()),
-            "left" => ctrl.left = Some(key_name.to_string()),
-            "right" => ctrl.right = Some(key_name.to_string()),
-            "jump" => ctrl.jump = Some(key_name.to_string()),
-            "sneak" => ctrl.sneak = Some(key_name.to_string()),
-            "toggle_diagnostics" => ctrl.toggle_diagnostics = Some(key_name.to_string()),
-            _ => {}
+        match name {
+            "forward" => Some(ctrl.forward.get_or_insert_with(Default::default)),
+            "back" => Some(ctrl.back.get_or_insert_with(Default::default)),
+            "left" => Some(ctrl.left.get_or_insert_with(Default::default)),
+            "right" => Some(ctrl.right.get_or_insert_with(Default::default)),
+            "jump" => Some(ctrl.jump.get_or_insert_with(Default::default)),
+            "sneak" => Some(ctrl.sneak.get_or_insert_with(Default::default)),
+            "toggle_diagnostics" => {
+                Some(ctrl.toggle_diagnostics.get_or_insert_with(Default::default))
+            }
+            "toggle_third_person" => Some(
+                ctrl.toggle_third_person
+                    .get_or_insert_with(Default::default),
+            ),
+            "spectate" => Some(ctrl.spectate.get_or_insert_with(Default::default)),
+            "fly" => Some(ctrl.fly.get_or_insert_with(Default::default)),
+            _ => None,
         }
+    }
+
+    /// Save the profile and rebuild `self.controls` *and* `self.input_tracker`
+    /// so a binding change (key/modifier/trigger, from any of the setters
+    /// below) applies immediately and survives restart — shared tail of all
+    /// of them. Rebuilding the tracker is essential, not just tidy: it caches
+    /// its own copy of every ResolvedBinding it watches (toggle_diagnostics/
+    /// toggle_third_person/spectate/fly), and without refreshing it here a
+    /// control's key/modifier/trigger could be changed in the UI and saved
+    /// to disk while runtime behavior kept using whatever was resolved at
+    /// startup — indistinguishable from the change doing nothing at all.
+    fn persist_control_change(&mut self) {
         if let Err(e) = profile::save(
             &self.current_profile,
             &self.current_game_name,
             &self.current_profile_name,
         ) {
-            tracing::warn!("failed to save profile after remap: {e}");
+            tracing::warn!("failed to save profile after control change: {e}");
         }
-
-        // Rebuild resolved controls so the new binding takes effect
-        // immediately, without waiting for a restart.
         self.controls = resolve_controls(&self.cfg);
+        self.input_tracker = InputTracker::new(&self.controls);
+    }
+
+    fn apply_control_remap(&mut self, binding: &str, key_name: &str) {
+        if let Some(b) = self.control_binding_mut(binding) {
+            b.key = Some(key_name.to_string());
+        }
+        if let Some(ov) = self.control_override_mut(binding) {
+            ov.key = Some(key_name.to_string());
+        }
+        self.persist_control_change();
+    }
+
+    /// Finish an in-progress remap capture with a newly-pressed input
+    /// source, converting it to config-string form. On failure (an
+    /// unrecognized source, e.g. a gilrs `Button::Unknown`), the capture is
+    /// deliberately left in progress rather than cancelled, so a stray
+    /// unsupported press doesn't kick the user out of capture mode — same
+    /// as the old keyboard-only behavior.
+    fn complete_remap(&mut self, binding: &str, source: InputSource) {
+        match input_source_to_string(source) {
+            Some(key_name) => {
+                self.apply_control_remap(binding, &key_name);
+                self.launcher.remapping = None;
+            }
+            None => tracing::warn!("unsupported input source for remapping: {source:?}"),
+        }
+    }
+
+    /// Unbind a control entirely (right-click on its key button in the
+    /// Controls tab) — also cancels any in-progress capture, so right-
+    /// clicking works as an unambiguous "clear" regardless of state.
+    fn clear_control_binding(&mut self, binding: &str) {
+        self.launcher.remapping = None;
+        if let Some(b) = self.control_binding_mut(binding) {
+            b.key = None;
+        }
+        if let Some(ov) = self.control_override_mut(binding) {
+            ov.key = Some(String::new());
+        }
+        self.persist_control_change();
+    }
+
+    /// Drain pending gilrs events: updates continuous held-state for
+    /// gamepad buttons the same way keyboard/mouse do, and — if the
+    /// Controls tab is capturing a new binding — completes it on the first
+    /// button press seen. Called once per rendered frame (RedrawRequested),
+    /// which keeps running in Launcher/Paused state, not just InGame.
+    fn poll_gamepads(&mut self) {
+        let Some(gilrs) = &mut self.gilrs else {
+            return;
+        };
+        let mut events = Vec::new();
+        while let Some(gilrs::Event { event, .. }) = gilrs.next_event() {
+            events.push(event);
+        }
+        for event in events {
+            match event {
+                gilrs::EventType::ButtonPressed(button, _) => {
+                    self.input.set_source(InputSource::Gamepad(button), true);
+                    if let Some((binding, _)) = self.launcher.remapping.clone() {
+                        self.complete_remap(&binding, InputSource::Gamepad(button));
+                    }
+                }
+                gilrs::EventType::ButtonReleased(button, _) => {
+                    self.input.set_source(InputSource::Gamepad(button), false);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn set_control_modifier(&mut self, binding: &str, modifier: ModifierKey) {
+        if let Some(b) = self.control_binding_mut(binding) {
+            b.modifier = modifier;
+        }
+        if let Some(ov) = self.control_override_mut(binding) {
+            ov.modifier = Some(modifier.cfg_str().to_string());
+        }
+        self.persist_control_change();
+    }
+
+    fn set_control_trigger(&mut self, binding: &str, trigger: TriggerKind) {
+        if let Some(b) = self.control_binding_mut(binding) {
+            b.trigger = trigger;
+        }
+        if let Some(ov) = self.control_override_mut(binding) {
+            ov.trigger = Some(trigger.cfg_str().to_string());
+        }
+        self.persist_control_change();
     }
     fn build_pause_ui(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
@@ -2397,6 +3366,22 @@ impl App {
                         .clicked()
                     {
                         self.pause_settings_open = !self.pause_settings_open;
+                    }
+
+                    ui.add_space(8.0);
+
+                    if ui
+                        .add_sized(btn_size, egui::Button::new("Toggle Spectate"))
+                        .clicked()
+                    {
+                        // Same discrete-event path a "spectate" keybind press
+                        // would take (see InputTracker::update) — the guest
+                        // treats a UI click and a key tap identically, both
+                        // just a Pressed event for the "spectate" action.
+                        cubic_wasm::push_input_event(cubic_wasm::InputEvent {
+                            name: "spectate".to_string(),
+                            kind: 0, // Pressed
+                        });
                     }
 
                     ui.add_space(8.0);
@@ -2439,8 +3424,18 @@ impl App {
                 let frame_ms = self.last_frame_dt * 1000.0;
                 ui.label(format!("{fps} fps  {frame_ms:.2}ms"));
 
-                // Position
-                let p = self.camera.position;
+                // Position — feet, not the camera, when a WASM game is
+                // driving: third-person orbit moves the camera away from
+                // the player, so camera.position alone would show orbit
+                // position instead of where the player actually is. In
+                // free-fly mode (no game loaded) there's no feet position
+                // to report, so fall back to the camera as before.
+                let p = if self.wasm_game.is_some() {
+                    let feet = cubic_wasm::get_player_feet();
+                    Vec3::new(feet.x, feet.y, feet.z)
+                } else {
+                    self.camera.position
+                };
                 ui.label(format!("XYZ: {:.1} / {:.1} / {:.1}", p.x, p.y, p.z));
 
                 // Facing
@@ -2597,7 +3592,216 @@ fn main() -> Result<()> {
         remesh_scratch: HashSet::new(),
         tex_map: HashMap::new(),
         face_textures: Arc::new(BlockFaceTextures::new()), // populated in resumed()
+        entity_meshes: HashMap::new(),
+        next_entity_mesh_id: 1,
+        input_tracker: InputTracker::new(&controls),
+        gilrs: gilrs::Gilrs::new()
+            .inspect_err(|e| tracing::warn!("gamepad support unavailable: {e}"))
+            .ok(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(key: KeyCode, modifier: ModifierKey, trigger: TriggerKind) -> ResolvedBinding {
+        ResolvedBinding {
+            source: Some(InputSource::Key(key)),
+            modifier,
+            trigger,
+        }
+    }
+
+    fn tracker_for(name: &str, binding: ResolvedBinding) -> InputTracker {
+        InputTracker {
+            actions: vec![(
+                name.to_string(),
+                binding,
+                ActionTracker {
+                    was_held: false,
+                    last_press_time: -1.0,
+                },
+            )],
+            elapsed: 0.0,
+        }
+    }
+
+    fn press(input: &mut InputState, key: KeyCode, pressed: bool) {
+        input.set_source(InputSource::Key(key), pressed);
+    }
+
+    #[test]
+    fn tap_trigger_fires_once_on_press_not_while_held() {
+        let mut tracker = tracker_for(
+            "x",
+            binding(KeyCode::KeyF, ModifierKey::None, TriggerKind::Tap),
+        );
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::KeyF, true);
+        assert_eq!(tracker.update(&input, 0.016), vec!["x".to_string()]);
+
+        // Still held on the next tick — must not re-fire.
+        assert!(tracker.update(&input, 0.016).is_empty());
+    }
+
+    #[test]
+    fn double_tap_trigger_suppresses_a_lone_tap() {
+        let mut tracker = tracker_for(
+            "x",
+            binding(KeyCode::Space, ModifierKey::None, TriggerKind::DoubleTap),
+        );
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::Space, true);
+        assert!(
+            tracker.update(&input, 0.05).is_empty(),
+            "a lone tap must not fire a DoubleTap-configured control \
+             (this is the exact bug being fixed: toggle_third_person set to \
+             DoubleTap used to fire on a single press)"
+        );
+    }
+
+    #[test]
+    fn double_tap_trigger_fires_on_a_genuine_rapid_double_press() {
+        let mut tracker = tracker_for(
+            "x",
+            binding(KeyCode::Space, ModifierKey::None, TriggerKind::DoubleTap),
+        );
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::Space, true);
+        assert!(tracker.update(&input, 0.05).is_empty()); // elapsed 0.05
+
+        press(&mut input, KeyCode::Space, false);
+        tracker.update(&input, 0.05); // elapsed 0.10, Released
+
+        press(&mut input, KeyCode::Space, true); // second press 0.10s after the first
+        assert_eq!(
+            tracker.update(&input, 0.05), // elapsed 0.15
+            vec!["x".to_string()],
+            "a rapid second press within the 0.3s window must fire"
+        );
+    }
+
+    #[test]
+    fn double_tap_trigger_does_not_fire_on_two_slow_taps() {
+        let mut tracker = tracker_for(
+            "x",
+            binding(KeyCode::Space, ModifierKey::None, TriggerKind::DoubleTap),
+        );
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::Space, true);
+        tracker.update(&input, 0.05); // elapsed 0.05
+
+        press(&mut input, KeyCode::Space, false);
+        tracker.update(&input, 0.05); // elapsed 0.10
+
+        press(&mut input, KeyCode::Space, true); // second press ~1s after the first
+        assert!(
+            tracker.update(&input, 1.0).is_empty(), // elapsed 1.10
+            "two taps more than 0.3s apart must not count as a double-tap"
+        );
+    }
+
+    #[test]
+    fn modifier_gates_activation_and_is_side_agnostic() {
+        let b = binding(KeyCode::F6, ModifierKey::Shift, TriggerKind::Tap);
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::F6, true);
+        assert!(
+            !input.binding_active(&b),
+            "key alone shouldn't activate a Shift-gated binding"
+        );
+
+        press(&mut input, KeyCode::ShiftLeft, true);
+        assert!(
+            input.binding_active(&b),
+            "key + ShiftLeft should activate it"
+        );
+
+        press(&mut input, KeyCode::ShiftLeft, false);
+        press(&mut input, KeyCode::ShiftRight, true);
+        assert!(
+            input.binding_active(&b),
+            "either shift side should satisfy a generic Shift modifier"
+        );
+    }
+
+    #[test]
+    fn unbound_binding_never_activates() {
+        let b = ResolvedBinding {
+            source: None,
+            modifier: ModifierKey::None,
+            trigger: TriggerKind::Tap,
+        };
+        let mut input = InputState::default();
+        press(&mut input, KeyCode::F6, true); // holding some unrelated key
+        assert!(!input.binding_active(&b));
+    }
+
+    #[test]
+    fn mouse_button_activates_a_binding_the_same_as_a_key() {
+        let b = ResolvedBinding {
+            source: Some(InputSource::Mouse(MouseButton::Right)),
+            modifier: ModifierKey::None,
+            trigger: TriggerKind::Tap,
+        };
+        let mut input = InputState::default();
+        assert!(!input.binding_active(&b));
+
+        input.set_source(InputSource::Mouse(MouseButton::Right), true);
+        assert!(input.binding_active(&b));
+
+        input.set_source(InputSource::Mouse(MouseButton::Right), false);
+        assert!(!input.binding_active(&b));
+    }
+
+    #[test]
+    fn gamepad_button_activates_a_binding_the_same_as_a_key() {
+        let b = ResolvedBinding {
+            source: Some(InputSource::Gamepad(gilrs::Button::South)),
+            modifier: ModifierKey::None,
+            trigger: TriggerKind::Tap,
+        };
+        let mut input = InputState::default();
+        input.set_source(InputSource::Gamepad(gilrs::Button::South), true);
+        assert!(input.binding_active(&b));
+    }
+
+    #[test]
+    fn input_source_round_trips_through_config_strings() {
+        for source in [
+            InputSource::Key(KeyCode::KeyW),
+            InputSource::Mouse(MouseButton::Left),
+            InputSource::Mouse(MouseButton::Other(7)),
+            InputSource::Gamepad(gilrs::Button::South),
+            InputSource::Gamepad(gilrs::Button::DPadUp),
+        ] {
+            let s = input_source_to_string(source).expect("source should stringify");
+            assert_eq!(
+                str_to_input_source(&s),
+                Some(source),
+                "round trip failed for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_kind_has_no_hold_variant() {
+        // Regression guard for the removed Hold trigger: legacy/empty
+        // bindings and KeyBinding::key's default must land on Tap instead
+        // (Hold and Tap fired identically anyway, so this is a pure label
+        // change, not a behavior change).
+        assert_eq!(KeyBinding::key("KeyW").trigger, TriggerKind::Tap);
+        assert_eq!(
+            KeyBinding::unbound(TriggerKind::Tap).trigger,
+            TriggerKind::Tap
+        );
+    }
 }

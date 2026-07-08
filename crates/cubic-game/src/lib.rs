@@ -181,9 +181,19 @@ const CHUNK_SIZE: usize = 32;
 const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 const VOXEL_SIZE: f32 = 0.5;
 
+/// Clearance above the queried surface height used for the player's spawn
+/// point (see `on_load`) — one voxel is enough to start in air rather than
+/// exactly on the solid/air boundary, given a negligible, near-instant fall
+/// onto the real surface (sweep_aabb's de-penetration step covers any
+/// residual voxel-quantization overlap).
+const SPAWN_MARGIN: f32 = VOXEL_SIZE;
+
 // ---------------------------------------------------------------------------
 // WIT guest implementation
 // ---------------------------------------------------------------------------
+
+static PLAYER_MESH: OnceLock<u32> = OnceLock::new();
+static PLAYER_TEX: OnceLock<u32> = OnceLock::new();
 
 struct GamePlugin;
 
@@ -239,6 +249,16 @@ impl Guest for GamePlugin {
             })
             .collect();
 
+        // Load player model
+        let mesh_path = b"assets/models/player.obj";
+        let mesh_handle =
+            cubic::game::render::load_mesh(mesh_path.as_ptr() as u32, mesh_path.len() as u32);
+        let tex_path = b"assets/textures/player.png";
+        let tex_index =
+            cubic::game::render::load_texture(tex_path.as_ptr() as u32, tex_path.len() as u32);
+        PLAYER_MESH.set(mesh_handle).ok();
+        PLAYER_TEX.set(tex_index).ok();
+
         let fallback_id = block_ids.get("stone").copied().unwrap_or(0);
 
         GENERATOR
@@ -251,8 +271,20 @@ impl Guest for GamePlugin {
             })
             .unwrap_or_else(|_| panic!("on_load called twice"));
 
+        // Spawn at the actual terrain height under (0, 0) — surface_height
+        // is the same continuous height function generate() already uses to
+        // decide solid-vs-air, and it needs no chunks loaded, so we can
+        // query it directly instead of guessing a fixed height (which can
+        // land below the real surface on tall-terrain seeds) or dropping
+        // the player from way above and waiting for gravity. SPAWN_MARGIN
+        // is just enough clearance that the spawn AABB starts in air, not
+        // exactly on the solid/air boundary; sweep_aabb's de-penetration
+        // step (see cubic-world/src/physics.rs) covers the rest if this
+        // column's voxel quantization puts solid ground fractionally above
+        // that estimate.
+        let spawn_y = generator().surface_height(0.0, 0.0) + SPAWN_MARGIN;
         PLAYER
-            .set(PlayerCell(RefCell::new(Player::new())))
+            .set(PlayerCell(RefCell::new(Player::new(spawn_y))))
             .unwrap_or_else(|_| panic!("on_load called twice"));
 
         0
@@ -308,12 +340,8 @@ impl Guest for GamePlugin {
 
 impl exports::cubic::game::tick::Guest for GamePlugin {
     fn on_tick(dt: f32) {
-        // Read input from host — out-ptr pattern, 32 bytes. Stack-allocated
-        // is fine; see the matching note on the sweep-aabb buffer in
-        // player.rs.
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; 48];
         cubic::game::input::get_input(buf.as_mut_ptr() as u32);
-
         let input_state = InputState {
             move_forward: i32::from_le_bytes(buf[0..4].try_into().unwrap()) != 0,
             move_back: i32::from_le_bytes(buf[4..8].try_into().unwrap()) != 0,
@@ -323,11 +351,74 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
             sneak: i32::from_le_bytes(buf[20..24].try_into().unwrap()) != 0,
             look_dx: f32::from_le_bytes(buf[24..28].try_into().unwrap()),
             look_dy: f32::from_le_bytes(buf[28..32].try_into().unwrap()),
+            walk_speed: f32::from_le_bytes(buf[32..36].try_into().unwrap()),
+            fly_speed: f32::from_le_bytes(buf[36..40].try_into().unwrap()),
+            jump_velocity: f32::from_le_bytes(buf[40..44].try_into().unwrap()),
+            gravity: f32::from_le_bytes(buf[44..48].try_into().unwrap()),
         };
+
+        // Read discrete events — up to 64 events * 40 bytes = 2560 bytes
+        let mut evt_buf = [0u8; 2560];
+        let evt_bytes =
+            cubic::game::input::get_events(evt_buf.as_mut_ptr() as u32, evt_buf.len() as u32)
+                as usize;
 
         if let Some(player_cell) = PLAYER.get() {
             let mut player = player_cell.0.borrow_mut();
+
+            // Process discrete events before tick. The host (InputTracker)
+            // has already decided *whether* each control's configured
+            // trigger (tap vs double-tap) was satisfied this tick — it only
+            // ever forwards an event once that's true — so the guest reacts
+            // to the action name alone, not a specific kind. kind==1
+            // (Released) is still delivered for possible future use, but
+            // none of these toggle-style actions care about it.
+            let mut i = 0;
+            while i + 40 <= evt_bytes {
+                let name_bytes = &evt_buf[i..i + 32];
+                let name = std::str::from_utf8(name_bytes)
+                    .unwrap_or("")
+                    .trim_end_matches('\0');
+                let kind = u32::from_le_bytes(evt_buf[i + 32..i + 36].try_into().unwrap());
+                if kind != 1 {
+                    match name {
+                        "fly" => {
+                            player.flying = !player.flying;
+                            player.vel[1] = 0.0;
+                        }
+                        "spectate" => {
+                            // Initialize spectator_pos to the current eye on
+                            // the ON transition only, so re-entering
+                            // spectate later doesn't snap the camera back to
+                            // a stale position.
+                            if !player.spectating {
+                                player.spectator_pos = player.eye_pos();
+                            }
+                            player.spectating = !player.spectating;
+                        }
+                        "toggle_third_person" => {
+                            player.third_person = !player.third_person;
+                        }
+                        _ => {}
+                    }
+                }
+                i += 40;
+            }
+
             player.tick(dt, &input_state);
+
+            if player.third_person
+                && let (Some(&mesh), Some(&tex)) = (PLAYER_MESH.get(), PLAYER_TEX.get())
+            {
+                cubic::game::render::draw_mesh(
+                    mesh,
+                    tex,
+                    player.pos[0],
+                    player.pos[1],
+                    player.pos[2],
+                    player.yaw,
+                );
+            }
         }
     }
 }
