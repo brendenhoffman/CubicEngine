@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
 //! Launcher screen: game/profile/settings/controls tabs, remap capture, and
 //! the Launch button's transition into InGame.
 
+use crate::backend::RendererBackend;
 use crate::config::{save_global_cfg, KeyBinding, ModifierKey, TextureFilter, TriggerKind};
 use crate::input::{input_source_to_string, resolve_controls, InputSource, InputTracker};
 use crate::profile;
-use crate::{App, AppState, RendererBackend};
+use crate::{App, AppState};
 use cubic_platform::winit::window::Fullscreen;
 
 use super::{GameEntry, LauncherTab, PendingWindowedResize, WindowMode};
@@ -54,7 +56,7 @@ fn read_game_display_name(game_dir: &std::path::Path) -> Option<String> {
 impl App {
     /// Called by the launcher's Launch button (and nothing else yet — the
     /// selected game/profile in `self.launcher` isn't re-resolved into
-    /// `self.cfg`/`self.plugin` here; switching games/profiles at runtime is
+    /// `self.cfg`/`self.guest.plugin` here; switching games/profiles at runtime is
     /// future work, per the `current_profile`/`current_game_name` fields).
     pub(crate) fn handle_launch(&mut self) {
         // Parse seed

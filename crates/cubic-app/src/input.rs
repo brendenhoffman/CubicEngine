@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
 //! Physical input: keycode/mouse/gamepad string round-tripping, resolved
 //! bindings, and the discrete-event tracker (tap/double-tap).
 

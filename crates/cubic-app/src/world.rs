@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
 //! World (re)loading and the per-frame guest tick / chunk streaming /
 //! upload / remesh / draw pipeline driven from RedrawRequested.
 
@@ -16,8 +17,52 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::error;
 
+use cubic_world::ChunkPos;
+
+use crate::backend::{Backend, RendererBackend};
 use crate::frustum::Frustum;
-use crate::{App, Backend, RendererBackend};
+use crate::App;
+
+/// Renderer-facing world state: chunk/entity mesh handles, the bindless
+/// texture-index lookups meshing needs, and the streaming pipeline that
+/// drives them. Grouped here (rather than flat on `App`) because it's all
+/// renderer-adjacent data — a mesh handle or a texture index means nothing
+/// without the `Backend` it was uploaded to — populated by `load_world`
+/// and consumed every frame by `world_tick_and_draw`.
+pub(crate) struct WorldRenderer {
+    pub(crate) stream: AsyncWorldStream,
+    pub(crate) chunk_meshes: HashMap<ChunkPos, MeshHandle>,
+    // Path (relative to the game's data dir) -> bindless texture index,
+    // populated by load_world() from the WASM plugin's block registry.
+    // Consumed by the mesher to assign tex_index per face.
+    pub(crate) tex_map: HashMap<String, u32>,
+    // Per-block-per-face bindless texture index lookup built from tex_map
+    // in load_world(); Arc'd so streaming worker threads can share it.
+    pub(crate) face_textures: Arc<BlockFaceTextures>,
+    pub(crate) entity_meshes: HashMap<u32, MeshHandle>,
+    pub(crate) next_entity_mesh_id: u32,
+    pub(crate) remesh_scratch: HashSet<ChunkPos>,
+    pub(crate) seed: u64,
+}
+
+impl WorldRenderer {
+    pub(crate) fn new(stream_radius: i32, stream_radius_y: i32) -> Self {
+        Self {
+            stream: AsyncWorldStream::new(
+                stream_radius,
+                stream_radius_y,
+                Some(Arc::new(cubic_wasm::set_worker_id as fn(usize))),
+            ),
+            chunk_meshes: HashMap::new(),
+            tex_map: HashMap::new(),
+            face_textures: Arc::new(BlockFaceTextures::new()),
+            entity_meshes: HashMap::new(),
+            next_entity_mesh_id: 1,
+            remesh_scratch: HashSet::new(),
+            seed: 0,
+        }
+    }
+}
 
 impl App {
     /// Load block-face textures into the bindless array and (re)start world
@@ -28,9 +73,9 @@ impl App {
         // Reset state from any previous world so re-launching works
         // cleanly (no supported way to trigger that yet, but load_world()
         // shouldn't assume it only ever runs once).
-        self.chunk_meshes.clear();
-        self.face_textures = Arc::new(BlockFaceTextures::new());
-        self.tex_map = HashMap::new();
+        self.world.chunk_meshes.clear();
+        self.world.face_textures = Arc::new(BlockFaceTextures::new());
+        self.world.tex_map = HashMap::new();
 
         // Reinitialize seed
         let seed = if self.cfg.world.seed == 0 {
@@ -41,7 +86,7 @@ impl App {
         } else {
             self.cfg.world.seed
         };
-        self.seed = seed;
+        self.world.seed = seed;
 
         // Construct the WASM plugin fresh, with this launch's seed baked
         // in — there's no way to change the seed on an existing WasmPlugin
@@ -69,8 +114,8 @@ impl App {
         // go out of scope. The pointers are valid for the duration of the call.
         {
             let backend_ptr = self.backend.as_mut().unwrap() as *mut Backend;
-            let entity_meshes_ptr = &mut self.entity_meshes as *mut HashMap<u32, MeshHandle>;
-            let next_id_ptr = &mut self.next_entity_mesh_id as *mut u32;
+            let entity_meshes_ptr = &mut self.world.entity_meshes as *mut HashMap<u32, MeshHandle>;
+            let next_id_ptr = &mut self.world.next_entity_mesh_id as *mut u32;
             let game_dir = std::path::Path::new(&self.cfg.game.path)
                 .parent()
                 .unwrap_or(std::path::Path::new("."))
@@ -133,10 +178,10 @@ impl App {
         // Warm up (runs on_load, populates block registry) so the texture
         // loading below sees a populated registry immediately.
         plugin.warm_up();
-        self.plugin = Some(Arc::clone(&plugin));
+        self.guest.plugin = Some(Arc::clone(&plugin));
         let wasm_gen = Arc::new(WasmWorldGenerator::new(Arc::clone(&plugin)));
-        self.generator = Some(Arc::clone(&wasm_gen) as Arc<dyn WorldGenerator>);
-        self.wasm_game = Some(wasm_gen);
+        self.guest.generator = Some(Arc::clone(&wasm_gen) as Arc<dyn WorldGenerator>);
+        self.guest.wasm_game = Some(wasm_gen);
 
         // Load textures
         if let Some(backend) = &mut self.backend {
@@ -180,7 +225,7 @@ impl App {
                     Err(e) => error!("failed to load texture {full:?}: {e}"),
                 }
             }
-            self.tex_map = tex_map;
+            self.world.tex_map = tex_map;
 
             // Build the per-block-per-face texture lookup the mesher
             // indexes by BlockTypeId, now that tex_map has the path ->
@@ -191,7 +236,7 @@ impl App {
             for def in registry.all_defs() {
                 // dir order: -X, +X, -Y, +Y, -Z, +Z
                 // face mapping: left/right=sides, bottom=-Y, top=+Y, front/back=sides
-                let get = |path: &str| self.tex_map.get(path).copied().unwrap_or(0);
+                let get = |path: &str| self.world.tex_map.get(path).copied().unwrap_or(0);
                 face_textures.push([
                     get(&def.faces.left),   // -X
                     get(&def.faces.right),  // +X
@@ -201,17 +246,17 @@ impl App {
                     get(&def.faces.back),   // +Z
                 ]);
             }
-            self.face_textures = Arc::new(face_textures);
+            self.world.face_textures = Arc::new(face_textures);
         }
 
         // Initialize streaming using the current (possibly launcher-edited)
         // radius settings, not whatever main() built App with.
-        self.stream = AsyncWorldStream::new(
+        self.world.stream = AsyncWorldStream::new(
             self.cfg.world.stream_radius,
             self.cfg.world.stream_radius_y,
             Some(Arc::new(cubic_wasm::set_worker_id as fn(usize))),
         );
-        self.chunk_meshes.clear();
+        self.world.chunk_meshes.clear();
     }
 
     /// Advance the guest tick, chunk streaming, mesh upload/remesh, and
@@ -227,10 +272,10 @@ impl App {
     ) {
         // --- Physics tick ---
         // Bracket on_tick with a chunk-query view borrowed from
-        // self.stream: queries happen on the main thread, sequentially,
+        // self.world.stream: queries happen on the main thread, sequentially,
         // before the streaming update below mutates chunks, so no locking
         // or copying is needed — just a borrow scoped to this call.
-        let view = self.stream.query_view();
+        let view = self.world.stream.query_view();
         set_tick_query(&view);
 
         // take_mouse_delta() is consumed here for the game tick —
@@ -268,7 +313,7 @@ impl App {
         }
         set_tick_input(snap);
 
-        if let Some(game) = &self.wasm_game {
+        if let Some(game) = &self.guest.wasm_game {
             game.tick(dt);
         }
 
@@ -283,11 +328,11 @@ impl App {
         // Apply any block edits (break/place) the guest requested this
         // tick — deferred until after the chunk-query borrow above ends,
         // since it aliases the same chunk data (see BlockEditRequest's doc
-        // comment). set_block_at pushes into self.stream.remesh_queue,
+        // comment). set_block_at pushes into self.world.stream.remesh_queue,
         // which the boundary remesh pass below already drains — no
         // separate "upload this edit's mesh" step needed.
         for edit in cubic_wasm::take_block_edits() {
-            self.stream.set_block_at(
+            self.world.stream.set_block_at(
                 edit.x,
                 edit.y,
                 edit.z,
@@ -298,7 +343,7 @@ impl App {
         // Flush entity draw queue from game tick
         let cam_pos = self.camera.position;
         for req in cubic_wasm::take_draw_queue() {
-            if let Some(&handle) = self.entity_meshes.get(&req.mesh_handle) {
+            if let Some(&handle) = self.world.entity_meshes.get(&req.mesh_handle) {
                 let relative = Vec3::new(req.x, req.y, req.z) - cam_pos;
                 let cos_y = req.yaw.cos();
                 // Negated (not req.yaw + PI): at yaw=0 this matrix already
@@ -332,15 +377,15 @@ impl App {
 
         // --- Stream update ---
         let center = world_pos_to_chunk(self.camera.position);
-        let delta = self.stream.update(
+        let delta = self.world.stream.update(
             center,
-            self.generator.as_ref().unwrap(),
-            self.seed,
-            &self.face_textures,
+            self.guest.generator.as_ref().unwrap(),
+            self.world.seed,
+            &self.world.face_textures,
         );
 
         for pos in delta.unloaded {
-            if let Some(handle) = self.chunk_meshes.remove(&pos) {
+            if let Some(handle) = self.world.chunk_meshes.remove(&pos) {
                 backend.free_mesh(handle);
             }
         }
@@ -356,50 +401,51 @@ impl App {
 
         // Upload new chunks
         while std::time::Instant::now() < budget_deadline {
-            let Some((pos, verts, idxs)) = self.stream.ready_meshes.pop() else {
+            let Some((pos, verts, idxs)) = self.world.stream.ready_meshes.pop() else {
                 break;
             };
             match backend.upload_mesh(&verts, &idxs) {
                 Ok(handle) => {
-                    self.chunk_meshes.insert(pos, handle);
+                    self.world.chunk_meshes.insert(pos, handle);
                 }
                 Err(e) => error!("chunk {pos:?} upload failed: {e}"),
             }
         }
 
         // Boundary remesh — shares the same deadline
-        self.remesh_scratch.clear();
-        self.remesh_scratch
-            .extend(self.stream.remesh_queue.drain(..));
+        self.world.remesh_scratch.clear();
+        self.world
+            .remesh_scratch
+            .extend(self.world.stream.remesh_queue.drain(..));
         let mut deferred = Vec::new();
-        for &pos in &self.remesh_scratch {
+        for &pos in &self.world.remesh_scratch {
             if std::time::Instant::now() >= budget_deadline {
                 deferred.push(pos);
                 continue;
             }
-            let neighbors = self.stream.neighbors(pos);
+            let neighbors = self.world.stream.neighbors(pos);
             if neighbors.iter().all(Option::is_none) {
                 continue;
             }
-            let chunk = match self.stream.chunks().get(&pos) {
+            let chunk = match self.world.stream.chunks().get(&pos) {
                 Some(c) => c,
                 None => continue,
             };
-            let (verts, idxs) = mesh_chunk(chunk, neighbors, &self.face_textures);
-            if let Some(old) = self.chunk_meshes.remove(&pos) {
+            let (verts, idxs) = mesh_chunk(chunk, neighbors, &self.world.face_textures);
+            if let Some(old) = self.world.chunk_meshes.remove(&pos) {
                 backend.free_mesh(old);
             }
             if !verts.is_empty() {
                 match backend.upload_mesh(&verts, &idxs) {
                     Ok(handle) => {
-                        self.chunk_meshes.insert(pos, handle);
-                        self.stream.mark_remeshed(pos);
+                        self.world.chunk_meshes.insert(pos, handle);
+                        self.world.stream.mark_remeshed(pos);
                     }
                     Err(e) => error!("remesh {pos:?} failed: {e}"),
                 }
             }
         }
-        self.stream.remesh_queue.extend(deferred);
+        self.world.stream.remesh_queue.extend(deferred);
 
         // --- Draw ---
         backend.set_camera(self.camera);
@@ -411,7 +457,7 @@ impl App {
         let chunk_world_size = CHUNK_SIZE as f32 * VOXEL_SIZE;
         let cam_pos = self.camera.position; // snapshot once
 
-        for (&pos, &handle) in &self.chunk_meshes {
+        for (&pos, &handle) in &self.world.chunk_meshes {
             let world_origin = pos.to_world_origin();
             let relative = world_origin - cam_pos; // camera-relative translation
             let min = relative;

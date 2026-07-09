@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
 //! cubic.toml config structs, profile/game-override resolution, and
 //! persistence (save_global_cfg).
 

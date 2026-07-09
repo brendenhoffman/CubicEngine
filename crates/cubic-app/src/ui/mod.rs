@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
 //! egui UI: launcher/pause/diagnostics screens and the shared launcher
 //! state/types they operate on.
 
@@ -199,7 +200,7 @@ impl App {
                 // position instead of where the player actually is. In
                 // free-fly mode (no game loaded) there's no feet position
                 // to report, so fall back to the camera as before.
-                let p = if self.wasm_game.is_some() {
+                let p = if self.guest.wasm_game.is_some() {
                     let feet = cubic_wasm::get_player_feet();
                     cubic_math::Vec3::new(feet.x, feet.y, feet.z)
                 } else {
@@ -221,8 +222,8 @@ impl App {
                 ));
 
                 // Chunk stats
-                let loaded = self.chunk_meshes.len();
-                let pending = self.stream.ready_meshes.len();
+                let loaded = self.world.chunk_meshes.len();
+                let pending = self.world.stream.ready_meshes.len();
                 ui.label(format!("Chunks: {loaded} loaded  {pending} pending"));
 
                 // Block position (which voxel the camera is in)

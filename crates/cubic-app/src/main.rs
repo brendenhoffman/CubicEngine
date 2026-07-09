@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
+mod backend;
 mod config;
 #[cfg(debug_assertions)]
 mod flat_generator;
 mod frustum;
 mod game_override;
+mod guest;
 mod input;
 mod loader;
 mod profile;
 mod ui;
 mod world;
 
+use backend::{Backend, RendererBackend};
 use config::{
     apply_game_override, apply_profile, build_custom_controls, load_cfg, AppCfg, CustomControl,
-    HdrFlavorCfg, MipmapMode, RenderCfg, TextureFilter, UnfocusedPolicy, VsyncMode,
+    RenderCfg, UnfocusedPolicy, VsyncMode,
 };
 #[cfg(test)]
 use config::{KeyBinding, ModifierKey, TriggerKind};
@@ -40,16 +43,10 @@ use cubic_platform::winit::{
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
     window::{CursorGrabMode, Window, WindowId},
 };
-use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
+use cubic_render::{RenderSize, Renderer};
 use cubic_render_gl::GlRenderer;
-use cubic_render_vk::{Filter, HdrFlavor, SamplerMipmapMode, VkRenderer, VkVsyncMode};
-use cubic_wasm::{WasmPlugin, WasmWorldGenerator};
-use cubic_world::{
-    AsyncWorldStream, BlockFaceTextures, ChunkPos, WorldGenerator, CHUNK_SIZE, VOXEL_SIZE,
-};
-use egui::{ClippedPrimitive, TexturesDelta};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use cubic_render_vk::VkRenderer;
+use cubic_world::{CHUNK_SIZE, VOXEL_SIZE};
 use tracing::{error, info};
 
 // ---------------------------------------------------------------------------
@@ -69,145 +66,6 @@ struct Args {
     /// Choose renderer backend: gl | vk
     #[arg(long, default_value = "vk")]
     backend: String,
-}
-
-// ---------------------------------------------------------------------------
-// Backend abstraction
-// ---------------------------------------------------------------------------
-
-trait RendererBackend {
-    fn resize(&mut self, size: RenderSize) -> Result<()>;
-    fn set_clear_color(&mut self, rgba: [f32; 4]);
-    fn set_vsync(&mut self, on: bool);
-    fn configure_advanced(&mut self, cfg: &RenderCfg);
-    fn upload_mesh(&mut self, verts: &[Vertex], idxs: &[u32]) -> Result<MeshHandle>;
-    fn set_camera(&mut self, camera: Camera);
-    fn draw_mesh(&mut self, handle: MeshHandle, push: PushData);
-    fn render(&mut self) -> Result<()>;
-    fn free_mesh(&mut self, _handle: MeshHandle) {} // default no-op
-    fn upload_texture(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<u32>;
-    fn queue_egui(
-        &mut self,
-        textures_delta: TexturesDelta,
-        paint_jobs: Vec<ClippedPrimitive>,
-        w: u32,
-        h: u32,
-        ppp: f32,
-    );
-}
-
-enum Backend {
-    Gl(Box<GlRenderer>),
-    Vk(Box<VkRenderer>),
-}
-
-impl RendererBackend for Backend {
-    fn resize(&mut self, size: RenderSize) -> Result<()> {
-        match self {
-            Backend::Gl(r) => r.resize(size),
-            Backend::Vk(r) => r.resize(size),
-        }
-    }
-
-    fn set_clear_color(&mut self, rgba: [f32; 4]) {
-        match self {
-            Backend::Gl(r) => r.set_clear_color(rgba),
-            Backend::Vk(r) => r.set_clear_color(rgba),
-        }
-    }
-
-    fn set_vsync(&mut self, on: bool) {
-        match self {
-            Backend::Gl(r) => r.set_vsync(on),
-            Backend::Vk(r) => r.set_vsync(on),
-        }
-    }
-
-    fn configure_advanced(&mut self, cfg: &RenderCfg) {
-        // GL has no advanced knobs yet.
-        if let Backend::Vk(r) = self {
-            let mode = match cfg.vsync_mode {
-                VsyncMode::Fifo => VkVsyncMode::Fifo,
-                VsyncMode::Mailbox => VkVsyncMode::Mailbox,
-            };
-            r.set_vsync_mode(mode);
-            r.set_hdr_enabled(cfg.hdr);
-            let flavor = match cfg.hdr_flavor {
-                HdrFlavorCfg::PreferScrgb => HdrFlavor::PreferScrgb,
-                HdrFlavorCfg::PreferHdr10 => HdrFlavor::PreferHdr10,
-            };
-            r.set_hdr_flavor(flavor);
-
-            let filter = match cfg.texture_filter {
-                TextureFilter::Nearest => Filter::NEAREST,
-                TextureFilter::Linear => Filter::LINEAR,
-            };
-            let mipmap_mode = match cfg.mipmap_mode {
-                MipmapMode::Nearest => SamplerMipmapMode::NEAREST,
-                MipmapMode::Linear => SamplerMipmapMode::LINEAR,
-            };
-            r.set_sampler_config(filter, filter, mipmap_mode, cfg.anisotropy, cfg.lod_bias);
-        }
-    }
-
-    fn upload_mesh(&mut self, verts: &[Vertex], idxs: &[u32]) -> Result<MeshHandle> {
-        match self {
-            // GL mesh API not yet implemented; uploaded meshes are silently
-            // dropped until the GL backend card is complete.
-            Backend::Gl(_) => Ok(MeshHandle(u32::MAX)),
-            Backend::Vk(r) => r.upload_mesh(verts, idxs),
-        }
-    }
-
-    fn set_camera(&mut self, camera: Camera) {
-        match self {
-            Backend::Gl(_) => {} // GL camera via uniforms — not yet implemented.
-            Backend::Vk(r) => r.set_camera(camera),
-        }
-    }
-
-    fn draw_mesh(&mut self, handle: MeshHandle, push: PushData) {
-        match self {
-            Backend::Gl(_) => {} // GL draw_mesh — not yet implemented.
-            Backend::Vk(r) => r.draw_mesh(handle, push),
-        }
-    }
-
-    fn free_mesh(&mut self, handle: MeshHandle) {
-        match self {
-            Backend::Gl(_) => {}
-            Backend::Vk(r) => r.free_mesh(handle),
-        }
-    }
-
-    fn render(&mut self) -> Result<()> {
-        match self {
-            Backend::Gl(r) => r.render(),
-            Backend::Vk(r) => r.render(),
-        }
-    }
-
-    fn upload_texture(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<u32> {
-        match self {
-            // GL texture API not yet implemented.
-            Backend::Gl(_) => Ok(0),
-            Backend::Vk(r) => r.upload_texture(pixels, width, height),
-        }
-    }
-
-    fn queue_egui(
-        &mut self,
-        textures_delta: TexturesDelta,
-        paint_jobs: Vec<ClippedPrimitive>,
-        w: u32,
-        h: u32,
-        ppp: f32,
-    ) {
-        match self {
-            Backend::Gl(_) => {}
-            Backend::Vk(r) => r.queue_egui(textures_delta, paint_jobs, w, h, ppp),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -279,35 +137,18 @@ struct App {
     // Resolved once at startup from cfg.controls (see resolve_controls).
     controls: ResolvedControls,
 
-    stream: AsyncWorldStream,
-    // Both None until load_world() (called from handle_launch()) actually
-    // constructs the WASM plugin with that launch's seed baked in — the
-    // seed can't be changed on an existing WasmPlugin, so getting a
-    // launcher-chosen seed to actually affect terrain means rebuilding the
-    // plugin (and generator, which just wraps it) fresh on every launch.
-    generator: Option<Arc<dyn WorldGenerator>>,
-    plugin: Option<Arc<WasmPlugin>>,
-    // Same generator as `generator`, but concretely typed so on_tick can be
-    // called — `Arc<dyn WorldGenerator>` doesn't expose `tick`. Both are set
-    // together in load_world().
-    wasm_game: Option<Arc<WasmWorldGenerator>>,
-    chunk_meshes: HashMap<ChunkPos, MeshHandle>,
-    seed: u64,
+    // Empty until load_world() (called from handle_launch()) actually
+    // constructs the WASM plugin with that launch's seed baked in — see
+    // GuestPlugin's doc comment.
+    guest: guest::GuestPlugin,
+    // Renderer-facing world state (chunk/entity meshes, bindless texture
+    // lookups, streaming) — see WorldRenderer's doc comment.
+    world: world::WorldRenderer,
     camera: Camera,
     input: InputState,
     last_frame_instant: std::time::Instant,
     last_frame_dt: f32,
     detected_refresh_hz: f32,
-    remesh_scratch: HashSet<ChunkPos>,
-    // Path (relative to the game's data dir) -> bindless texture index,
-    // populated once in resumed() from the WASM plugin's block registry.
-    // Consumed by the mesher to assign tex_index per face.
-    tex_map: HashMap<String, u32>,
-    // Per-block-per-face bindless texture index lookup built from tex_map
-    // once in resumed(); Arc'd so streaming worker threads can share it.
-    face_textures: Arc<BlockFaceTextures>,
-    entity_meshes: HashMap<u32, MeshHandle>,
-    next_entity_mesh_id: u32,
     input_tracker: InputTracker,
     // None if no gamepad backend is available on this platform (Gilrs::new
     // can fail, e.g. no udev) — gamepad support is then simply absent
@@ -806,7 +647,7 @@ impl ApplicationHandler for App {
             info!(
                 "fps ~ {} | loaded={}",
                 self.last_fps,
-                self.chunk_meshes.len()
+                self.world.chunk_meshes.len()
             );
             self.frames = 0;
             self.last_fps_instant = now;
@@ -828,14 +669,14 @@ impl App {
     /// guest owns the camera via set-camera. Skipping both blocks here below
     /// avoids double-applying the same mouse delta to the camera.
     fn apply_input(&mut self, dt: f32) {
-        if self.wasm_game.is_none() {
+        if self.guest.wasm_game.is_none() {
             let (dx, dy) = self.input.take_mouse_delta();
             self.camera.yaw -= dx * self.cfg.camera.mouse_sensitivity;
             self.camera.pitch = (self.camera.pitch - dy * self.cfg.camera.mouse_sensitivity)
                 .clamp(-MAX_PITCH, MAX_PITCH);
         }
 
-        if self.wasm_game.is_none() {
+        if self.guest.wasm_game.is_none() {
             let forward = self.camera.forward();
             let right = forward.cross(Vec3::Y).normalize_or_zero();
             let mut movement = Vec3::ZERO;
@@ -951,18 +792,6 @@ fn main() -> Result<()> {
     let controls = resolve_controls(&cfg);
     let custom_controls = build_custom_controls(&game_overrides, &current_profile);
 
-    // Placeholder until load_world() (called from handle_launch()) computes
-    // the real one and rebuilds the plugin/generator with it baked in — see
-    // the comment on App::plugin. Not used for anything before then.
-    let seed = if cfg.world.seed == 0 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos() as u64
-    } else {
-        cfg.world.seed
-    };
-
     // Remembered from a previous launch, if this profile has ever saved one
     // (see handle_launch/persist_window_prefs); otherwise sensible defaults.
     let remembered_window = current_profile.window.as_ref();
@@ -1000,16 +829,8 @@ fn main() -> Result<()> {
             width: 1,
             height: 1,
         },
-        stream: AsyncWorldStream::new(
-            cfg.world.stream_radius,
-            cfg.world.stream_radius_y,
-            Some(Arc::new(cubic_wasm::set_worker_id as fn(usize))),
-        ),
-        generator: None,
-        plugin: None,
-        wasm_game: None,
-        chunk_meshes: HashMap::new(),
-        seed,
+        world: world::WorldRenderer::new(cfg.world.stream_radius, cfg.world.stream_radius_y),
+        guest: guest::GuestPlugin::default(),
         cfg,
         current_profile,
         current_profile_name: profile_name,
@@ -1044,11 +865,6 @@ fn main() -> Result<()> {
         last_frame_instant: std::time::Instant::now(),
         last_frame_dt: 0.0,
         detected_refresh_hz: 60.0, // overwritten in resumed()
-        remesh_scratch: HashSet::new(),
-        tex_map: HashMap::new(),
-        face_textures: Arc::new(BlockFaceTextures::new()), // populated in resumed()
-        entity_meshes: HashMap::new(),
-        next_entity_mesh_id: 1,
         input_tracker: InputTracker::new(&controls, &custom_controls),
         gilrs: gilrs::Gilrs::new()
             .inspect_err(|e| tracing::warn!("gamepad support unavailable: {e}"))
