@@ -16,22 +16,30 @@ pub trait ChunkQuery {
     }
 }
 
+/// Which chunk a world-space position falls in, and its position within
+/// that chunk in voxel-local coordinates — shared by `get_block_at` (read)
+/// and `AsyncWorldStream::set_block_at` (write, see stream_pool.rs) so both
+/// use the exact same world->chunk mapping.
+pub fn world_to_chunk_local(wx: f32, wy: f32, wz: f32) -> (ChunkPos, ChunkLocalPos) {
+    let s = CHUNK_SIZE as f32 * VOXEL_SIZE;
+    let cp = ChunkPos {
+        x: (wx / s).floor() as i32,
+        y: (wy / s).floor() as i32,
+        z: (wz / s).floor() as i32,
+    };
+    let lx = ((wx / VOXEL_SIZE).floor() as i32).rem_euclid(CHUNK_SIZE as i32) as u8;
+    let ly = ((wy / VOXEL_SIZE).floor() as i32).rem_euclid(CHUNK_SIZE as i32) as u8;
+    let lz = ((wz / VOXEL_SIZE).floor() as i32).rem_euclid(CHUNK_SIZE as i32) as u8;
+    (cp, ChunkLocalPos::new(lx, ly, lz))
+}
+
 impl ChunkQuery for HashMap<ChunkPos, Chunk> {
     fn get_block_at(&self, wx: f32, wy: f32, wz: f32) -> BlockTypeId {
-        let s = CHUNK_SIZE as f32 * VOXEL_SIZE;
-        let cp = ChunkPos {
-            x: (wx / s).floor() as i32,
-            y: (wy / s).floor() as i32,
-            z: (wz / s).floor() as i32,
-        };
-        let chunk = match self.get(&cp) {
-            Some(c) => c,
-            None => return BlockTypeId(0),
-        };
-        let lx = ((wx / VOXEL_SIZE).floor() as i32).rem_euclid(CHUNK_SIZE as i32) as u8;
-        let ly = ((wy / VOXEL_SIZE).floor() as i32).rem_euclid(CHUNK_SIZE as i32) as u8;
-        let lz = ((wz / VOXEL_SIZE).floor() as i32).rem_euclid(CHUNK_SIZE as i32) as u8;
-        chunk.get(ChunkLocalPos::new(lx, ly, lz))
+        let (cp, lp) = world_to_chunk_local(wx, wy, wz);
+        match self.get(&cp) {
+            Some(chunk) => chunk.get(lp),
+            None => BlockTypeId(0),
+        }
     }
 }
 

@@ -4,9 +4,10 @@
 pub mod tick;
 pub use tick::{
     call_load_mesh, call_load_tex, clear_tick_query, get_player_feet, get_tick_input,
-    push_draw_request, push_input_event, set_camera_update, set_load_fns, set_player_feet,
-    set_tick_input, set_tick_query, take_camera_update, take_draw_queue, take_input_events,
-    with_chunk_query, CameraUpdate, DrawRequest, InputEvent, InputSnapshot, PlayerFeet,
+    push_block_edit, push_draw_request, push_input_event, set_camera_update, set_load_fns,
+    set_player_feet, set_tick_input, set_tick_query, take_block_edits, take_camera_update,
+    take_draw_queue, take_input_events, with_chunk_query, BlockEditRequest, CameraUpdate,
+    DrawRequest, InputEvent, InputSnapshot, PlayerFeet,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -320,6 +321,27 @@ impl WasmInstance {
 
         linker.func_wrap(
             IMPORT_PHYSICS_MODULE,
+            "get-block",
+            |_caller: wasmtime::Caller<'_, HostState>, x: f32, y: f32, z: f32| -> i32 {
+                with_chunk_query(|q| q.map(|q| q.get_block_at(x, y, z).0 as i32).unwrap_or(0))
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_PHYSICS_MODULE,
+            "request-set-block",
+            |_caller: wasmtime::Caller<'_, HostState>, x: f32, y: f32, z: f32, block_id: i32| {
+                push_block_edit(BlockEditRequest {
+                    x,
+                    y,
+                    z,
+                    block_id: block_id as u32,
+                });
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_PHYSICS_MODULE,
             "sweep-aabb",
             |mut caller: wasmtime::Caller<'_, HostState>,
              ox: f32,
@@ -386,12 +408,13 @@ impl WasmInstance {
                 data[base + 20..base + 24].copy_from_slice(&(snap.sneak as i32).to_le_bytes());
                 data[base + 24..base + 28].copy_from_slice(&snap.look_dx.to_le_bytes());
                 data[base + 28..base + 32].copy_from_slice(&snap.look_dy.to_le_bytes());
-                // player movement/physics config at bytes 32-48
+                // player movement/physics config at bytes 32-52
                 data[base + 32..base + 36].copy_from_slice(&snap.walk_speed.to_le_bytes());
                 data[base + 36..base + 40].copy_from_slice(&snap.fly_speed.to_le_bytes());
                 data[base + 40..base + 44].copy_from_slice(&snap.jump_velocity.to_le_bytes());
                 data[base + 44..base + 48].copy_from_slice(&snap.gravity.to_le_bytes());
-                48i32
+                data[base + 48..base + 52].copy_from_slice(&snap.sprint_multiplier.to_le_bytes());
+                52i32
             },
         )?;
 

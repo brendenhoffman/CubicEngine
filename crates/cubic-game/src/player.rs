@@ -17,6 +17,12 @@ const GROUND_PROBE_DIST: f32 = 0.05;
 /// calls — `on_load` in lib.rs always constructs via `Player::new` with a
 /// terrain-aware height instead (see its call site).
 const DEFAULT_SPAWN_Y: f32 = 20.0;
+/// Max block-interaction distance, in metres (~12 voxels) — same ballpark
+/// as vanilla Minecraft's reach.
+const REACH: f32 = 6.0;
+/// Ray march step size, in metres — well under VOXEL_SIZE so the march
+/// can't skip over a thin voxel boundary and tunnel through a face.
+const RAY_STEP: f32 = 0.05;
 
 /// Mirrors `cubic_wasm::InputSnapshot` field-for-field — see on_tick in
 /// lib.rs, which decodes the host's get-input out-ptr buffer into this.
@@ -40,6 +46,7 @@ pub struct InputState {
     pub fly_speed: f32,
     pub jump_velocity: f32,
     pub gravity: f32,
+    pub sprint_multiplier: f32,
 }
 
 pub struct Player {
@@ -60,11 +67,39 @@ pub struct Player {
     // with no collision at all (not even a de-penetration/ground probe).
     pub spectating: bool,
     pub spectator_pos: [f32; 3],
+    // Set/cleared by a "sprint" InputEvent (double-tap forward by default,
+    // registered by this game's game_overrides.toml rather than being a
+    // built-in engine control — see on_tick in lib.rs). Unlike the toggles
+    // above, sprint tracks kind==1 (Released) too: it's meant to last only
+    // as long as the double-tapped key stays held, not flip on/off.
+    pub sprinting: bool,
+    // The block type placed by a "place_block" InputEvent — set by a
+    // "pick_block" InputEvent (middle-click), initialized to whatever
+    // on_load's caller passes as a sensible starting block. See on_tick in
+    // lib.rs, which handles break/place/pick.
+    pub selected_block: u32,
+    // This tick's raycast hit, if the player is looking at a block within
+    // REACH — recomputed once per tick (see raycast_target) and consumed
+    // by on_tick in lib.rs both for break/place/pick and for drawing the
+    // highlight mesh. None while spectating (tick_spectator never touches
+    // this) or when nothing solid is in range.
+    pub target: Option<RayHit>,
+}
+
+/// A raycast hit against solid voxel geometry: the targeted (solid) block,
+/// and the empty voxel immediately before it along the ray — Minecraft's
+/// usual "break the thing you're looking at, place against the face you're
+/// looking at" pair. Both are min-corner world positions (matches how block
+/// positions are computed from chunk-local voxel indices elsewhere).
+#[derive(Clone, Copy)]
+pub struct RayHit {
+    pub block: [f32; 3],
+    pub place: [f32; 3],
 }
 
 impl Default for Player {
     fn default() -> Self {
-        Self::new(DEFAULT_SPAWN_Y)
+        Self::new(DEFAULT_SPAWN_Y, 0)
     }
 }
 
@@ -75,7 +110,9 @@ impl Player {
     /// output, spawning the player embedded in the ground with no way to
     /// sweep back out (see `sweep_aabb`'s de-penetration step, which only
     /// ever helps once already ticking, not for the very first placement).
-    pub fn new(spawn_y: f32) -> Self {
+    /// `default_block` is the initially selected block for placing — see
+    /// `on_load`'s call site, which passes its terrain fallback block.
+    pub fn new(spawn_y: f32, default_block: u32) -> Self {
         Self {
             pos: [0.0, spawn_y, 0.0],
             vel: [0.0; 3],
@@ -86,11 +123,68 @@ impl Player {
             flying: false,
             spectating: false,
             spectator_pos: [0.0; 3],
+            sprinting: false,
+            selected_block: default_block,
+            target: None,
         }
     }
 
     pub fn eye_pos(&self) -> [f32; 3] {
         [self.pos[0], self.pos[1] + EYE_HEIGHT, self.pos[2]]
+    }
+
+    /// March a ray from the eye along the look direction (yaw/pitch —
+    /// full 3D, unlike movement's horizontal-only forward vector) up to
+    /// REACH, sampling `physics::is-solid` every RAY_STEP. Always aims from
+    /// the eye regardless of `third_person`, so aiming stays consistent
+    /// with where the player is actually looking rather than the orbited
+    /// third-person camera's angle.
+    fn raycast_target(&self) -> Option<RayHit> {
+        let origin = self.eye_pos();
+        let dir = [
+            -self.yaw.sin() * self.pitch.cos(),
+            self.pitch.sin(),
+            -self.yaw.cos() * self.pitch.cos(),
+        ];
+
+        let mut prev_voxel: Option<[i32; 3]> = None;
+        let mut t = 0.0f32;
+        while t < REACH {
+            let p = [
+                origin[0] + dir[0] * t,
+                origin[1] + dir[1] * t,
+                origin[2] + dir[2] * t,
+            ];
+            if physics::is_solid(p[0], p[1], p[2]) {
+                let voxel = [
+                    (p[0] / crate::VOXEL_SIZE).floor() as i32,
+                    (p[1] / crate::VOXEL_SIZE).floor() as i32,
+                    (p[2] / crate::VOXEL_SIZE).floor() as i32,
+                ];
+                let block = [
+                    voxel[0] as f32 * crate::VOXEL_SIZE,
+                    voxel[1] as f32 * crate::VOXEL_SIZE,
+                    voxel[2] as f32 * crate::VOXEL_SIZE,
+                ];
+                let place = prev_voxel
+                    .map(|pv| {
+                        [
+                            pv[0] as f32 * crate::VOXEL_SIZE,
+                            pv[1] as f32 * crate::VOXEL_SIZE,
+                            pv[2] as f32 * crate::VOXEL_SIZE,
+                        ]
+                    })
+                    .unwrap_or(block);
+                return Some(RayHit { block, place });
+            }
+            prev_voxel = Some([
+                (p[0] / crate::VOXEL_SIZE).floor() as i32,
+                (p[1] / crate::VOXEL_SIZE).floor() as i32,
+                (p[2] / crate::VOXEL_SIZE).floor() as i32,
+            ]);
+            t += RAY_STEP;
+        }
+        None
     }
 
     pub fn tick(&mut self, dt: f32, input: &InputState) {
@@ -111,6 +205,12 @@ impl Player {
             self.tick_spectator(dt, input);
             return;
         }
+
+        // Recomputed every tick from the just-updated look direction, ahead
+        // of movement/physics below — on_tick in lib.rs reads this after
+        // Player::tick returns, both to draw the highlight mesh and to
+        // resolve this tick's break/place/pick events (see BlockAction).
+        self.target = self.raycast_target();
 
         // 1. Vertical control: flying replaces gravity/ground-jump with
         // direct jump/sneak-driven ascend/descend (collision still applies
@@ -162,11 +262,14 @@ impl Player {
             mx -= right[0];
             mz -= right[2];
         }
-        let horiz_speed = if self.flying {
+        let mut horiz_speed = if self.flying {
             input.fly_speed
         } else {
             input.walk_speed
         };
+        if self.sprinting {
+            horiz_speed *= input.sprint_multiplier;
+        }
         let len = (mx * mx + mz * mz).sqrt();
         if len > 0.0 {
             mx = mx / len * horiz_speed;

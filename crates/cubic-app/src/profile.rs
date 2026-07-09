@@ -112,6 +112,8 @@ pub struct PlayerOverride {
     pub jump_velocity: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gravity: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprint_multiplier: Option<f32>,
 }
 
 /// Sparse override for one control's binding. All three parts are
@@ -154,6 +156,12 @@ pub struct ControlsOverride {
     pub spectate: Option<KeyBindingOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fly: Option<KeyBindingOverride>,
+    /// Overrides for controls a game registers itself (see
+    /// game_override::CustomControlDef), keyed by control name — a sparse
+    /// map instead of named fields since the set of names isn't known
+    /// statically the way the built-ins above are.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub custom: std::collections::HashMap<String, KeyBindingOverride>,
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,23 @@
+# Per-game engine overrides for cubic-game — see
+# crates/cubic-app/src/game_override.rs for the full schema.
+
+[[controls]]
+name = "sprint"
+label = "Sprint"
+key = "KeyW"
+trigger = "double_tap"
+
+[[controls]]
+name = "break_block"
+label = "Break block"
+key = "MouseLeft"
+
+[[controls]]
+name = "place_block"
+label = "Place block"
+key = "MouseRight"
+
+[[controls]]
+name = "pick_block"
+label = "Pick block"
+key = "MouseMiddle"

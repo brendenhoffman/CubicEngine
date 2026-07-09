@@ -4,8 +4,10 @@
 use serde::Deserialize;
 use std::path::Path;
 
-// Schema — same sparse Option<T> pattern as ProfileCfg but no controls
-// section (games cannot override controls).
+// Schema — same sparse Option<T> pattern as ProfileCfg. `controls` is the
+// one exception to "sparse override of an existing value": games still
+// cannot remap forward/jump/etc, but they can *register new* controls of
+// their own (see CustomControlDef).
 
 #[derive(Debug, Deserialize, Default, Clone)]
 pub struct GameOverrideCfg {
@@ -17,7 +19,35 @@ pub struct GameOverrideCfg {
     pub camera: Option<GameCameraOverride>,
     #[serde(default)]
     pub player: Option<GamePlayerOverride>,
-    // no controls field — games cannot remap engine controls
+    // Controls a game *defines itself* (e.g. "sprint"), not an override of
+    // an existing engine control — games still cannot remap forward/jump/
+    // etc, there's just no field for that here at all.
+    #[serde(default)]
+    pub controls: Vec<CustomControlDef>,
+}
+
+/// A single custom control this game wants registered, declared as
+/// `[[controls]]` entries in game_overrides.toml. `key`/`modifier`/
+/// `trigger` are plain strings (not main.rs's `ModifierKey`/`TriggerKind`
+/// enums) to keep this crate decoupled from main.rs's types, same
+/// reasoning as `profile::KeyBindingOverride` — parsed via main.rs's
+/// parse_cfg_str in `build_custom_controls`. Unset `key` means the control
+/// starts out unbound rather than defaulting to some key that might already
+/// be taken.
+#[derive(Debug, Deserialize, Clone)]
+pub struct CustomControlDef {
+    /// Also the InputEvent name forwarded to the guest — must match
+    /// whatever the game's own on_tick matches on.
+    pub name: String,
+    /// Controls-tab display label; falls back to `name` if unset.
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub modifier: Option<String>,
+    #[serde(default)]
+    pub trigger: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default, Clone)]
@@ -65,6 +95,8 @@ pub struct GamePlayerOverride {
     pub jump_velocity: Option<f32>,
     #[serde(default)]
     pub gravity: Option<f32>,
+    #[serde(default)]
+    pub sprint_multiplier: Option<f32>,
 }
 
 /// Load game override config from {game_dir}/game_overrides.toml.

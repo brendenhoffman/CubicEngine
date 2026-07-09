@@ -411,6 +411,9 @@ fn apply_game_override(mut cfg: AppCfg, overrides: &game_override::GameOverrideC
         if let Some(v) = p.gravity {
             cfg.player.gravity = v;
         }
+        if let Some(v) = p.sprint_multiplier {
+            cfg.player.sprint_multiplier = v;
+        }
     }
     cfg
 }
@@ -480,6 +483,9 @@ fn apply_profile(mut cfg: AppCfg, profile: &profile::ProfileCfg) -> AppCfg {
         if let Some(v) = p.gravity {
             cfg.player.gravity = v;
         }
+        if let Some(v) = p.sprint_multiplier {
+            cfg.player.sprint_multiplier = v;
+        }
     }
     if let Some(ctrl) = &profile.controls {
         if let Some(v) = &ctrl.forward {
@@ -514,6 +520,64 @@ fn apply_profile(mut cfg: AppCfg, profile: &profile::ProfileCfg) -> AppCfg {
         }
     }
     cfg
+}
+
+/// A control the currently loaded game registered itself, via
+/// game_overrides.toml's `[[controls]]` (see
+/// `game_override::CustomControlDef`) — not one of the engine's fixed
+/// `ControlsCfg` fields. The engine has no idea what the named action
+/// *does* (that's entirely up to the guest's on_tick matching on the same
+/// name, e.g. cubic-game's "sprint"); it only knows how to bind/display/
+/// persist it, exactly like a built-in control — see control_binding_mut,
+/// control_override_mut, and InputTracker::new, all of which treat this
+/// list as a dynamic extension of the built-in ones.
+#[derive(Clone)]
+struct CustomControl {
+    name: String,
+    label: String,
+    binding: KeyBinding,
+}
+
+/// Resolve `overrides`' declared custom controls (defaults) against
+/// `profile`'s sparse per-control overrides, the same two-layer resolution
+/// built-in controls get from cubic.toml + profile.toml — minus a global
+/// cubic.toml layer, since the engine has no default for a control it
+/// doesn't know exists.
+fn build_custom_controls(
+    overrides: &game_override::GameOverrideCfg,
+    profile: &profile::ProfileCfg,
+) -> Vec<CustomControl> {
+    overrides
+        .controls
+        .iter()
+        .map(|def| {
+            let mut binding = KeyBinding {
+                key: def.key.clone(),
+                modifier: def
+                    .modifier
+                    .as_deref()
+                    .and_then(parse_cfg_str::<ModifierKey>)
+                    .unwrap_or(ModifierKey::None),
+                trigger: def
+                    .trigger
+                    .as_deref()
+                    .and_then(parse_cfg_str::<TriggerKind>)
+                    .unwrap_or(TriggerKind::Tap),
+            };
+            if let Some(ov) = profile
+                .controls
+                .as_ref()
+                .and_then(|c| c.custom.get(&def.name))
+            {
+                apply_key_binding_override(&mut binding, ov);
+            }
+            CustomControl {
+                name: def.name.clone(),
+                label: def.label.clone().unwrap_or_else(|| def.name.clone()),
+                binding,
+            }
+        })
+        .collect()
 }
 
 fn default_stream_radius() -> i32 {
@@ -583,11 +647,18 @@ fn default_jump_velocity() -> f32 {
 fn default_gravity() -> f32 {
     -20.0
 }
+fn default_sprint_multiplier() -> f32 {
+    1.5
+}
 
 /// In-game player movement/physics — distinct from `CameraCfg`, which only
 /// drives the free-fly debug camera shown before a game is loaded. Sent to
 /// the guest every tick via `InputSnapshot` (see RedrawRequested), so
-/// Settings-tab edits apply immediately without a relaunch.
+/// Settings-tab edits apply immediately without a relaunch. `sprint_multiplier`
+/// is a generic movement-speed multiplier — the engine has no concept of
+/// "sprint" itself, that's entirely a guest-side feature (see cubic-game's
+/// player.rs), this just carries the configured number through the same way
+/// walk_speed etc. already do.
 #[derive(Debug, Deserialize, Serialize, Clone, Copy)]
 struct PlayerCfg {
     #[serde(default = "default_walk_speed")]
@@ -598,6 +669,8 @@ struct PlayerCfg {
     jump_velocity: f32,
     #[serde(default = "default_gravity")]
     gravity: f32,
+    #[serde(default = "default_sprint_multiplier")]
+    sprint_multiplier: f32,
 }
 
 impl Default for PlayerCfg {
@@ -607,6 +680,7 @@ impl Default for PlayerCfg {
             fly_speed: default_fly_speed(),
             jump_velocity: default_jump_velocity(),
             gravity: default_gravity(),
+            sprint_multiplier: default_sprint_multiplier(),
         }
     }
 }
@@ -1322,42 +1396,58 @@ struct InputTracker {
 }
 
 impl InputTracker {
-    fn new(controls: &ResolvedControls) -> Self {
+    /// `custom` are controls the currently loaded game registered itself
+    /// (see CustomControl) — tracked exactly like the four built-in
+    /// discrete controls, just resolved from their own KeyBinding instead
+    /// of a ResolvedControls field, since the set of names isn't known at
+    /// compile time.
+    fn new(controls: &ResolvedControls, custom: &[CustomControl]) -> Self {
+        let mut actions = vec![
+            (
+                "toggle_diagnostics".into(),
+                controls.toggle_diagnostics,
+                ActionTracker {
+                    was_held: false,
+                    last_press_time: -1.0,
+                },
+            ),
+            (
+                "toggle_third_person".into(),
+                controls.toggle_third_person,
+                ActionTracker {
+                    was_held: false,
+                    last_press_time: -1.0,
+                },
+            ),
+            (
+                "spectate".into(),
+                controls.spectate,
+                ActionTracker {
+                    was_held: false,
+                    last_press_time: -1.0,
+                },
+            ),
+            (
+                "fly".into(),
+                controls.fly,
+                ActionTracker {
+                    was_held: false,
+                    last_press_time: -1.0,
+                },
+            ),
+        ];
+        for c in custom {
+            actions.push((
+                c.name.clone(),
+                resolve_binding(&c.binding),
+                ActionTracker {
+                    was_held: false,
+                    last_press_time: -1.0,
+                },
+            ));
+        }
         Self {
-            actions: vec![
-                (
-                    "toggle_diagnostics".into(),
-                    controls.toggle_diagnostics,
-                    ActionTracker {
-                        was_held: false,
-                        last_press_time: -1.0,
-                    },
-                ),
-                (
-                    "toggle_third_person".into(),
-                    controls.toggle_third_person,
-                    ActionTracker {
-                        was_held: false,
-                        last_press_time: -1.0,
-                    },
-                ),
-                (
-                    "spectate".into(),
-                    controls.spectate,
-                    ActionTracker {
-                        was_held: false,
-                        last_press_time: -1.0,
-                    },
-                ),
-                (
-                    "fly".into(),
-                    controls.fly,
-                    ActionTracker {
-                        was_held: false,
-                        last_press_time: -1.0,
-                    },
-                ),
-            ],
+            actions,
             elapsed: 0.0,
         }
     }
@@ -1657,6 +1747,10 @@ struct App {
     // "(game override)" labels next to affected knobs (future card).
     #[allow(dead_code)]
     game_overrides: game_override::GameOverrideCfg,
+    // Controls the currently loaded game registered itself (see
+    // CustomControl/build_custom_controls) — resolved once at startup from
+    // game_overrides + current_profile, same as `controls`/`input_tracker`.
+    custom_controls: Vec<CustomControl>,
     // Transient launcher UI state (selected game/profile, seed field,
     // window-mode radio, remap-in-progress, ...).
     launcher: LauncherState,
@@ -1664,6 +1758,10 @@ struct App {
     // Toggled by the pause menu's Settings button; shows the same content
     // as the launcher's Settings tab in a floating egui::Window.
     pause_settings_open: bool,
+    // Same idea, for the Controls tab — so bindings (including a game's own
+    // custom_controls) can be changed mid-game without quitting to the
+    // launcher; persist_control_change already applies changes live.
+    pause_controls_open: bool,
     // See PendingWindowedResize doc comment. None when no dance is in
     // flight (the common case — only set by handle_launch's Windowed arm).
     pending_windowed_resize: Option<PendingWindowedResize>,
@@ -2123,6 +2221,7 @@ impl ApplicationHandler for App {
                             fly_speed: self.cfg.player.fly_speed,
                             jump_velocity: self.cfg.player.jump_velocity,
                             gravity: self.cfg.player.gravity,
+                            sprint_multiplier: self.cfg.player.sprint_multiplier,
                         };
                         // toggle_diagnostics is host-only (no guest round
                         // trip needed) — InputTracker still applies its
@@ -2150,6 +2249,23 @@ impl ApplicationHandler for App {
                         }
 
                         clear_tick_query();
+
+                        // Apply any block edits (break/place) the guest
+                        // requested this tick — deferred until after the
+                        // chunk-query borrow above ends, since it aliases
+                        // the same chunk data (see BlockEditRequest's doc
+                        // comment). set_block_at pushes into
+                        // self.stream.remesh_queue, which the boundary
+                        // remesh pass below already drains — no separate
+                        // "upload this edit's mesh" step needed.
+                        for edit in cubic_wasm::take_block_edits() {
+                            self.stream.set_block_at(
+                                edit.x,
+                                edit.y,
+                                edit.z,
+                                cubic_world::BlockTypeId(edit.block_id),
+                            );
+                        }
 
                         // Flush entity draw queue from game tick
                         let cam_pos = self.camera.position;
@@ -3054,6 +3170,15 @@ impl App {
                         ))
                         .changed();
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Sprint multiplier");
+                    changed |= ui
+                        .add(egui::Slider::new(
+                            &mut self.cfg.player.sprint_multiplier,
+                            1.0..=3.0,
+                        ))
+                        .changed();
+                });
                 if changed {
                     save_global_cfg(&self.cfg);
                 }
@@ -3092,100 +3217,136 @@ impl App {
         ];
 
         for (label, action, current) in &controls {
-            ui.horizontal(|ui| {
-                ui.label(*label);
+            // Trigger kind only matters for controls actually routed
+            // through InputTracker (toggle_diagnostics/toggle_third_person/
+            // spectate/fly); movement controls are read continuously via
+            // InputState::binding_active and never consult it, so the
+            // dropdown would just be a confusing no-op there.
+            let show_trigger = matches!(
+                *action,
+                "toggle_diagnostics" | "toggle_third_person" | "spectate" | "fly"
+            );
+            self.control_row(ui, label, action, current, show_trigger);
+        }
 
-                // Base binding: captured by pressing/clicking it, via the
-                // raw winit event streams intercepted at the top of
-                // window_event (see that comment) rather than egui's own
-                // event stream — that's what makes modifier keys (ShiftLeft,
-                // ControlLeft, AltLeft, ...) usable as a control's own base
-                // key at all, and what lets a mouse button or gamepad
-                // button be captured too: egui's `Key` enum has no variants
-                // for bare modifier presses (they only ever show up via a
-                // `Modifiers` bitset alongside some other key, which can't
-                // tell ShiftLeft from ShiftRight anyway) and has no concept
-                // of mouse/gamepad buttons as bindable at all. This is
-                // unambiguous for a *base* key (there's only ever one, and
-                // it's the whole point of pressing it) — unlike the *combo*
-                // modifier below, which must not be captured this way (see
-                // its comment).
-                let capturing = matches!(&self.launcher.remapping, Some((a, _)) if a == action);
-                let btn_label = if capturing {
-                    "Press a key, click, or button... (Esc to cancel)".to_string()
+        // Controls the currently loaded game registered itself (see
+        // game_override::CustomControlDef) — the engine has no idea what
+        // these *do* (that's entirely up to the guest's on_tick matching on
+        // the same name), it only knows how to bind/display/persist them,
+        // same as any built-in control. Always InputTracker-routed (there's
+        // no continuously-read variant for a game-defined control), so the
+        // trigger dropdown always applies.
+        if !self.custom_controls.is_empty() {
+            ui.separator();
+            ui.label("Game controls");
+            let custom = self.custom_controls.clone();
+            for c in &custom {
+                self.control_row(ui, &c.label, &c.name, &c.binding, true);
+            }
+        }
+    }
+
+    /// One row of the Controls tab: a capture button (left-click to bind
+    /// any key/mouse/gamepad button, right-click to clear), a modifier
+    /// combo, and — if `show_trigger` — a trigger-kind combo. Shared by
+    /// both the fixed built-in control list and the dynamic per-game
+    /// `custom_controls` list, which differ only in where their KeyBinding
+    /// lives (see control_binding_mut/control_override_mut).
+    fn control_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: &str,
+        action: &str,
+        current: &KeyBinding,
+        show_trigger: bool,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label(label);
+
+            // Base binding: captured by pressing/clicking it, via the raw
+            // winit event streams intercepted at the top of window_event
+            // (see that comment) rather than egui's own event stream —
+            // that's what makes modifier keys (ShiftLeft, ControlLeft,
+            // AltLeft, ...) usable as a control's own base key at all, and
+            // what lets a mouse button or gamepad button be captured too:
+            // egui's `Key` enum has no variants for bare modifier presses
+            // (they only ever show up via a `Modifiers` bitset alongside
+            // some other key, which can't tell ShiftLeft from ShiftRight
+            // anyway) and has no concept of mouse/gamepad buttons as
+            // bindable at all. This is unambiguous for a *base* key
+            // (there's only ever one, and it's the whole point of pressing
+            // it) — unlike the *combo* modifier below, which must not be
+            // captured this way (see its comment).
+            let capturing = matches!(&self.launcher.remapping, Some((a, _)) if a == action);
+            let btn_label = if capturing {
+                "Press a key, click, or button... (Esc to cancel)".to_string()
+            } else {
+                current.key.clone().unwrap_or_else(|| "unbound".to_string())
+            };
+            let btn = ui
+                .button(&btn_label)
+                .on_hover_text("Click to bind, right-click to clear");
+            if btn.clicked() {
+                self.launcher.remapping = Some((action.to_string(), std::time::Instant::now()));
+            }
+            if btn.secondary_clicked() {
+                self.clear_control_binding(action);
+            }
+
+            // Combo modifier: an explicit dropdown, not press-to-capture —
+            // "wait for the next key" can't distinguish "the user wants
+            // Shift+F6" from "the user wants to bind Shift itself," since
+            // the modifier's own key-down event arrives first either way.
+            // Selecting it here instead means nothing is reserved: any key
+            // can still be the base key (above), and any of Shift/Control/
+            // Alt can independently gate it.
+            let mut modifier = current.modifier;
+            egui::ComboBox::from_id_salt(format!("modifier_{action}"))
+                .selected_text(if modifier == ModifierKey::None {
+                    "+ modifier".to_string()
                 } else {
-                    current.key.clone().unwrap_or_else(|| "unbound".to_string())
-                };
-                let btn = ui
-                    .button(&btn_label)
-                    .on_hover_text("Click to bind, right-click to clear");
-                if btn.clicked() {
-                    self.launcher.remapping = Some((action.to_string(), std::time::Instant::now()));
-                }
-                if btn.secondary_clicked() {
-                    self.clear_control_binding(action);
-                }
+                    modifier.label().to_string()
+                })
+                .show_ui(ui, |ui| {
+                    for m in [
+                        ModifierKey::None,
+                        ModifierKey::Shift,
+                        ModifierKey::Control,
+                        ModifierKey::Alt,
+                    ] {
+                        ui.selectable_value(&mut modifier, m, m.label());
+                    }
+                });
+            if modifier != current.modifier {
+                self.set_control_modifier(action, modifier);
+            }
 
-                // Combo modifier: an explicit dropdown, not press-to-capture
-                // — "wait for the next key" can't distinguish "the user
-                // wants Shift+F6" from "the user wants to bind Shift
-                // itself," since the modifier's own key-down event arrives
-                // first either way. Selecting it here instead means nothing
-                // is reserved: any key can still be the base key (above),
-                // and any of Shift/Control/Alt can independently gate it.
-                let mut modifier = current.modifier;
-                egui::ComboBox::from_id_salt(format!("modifier_{action}"))
-                    .selected_text(if modifier == ModifierKey::None {
-                        "+ modifier".to_string()
-                    } else {
-                        modifier.label().to_string()
-                    })
+            // Trigger kind — see TriggerKind's doc comment for what each
+            // option actually changes.
+            if show_trigger {
+                let mut trigger = current.trigger;
+                egui::ComboBox::from_id_salt(format!("trigger_{action}"))
+                    .selected_text(trigger.label())
                     .show_ui(ui, |ui| {
-                        for m in [
-                            ModifierKey::None,
-                            ModifierKey::Shift,
-                            ModifierKey::Control,
-                            ModifierKey::Alt,
-                        ] {
-                            ui.selectable_value(&mut modifier, m, m.label());
+                        for t in [TriggerKind::Tap, TriggerKind::DoubleTap] {
+                            ui.selectable_value(&mut trigger, t, t.label());
                         }
                     });
-                if modifier != current.modifier {
-                    self.set_control_modifier(action, modifier);
+                if trigger != current.trigger {
+                    self.set_control_trigger(action, trigger);
                 }
-
-                // Trigger kind — see TriggerKind's doc comment for what
-                // each option actually changes. Only shown for controls
-                // actually routed through InputTracker (toggle_diagnostics/
-                // toggle_third_person/spectate/fly); movement controls are
-                // read continuously via InputState::binding_active and
-                // never consult a trigger kind at all, so the dropdown
-                // would just be a confusing no-op there.
-                if matches!(
-                    *action,
-                    "toggle_diagnostics" | "toggle_third_person" | "spectate" | "fly"
-                ) {
-                    let mut trigger = current.trigger;
-                    egui::ComboBox::from_id_salt(format!("trigger_{action}"))
-                        .selected_text(trigger.label())
-                        .show_ui(ui, |ui| {
-                            for t in [TriggerKind::Tap, TriggerKind::DoubleTap] {
-                                ui.selectable_value(&mut trigger, t, t.label());
-                            }
-                        });
-                    if trigger != current.trigger {
-                        self.set_control_trigger(action, trigger);
-                    }
-                }
-            });
-        }
+            }
+        });
     }
 
     /// The live `KeyBinding` for a control named the same way the Controls
     /// tab / InputTracker / InputEvent system already names actions
     /// ("forward", "spectate", ...). Centralizing this name->field lookup
     /// here is what lets remap/modifier/trigger changes share one small
-    /// generic setter each instead of three parallel match statements.
+    /// generic setter each instead of three parallel match statements. Any
+    /// name not matching a built-in engine control falls back to
+    /// `custom_controls` — a control the currently loaded game registered
+    /// itself (see CustomControl/build_custom_controls).
     fn control_binding_mut(&mut self, name: &str) -> Option<&mut KeyBinding> {
         match name {
             "forward" => Some(&mut self.cfg.controls.forward),
@@ -3198,13 +3359,19 @@ impl App {
             "toggle_third_person" => Some(&mut self.cfg.controls.toggle_third_person),
             "spectate" => Some(&mut self.cfg.controls.spectate),
             "fly" => Some(&mut self.cfg.controls.fly),
-            _ => None,
+            _ => self
+                .custom_controls
+                .iter_mut()
+                .find(|c| c.name == name)
+                .map(|c| &mut c.binding),
         }
     }
 
     /// The profile-override sparse entry for a control, creating it (and
     /// its parent `ControlsOverride`) if this is the first time any part of
-    /// this control has been overridden.
+    /// this control has been overridden. Custom (game-registered) controls
+    /// share one sparse `HashMap<String, KeyBindingOverride>` instead of
+    /// their own named field, since the set of names isn't known statically.
     fn control_override_mut(&mut self, name: &str) -> Option<&mut profile::KeyBindingOverride> {
         let ctrl = self
             .current_profile
@@ -3226,7 +3393,7 @@ impl App {
             ),
             "spectate" => Some(ctrl.spectate.get_or_insert_with(Default::default)),
             "fly" => Some(ctrl.fly.get_or_insert_with(Default::default)),
-            _ => None,
+            _ => Some(ctrl.custom.entry(name.to_string()).or_default()),
         }
     }
 
@@ -3248,7 +3415,7 @@ impl App {
             tracing::warn!("failed to save profile after control change: {e}");
         }
         self.controls = resolve_controls(&self.cfg);
-        self.input_tracker = InputTracker::new(&self.controls);
+        self.input_tracker = InputTracker::new(&self.controls, &self.custom_controls);
     }
 
     fn apply_control_remap(&mut self, binding: &str, key_name: &str) {
@@ -3371,6 +3538,15 @@ impl App {
                     ui.add_space(8.0);
 
                     if ui
+                        .add_sized(btn_size, egui::Button::new("Controls"))
+                        .clicked()
+                    {
+                        self.pause_controls_open = !self.pause_controls_open;
+                    }
+
+                    ui.add_space(8.0);
+
+                    if ui
                         .add_sized(btn_size, egui::Button::new("Toggle Spectate"))
                         .clicked()
                     {
@@ -3397,6 +3573,14 @@ impl App {
                 .collapsible(false)
                 .show(ctx, |ui| {
                     self.build_settings_tab(ui);
+                });
+        }
+
+        if self.pause_controls_open {
+            egui::Window::new("Controls")
+                .collapsible(false)
+                .show(ctx, |ui| {
+                    self.build_controls_tab(ui);
                 });
         }
 
@@ -3498,6 +3682,7 @@ fn main() -> Result<()> {
         &current_profile,
     );
     let controls = resolve_controls(&cfg);
+    let custom_controls = build_custom_controls(&game_overrides, &current_profile);
 
     // Placeholder until load_world() (called from handle_launch()) computes
     // the real one and rebuilds the plugin/generator with it baked in — see
@@ -3563,9 +3748,11 @@ fn main() -> Result<()> {
         current_profile_name: profile_name,
         current_game_name: game_name,
         game_overrides,
+        custom_controls: custom_controls.clone(),
         launcher,
         launcher_tab: LauncherTab::Game,
         pause_settings_open: false,
+        pause_controls_open: false,
         pending_windowed_resize: None,
         exiting: false,
         quit_requested: false,
@@ -3594,7 +3781,7 @@ fn main() -> Result<()> {
         face_textures: Arc::new(BlockFaceTextures::new()), // populated in resumed()
         entity_meshes: HashMap::new(),
         next_entity_mesh_id: 1,
-        input_tracker: InputTracker::new(&controls),
+        input_tracker: InputTracker::new(&controls, &custom_controls),
         gilrs: gilrs::Gilrs::new()
             .inspect_err(|e| tracing::warn!("gamepad support unavailable: {e}"))
             .ok(),
@@ -3803,5 +3990,65 @@ mod tests {
             KeyBinding::unbound(TriggerKind::Tap).trigger,
             TriggerKind::Tap
         );
+    }
+
+    #[test]
+    fn custom_control_resolves_game_default_with_no_profile_override() {
+        let overrides = game_override::GameOverrideCfg {
+            controls: vec![game_override::CustomControlDef {
+                name: "sprint".to_string(),
+                label: Some("Sprint".to_string()),
+                key: Some("KeyW".to_string()),
+                modifier: None,
+                trigger: Some("double_tap".to_string()),
+            }],
+            ..Default::default()
+        };
+        let profile = profile::ProfileCfg::default();
+
+        let custom = build_custom_controls(&overrides, &profile);
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].name, "sprint");
+        assert_eq!(custom[0].label, "Sprint");
+        assert_eq!(custom[0].binding.key.as_deref(), Some("KeyW"));
+        assert_eq!(custom[0].binding.trigger, TriggerKind::DoubleTap);
+        assert_eq!(custom[0].binding.modifier, ModifierKey::None);
+    }
+
+    #[test]
+    fn custom_control_profile_override_takes_precedence_over_game_default() {
+        let overrides = game_override::GameOverrideCfg {
+            controls: vec![game_override::CustomControlDef {
+                name: "sprint".to_string(),
+                label: None,
+                key: Some("KeyW".to_string()),
+                modifier: None,
+                trigger: Some("double_tap".to_string()),
+            }],
+            ..Default::default()
+        };
+        let mut custom_override = std::collections::HashMap::new();
+        custom_override.insert(
+            "sprint".to_string(),
+            profile::KeyBindingOverride {
+                key: Some("KeyR".to_string()),
+                modifier: None,
+                trigger: Some("tap".to_string()),
+            },
+        );
+        let profile = profile::ProfileCfg {
+            controls: Some(profile::ControlsOverride {
+                custom: custom_override,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let custom = build_custom_controls(&overrides, &profile);
+        assert_eq!(custom.len(), 1);
+        // Falls back to the control's own name when no label is declared.
+        assert_eq!(custom[0].label, "sprint");
+        assert_eq!(custom[0].binding.key.as_deref(), Some("KeyR"));
+        assert_eq!(custom[0].binding.trigger, TriggerKind::Tap);
     }
 }

@@ -35,6 +35,12 @@ pub struct InputSnapshot {
     pub fly_speed: f32,
     pub jump_velocity: f32,
     pub gravity: f32,
+    // A generic movement-speed multiplier, not tied to any specific engine
+    // feature — cubic-game's "sprint" (double-tap-forward) is entirely
+    // guest-side and just multiplies horiz_speed by this while its own
+    // `sprinting` flag is set; the host has no notion of sprinting at all,
+    // it only carries the configured number through, same as walk_speed.
+    pub sprint_multiplier: f32,
 }
 
 thread_local! {
@@ -51,6 +57,7 @@ thread_local! {
         fly_speed: 0.0,
         jump_velocity: 0.0,
         gravity: 0.0,
+        sprint_multiplier: 1.0,
     }) };
 }
 
@@ -151,6 +158,39 @@ pub fn push_draw_request(req: DrawRequest) {
 /// Take (and clear) all queued draw requests. Called by cubic-app after on_tick.
 pub fn take_draw_queue() -> Vec<DrawRequest> {
     DRAW_QUEUE.with(|q| std::mem::take(&mut *q.borrow_mut()))
+}
+
+// ---------------------------------------------------------------------------
+// Block edit queue
+// ---------------------------------------------------------------------------
+
+/// A block edit (break/place) requested by the guest via `request-set-block`
+/// during on_tick. Queued rather than applied immediately for the same
+/// reason as CHUNK_QUERY_PTR's safety note explains: the chunk data this
+/// tick's is-solid/get-block calls are reading from can't be mutated until
+/// that borrow ends, which is after on_tick returns — cubic-app drains this
+/// queue then, applying each edit via AsyncWorldStream::set_block_at.
+#[derive(Clone, Copy)]
+pub struct BlockEditRequest {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub block_id: u32,
+}
+
+thread_local! {
+    static BLOCK_EDITS: RefCell<Vec<BlockEditRequest>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Push a block edit request from the guest's `request-set-block` call.
+pub fn push_block_edit(req: BlockEditRequest) {
+    BLOCK_EDITS.with(|q| q.borrow_mut().push(req));
+}
+
+/// Take (and clear) all queued block edits. Called by cubic-app after
+/// on_tick returns and clear_tick_query() has run.
+pub fn take_block_edits() -> Vec<BlockEditRequest> {
+    BLOCK_EDITS.with(|q| std::mem::take(&mut *q.borrow_mut()))
 }
 
 // ---------------------------------------------------------------------------

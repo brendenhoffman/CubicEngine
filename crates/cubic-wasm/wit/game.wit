@@ -66,6 +66,19 @@ interface physics {
     ) -> u32;
 
     is-solid: func(x: f32, y: f32, z: f32) -> bool;
+
+    /// Raw BlockTypeId at the given world position (0 = air, or "no chunk
+    /// loaded there"). Used for pick-block; is-solid stays the cheap bool
+    /// check everything else (movement, raycasting) uses.
+    get-block: func(x: f32, y: f32, z: f32) -> u32;
+
+    /// Request that the voxel at the given world position be set to
+    /// block-id (0 = air, i.e. break). Fire-and-forget, like draw-mesh: the
+    /// edit can't be applied until after this tick's chunk-query borrow
+    /// ends (see cubic-wasm's tick.rs), so the host queues it and applies +
+    /// remeshes after on-tick returns. No-ops if the containing chunk isn't
+    /// currently loaded.
+    request-set-block: func(x: f32, y: f32, z: f32, block-id: u32);
 }
 
 interface data {
@@ -90,13 +103,14 @@ interface input {
         fly-speed: f32,
         jump-velocity: f32,
         gravity: f32,
+        sprint-multiplier: f32,
     }
 
     /// Writes an input-state into out-ptr.
     /// Layout: [move_forward: i32, move_back: i32, move_left: i32, move_right: i32,
     ///          jump: i32, sneak: i32, look_dx: f32, look_dy: f32,
     ///          walk_speed: f32, fly_speed: f32, jump_velocity: f32,
-    ///          gravity: f32] = 12 * 4 = 48 bytes.
+    ///          gravity: f32, sprint_multiplier: f32] = 13 * 4 = 52 bytes.
     ///
     /// Purely discrete/toggle-style controls (toggle-third-person, spectate,
     /// fly, ...) are deliberately not here — they go through get-events
