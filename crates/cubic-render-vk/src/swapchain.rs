@@ -5,6 +5,13 @@ use ash::khr::{surface, swapchain};
 use ash::vk;
 use cubic_render::RenderSize;
 
+use crate::pipeline::{create_pipeline, PipelineConfig};
+use crate::resources::{
+    create_depth_resources, create_frame_uniforms_and_sets, create_indirect_draw_resources,
+};
+use crate::sync::FrameSync;
+use crate::{DeferredDrop, GpuResource, VkRenderer};
+
 #[derive(Clone, Copy, Debug)]
 pub enum VkVsyncMode {
     Fifo,    // Target monitor refresh rate
@@ -369,4 +376,298 @@ pub(crate) fn create_swapchain_bundle(
         image_views: views,
         color_space: surf_format.color_space,
     })
+}
+
+impl VkRenderer {
+    // STRICT ORDER (recreate):
+    // 1) Wait all in-flight image fences + acquire fences (no work using old sc)
+    // 2) device_wait_idle() to avoid destroying in-use views/pipelines
+    // 3) Destroy per-image views + per-image sync tied to OLD swapchain
+    // 4) Create NEW swapchain + images + views
+    // 5) Recreate per-image sync objects
+    // 6) Recreate pipeline ONLY if format changed
+    // 7) Resize command buffers if image count changed
+    // (No re-record step here: render() records each frame's command
+    // buffer fresh for whichever image it just acquired.)
+    // Any deviation can cause sporadic DEVICE_LOST or image-in-use errors.
+    pub(crate) fn recreate_swapchain(&mut self, size: RenderSize) -> Result<()> {
+        // Guard min size window
+        if size.width == 0 || size.height == 0 {
+            return Ok(());
+        }
+
+        // 1) Wait for GPU to reach the last signaled timeline value (flush all prior work)
+        if self.timeline_value > 0 {
+            let wait_info = vk::SemaphoreWaitInfo {
+                s_type: vk::StructureType::SEMAPHORE_WAIT_INFO,
+                flags: vk::SemaphoreWaitFlags::empty(),
+                semaphore_count: 1,
+                p_semaphores: &self.timeline,
+                p_values: &self.timeline_value,
+                ..Default::default()
+            };
+            unsafe { self.device.wait_semaphores(&wait_info, u64::MAX).ok() };
+        }
+
+        // 2) device_wait_idle() to avoid destroying in-use views/pipelines
+        unsafe { self.device.device_wait_idle().ok() };
+
+        // 3) Destroy per-image views + per-image sync tied to OLD swapchain
+        for &iv in &self.image_views {
+            unsafe { self.device.destroy_image_view(iv, None) };
+        }
+        for f in &self.frames {
+            unsafe { self.device.destroy_semaphore(f.render_finished, None) };
+        }
+        self.frames.clear();
+
+        // 3b) Retire per-image UBOs + descriptor pool tied to OLD swapchain.
+        // gpu-allocator persistently maps CpuToGpu allocations, so no
+        // explicit unmap is needed. device_wait_idle() above already makes
+        // these safe to destroy immediately, but route them through the
+        // trash queue anyway for consistency with the rest of the renderer.
+        for (buffer, alloc) in self.ubufs.drain(..).zip(self.umems.drain(..)) {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Buffer { buffer, alloc },
+            });
+        }
+        self.ubo_ptrs.clear();
+        self.ubo_size = 0;
+
+        if self.desc_pool != vk::DescriptorPool::null() {
+            unsafe { self.device.destroy_descriptor_pool(self.desc_pool, None) };
+            self.desc_pool = vk::DescriptorPool::null();
+        }
+        self.desc_sets.clear();
+
+        // 3c) Retire per-image indirect draw buffers.
+        for (buffer, alloc) in self
+            .candidate_bufs
+            .drain(..)
+            .zip(self.candidate_allocs.drain(..))
+        {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Buffer { buffer, alloc },
+            });
+        }
+        self.candidate_ptrs.clear();
+        for (buffer, alloc) in self
+            .indirect_bufs
+            .drain(..)
+            .zip(self.indirect_allocs.drain(..))
+        {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Buffer { buffer, alloc },
+            });
+        }
+        for (buffer, alloc) in self
+            .draw_count_bufs
+            .drain(..)
+            .zip(self.draw_count_allocs.drain(..))
+        {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Buffer { buffer, alloc },
+            });
+        }
+        if self.indirect_desc_pool != vk::DescriptorPool::null() {
+            unsafe {
+                self.device
+                    .destroy_descriptor_pool(self.indirect_desc_pool, None)
+            };
+            self.indirect_desc_pool = vk::DescriptorPool::null();
+        }
+        self.indirect_compute_desc_sets.clear();
+        self.indirect_graphics_desc_sets.clear();
+
+        // 4a) cfg for new swapchain (hdr/vsync/flavor/extent)
+        let cfg = self.cfg.to_swapchain_config(size);
+
+        // 4b) create NEW swapchain + images + views
+        let bundle = create_swapchain_bundle(
+            &self.device,
+            &self.surface_loader,
+            &self.swapchain_loader,
+            self.phys,
+            self.surface,
+            self.swapchain,
+            cfg,
+        )?;
+        unsafe {
+            self.swapchain_loader
+                .destroy_swapchain(self.swapchain, None)
+        };
+        let SwapchainBundle {
+            swapchain,
+            format,
+            extent,
+            images,
+            image_views,
+            color_space,
+        } = bundle;
+
+        // 4c) HDR metadata
+        create_hdr_metadata_if_needed(
+            &self.instance,
+            &self.device,
+            self.has_hdr_metadata_ext,
+            color_space,
+            swapchain,
+        );
+
+        // 4d) Swap in new data
+        let old_format = self.format;
+        self.swapchain = swapchain;
+        self.format = format;
+        self.extent = extent;
+        self.images = images;
+        self.image_views = image_views;
+
+        // 4e) Recreate depth resources for the NEW extent (using same depth format)
+        if self.depth_view != vk::ImageView::null() {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::ImageView(self.depth_view),
+            });
+        }
+        if self.depth_image != vk::Image::null() {
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Image {
+                    image: self.depth_image,
+                    alloc: std::mem::take(&mut self.depth_alloc),
+                },
+            });
+        } else {
+            // No image to pair the allocation with (shouldn't happen in
+            // practice; image/alloc/view are always set together), but
+            // don't leak the allocation if it ever does.
+            let old_alloc = std::mem::take(&mut self.depth_alloc);
+            let _ = self
+                .allocator
+                .as_mut()
+                .expect("allocator missing")
+                .free(old_alloc);
+        }
+        let (dimg, dalloc, dview) = create_depth_resources(
+            &self.device,
+            self.allocator.as_mut().expect("allocator missing"),
+            self.extent,
+            self.depth_format,
+        )?;
+        self.depth_image = dimg;
+        self.depth_alloc = dalloc;
+        self.depth_view = dview;
+
+        // 5) Recreate per-image UBOs + descriptor sets
+        let (ubufs, umems, ubo_ptrs, ubo_size, desc_pool, desc_sets) =
+            create_frame_uniforms_and_sets(
+                &self.instance,
+                &self.device,
+                self.phys,
+                self.allocator.as_mut().expect("allocator missing"),
+                self.desc_set_layout_camera,
+                self.images.len(),
+            )?;
+        self.ubufs = ubufs;
+        self.umems = umems;
+        self.ubo_ptrs = ubo_ptrs;
+        self.ubo_size = ubo_size;
+        self.desc_pool = desc_pool;
+        self.desc_sets = desc_sets;
+
+        // 5b) Recreate per-image indirect draw resources.
+        let indirect = create_indirect_draw_resources(
+            &self.device,
+            self.allocator.as_mut().expect("allocator missing"),
+            self.desc_set_layout_indirect_compute,
+            self.desc_set_layout_indirect_graphics,
+            self.images.len(),
+        )?;
+        self.candidate_bufs = indirect.candidate_bufs;
+        self.candidate_allocs = indirect.candidate_allocs;
+        self.candidate_ptrs = indirect.candidate_ptrs;
+        self.indirect_bufs = indirect.indirect_bufs;
+        self.indirect_allocs = indirect.indirect_allocs;
+        self.draw_count_bufs = indirect.draw_count_bufs;
+        self.draw_count_allocs = indirect.draw_count_allocs;
+        self.indirect_desc_pool = indirect.desc_pool;
+        self.indirect_compute_desc_sets = indirect.compute_desc_sets;
+        self.indirect_graphics_desc_sets = indirect.graphics_desc_sets;
+
+        // 5c) Recreate per-image sync
+        let image_count = self.images.len();
+        let sem_info = vk::SemaphoreCreateInfo::default();
+        for _ in 0..image_count {
+            let rf = unsafe { self.device.create_semaphore(&sem_info, None)? };
+            self.frames.push(FrameSync {
+                render_finished: rf,
+            });
+        }
+
+        // 6) Recreate pipeline only if COLOR format changed
+        if self.format != old_format {
+            let (new_layout, new_pipeline) = create_pipeline(
+                &self.device,
+                self.pipeline_cache,
+                &PipelineConfig {
+                    color_format: self.format,
+                    depth_format: self.depth_format,
+                    set_layout_camera: self.desc_set_layout_camera,
+                    set_layout_material: self.desc_set_layout_material,
+                    set_layout_indirect_graphics: self.desc_set_layout_indirect_graphics,
+                },
+            )?;
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::Pipeline(self.pipeline),
+            });
+            self.trash.push(DeferredDrop {
+                value: self.timeline_value,
+                resource: GpuResource::PipelineLayout(self.pipeline_layout),
+            });
+            self.pipeline_layout = new_layout;
+            self.pipeline = new_pipeline;
+
+            // The egui pipeline is built against a fixed color format too
+            // (see build_renderer); left stale here, cmd_begin_rendering's
+            // new-format attachment wouldn't match it and every egui draw
+            // would hit VUID-vkCmdDrawIndexed-dynamicRenderingUnusedAttachments-08910.
+            // NB: this doesn't update Options::srgb_framebuffer (baked in at
+            // construction), so if a format change ever crosses the
+            // sRGB-view/HDR10-PQ/UNORM boundary (see format_needs_srgb_egui)
+            // rather than just changing bit layout, egui's colors would be
+            // off (not a crash) until the renderer is fully reconstructed —
+            // not a case this engine's flavor selection hits today.
+            if let Some(egui_renderer) = self.egui_renderer.as_mut() {
+                let _ = egui_renderer.set_dynamic_rendering(egui_ash_renderer::DynamicRendering {
+                    color_attachment_format: self.format,
+                    depth_attachment_format: Some(self.depth_format),
+                });
+            }
+        }
+
+        // 7) Resize CBs if image count changed
+        if self.cmd_bufs.len() != self.images.len() {
+            unsafe {
+                self.device
+                    .free_command_buffers(self.cmd_pool, &self.cmd_bufs)
+            };
+            let alloc_info = vk::CommandBufferAllocateInfo {
+                s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
+                command_pool: self.cmd_pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: self.images.len() as u32,
+                ..Default::default()
+            };
+            self.cmd_bufs = unsafe { self.device.allocate_command_buffers(&alloc_info)? };
+        }
+
+        self.acq_index = 0;
+
+        Ok(())
+    }
 }
