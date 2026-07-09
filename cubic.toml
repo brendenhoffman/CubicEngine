@@ -30,10 +30,11 @@ move_speed = 10.0        # m/s; free-fly debug camera only (no game loaded)
 mouse_sensitivity = 0.0025
 
 [player]
-walk_speed = 4.5      # m/s, in-game grounded movement
-fly_speed = 10.0      # m/s, in-game flying (double-tap jump to toggle)
-jump_velocity = 8.0   # m/s, initial upward velocity on jump
-gravity = -20.0       # m/s^2
+walk_speed = 4.5         # m/s, in-game grounded movement
+fly_speed = 10.0         # m/s, in-game flying (double-tap jump to toggle)
+jump_velocity = 8.0      # m/s, initial upward velocity on jump
+gravity = -20.0          # m/s^2
+sprint_multiplier = 1.5  # generic move-speed multiplier; cubic-game's "sprint" control uses this
 
 [game]
 path = "games/cubic-game/game.wasm"
@@ -48,6 +49,12 @@ jump = "Space"
 sneak = "ShiftLeft"
 toggle_diagnostics = "F3"
 toggle_third_person = "F5"
+
+[ui]
+# Swap in your own image to make a custom crosshair — see
+# tools/gen_crosshair.py for how the bundled default was generated.
+crosshair_path = "assets/ui/crosshair.png"
+crosshair_size = 32.0  # on-screen size in logical pixels
 
 [launcher]
 # Fixed size of the launcher screen's own window. Not a "setting" — no

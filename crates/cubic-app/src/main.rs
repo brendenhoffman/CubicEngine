@@ -209,6 +209,8 @@ struct AppCfg {
     controls: ControlsCfg,
     #[serde(default)]
     launcher: LauncherCfg,
+    #[serde(default)]
+    ui: UiCfg,
 }
 
 #[derive(Parser, Debug)]
@@ -487,6 +489,14 @@ fn apply_profile(mut cfg: AppCfg, profile: &profile::ProfileCfg) -> AppCfg {
             cfg.player.sprint_multiplier = v;
         }
     }
+    if let Some(u) = &profile.ui {
+        if let Some(v) = &u.crosshair_path {
+            cfg.ui.crosshair_path = v.clone();
+        }
+        if let Some(v) = u.crosshair_size {
+            cfg.ui.crosshair_size = v;
+        }
+    }
     if let Some(ctrl) = &profile.controls {
         if let Some(v) = &ctrl.forward {
             apply_key_binding_override(&mut cfg.controls.forward, v);
@@ -681,6 +691,36 @@ impl Default for PlayerCfg {
             jump_velocity: default_jump_velocity(),
             gravity: default_gravity(),
             sprint_multiplier: default_sprint_multiplier(),
+        }
+    }
+}
+
+fn default_crosshair_path() -> String {
+    "assets/ui/crosshair.png".to_string()
+}
+fn default_crosshair_size() -> f32 {
+    32.0
+}
+
+/// In-game HUD appearance. `crosshair_path` is resolved relative to the
+/// engine's working directory (same convention as `game.path`) — swapping
+/// in a different image is the entire "make your own crosshair" story for
+/// now, no in-engine editor. See tools/gen_crosshair.py for how the bundled
+/// default was made, including why it's shipped at a much higher
+/// resolution (256x256) than its default on-screen size.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+struct UiCfg {
+    #[serde(default = "default_crosshair_path")]
+    crosshair_path: String,
+    #[serde(default = "default_crosshair_size")]
+    crosshair_size: f32,
+}
+
+impl Default for UiCfg {
+    fn default() -> Self {
+        UiCfg {
+            crosshair_path: default_crosshair_path(),
+            crosshair_size: default_crosshair_size(),
         }
     }
 }
@@ -1319,6 +1359,16 @@ const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
 #[derive(Default)]
 struct InputState {
     held: HashSet<InputSource>,
+    // Sources that saw at least one Pressed transition since the last time
+    // InputTracker::update drained this (see binding_pressed_this_tick).
+    // Exists because InputTracker only samples state once per rendered
+    // frame — a source that's pressed *and* released again within that
+    // same frame would otherwise read as "never held" and the tap would
+    // silently vanish. This isn't just theoretical: some trackpoint
+    // drivers (e.g. ThinkPads with click-to-scroll on the middle button)
+    // synthesize a very short press/release pair around what the user
+    // experiences as a single deliberate click, well under one frame long.
+    pressed_since_check: HashSet<InputSource>,
     mouse_delta: (f32, f32),
 }
 
@@ -1326,6 +1376,7 @@ impl InputState {
     fn set_source(&mut self, source: InputSource, pressed: bool) {
         if pressed {
             self.held.insert(source);
+            self.pressed_since_check.insert(source);
         } else {
             self.held.remove(&source);
         }
@@ -1366,6 +1417,29 @@ impl InputState {
             Some(source) => self.is_held(source) && self.modifier_held(binding.modifier),
             None => false,
         }
+    }
+
+    /// Like `binding_active`, but also counts as "held" if the source was
+    /// pressed at any point since the last `clear_pressed_since_check` call
+    /// even if it's already been released again — see `pressed_since_check`'s
+    /// doc comment for why InputTracker needs this instead of the plain
+    /// instant-in-time check movement controls use.
+    fn binding_pressed_this_tick(&self, binding: &ResolvedBinding) -> bool {
+        match binding.source {
+            Some(source) => {
+                (self.is_held(source) || self.pressed_since_check.contains(&source))
+                    && self.modifier_held(binding.modifier)
+            }
+            None => false,
+        }
+    }
+
+    /// Drain `pressed_since_check` — called once per frame by
+    /// `InputTracker::update` after it's done consulting
+    /// `binding_pressed_this_tick`, so a same-frame press+release doesn't
+    /// keep reading as "held" forever afterward.
+    fn clear_pressed_since_check(&mut self) {
+        self.pressed_since_check.clear();
     }
 
     fn accumulate_mouse_delta(&mut self, dx: f32, dy: f32) {
@@ -1460,11 +1534,11 @@ impl InputTracker {
     /// as an InputEvent (kind 0, or 2 if it happened to be a double-tap);
     /// callers that only care about something host-side (toggle_diagnostics)
     /// use the returned names instead of waiting on a guest round-trip.
-    fn update(&mut self, input: &InputState, dt: f32) -> Vec<String> {
+    fn update(&mut self, input: &mut InputState, dt: f32) -> Vec<String> {
         self.elapsed += dt;
         let mut fired = Vec::new();
         for (name, binding, state) in &mut self.actions {
-            let is_held = input.binding_active(binding);
+            let is_held = input.binding_pressed_this_tick(binding);
             if is_held && !state.was_held {
                 let is_double_tap = self.elapsed - state.last_press_time < 0.3;
                 state.last_press_time = self.elapsed;
@@ -1492,6 +1566,7 @@ impl InputTracker {
             }
             state.was_held = is_held;
         }
+        input.clear_pressed_since_check();
         fired
     }
 }
@@ -1787,6 +1862,11 @@ struct App {
     // Option because it's initialized in resumed(), once the window exists.
     egui_winit: Option<egui_winit::State>,
     show_diagnostics: bool,
+    // Loaded once in resumed() from cfg.ui.crosshair_path (see
+    // load_crosshair_texture) — None if that image failed to load, in
+    // which case the crosshair is just silently skipped rather than
+    // crashing the app over a missing/bad HUD asset.
+    crosshair_tex: Option<egui::TextureHandle>,
     // Resolved once at startup from cfg.controls (see resolve_controls).
     controls: ResolvedControls,
 
@@ -1865,6 +1945,7 @@ impl ApplicationHandler for App {
             None,
         );
         self.egui_winit = Some(egui_winit);
+        self.load_crosshair_texture();
 
         let wh = window.window_handle().expect("window_handle");
         let dh = window.display_handle().expect("display_handle");
@@ -2230,7 +2311,7 @@ impl ApplicationHandler for App {
                         // acted on directly here instead of via InputEvent.
                         if self
                             .input_tracker
-                            .update(&self.input, dt)
+                            .update(&mut self.input, dt)
                             .iter()
                             .any(|name| name == "toggle_diagnostics")
                         {
@@ -2531,6 +2612,59 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// (Re)load the crosshair image from `cfg.ui.crosshair_path` into an
+    /// egui texture — called once from resumed(), and again by the
+    /// Settings tab whenever the path/size is edited, so swapping in a
+    /// custom crosshair.png takes effect immediately without a relaunch.
+    /// On failure, logs a warning and leaves `crosshair_tex` as None —
+    /// build_crosshair_ui just skips drawing rather than the app crashing
+    /// over a missing/corrupt HUD asset.
+    fn load_crosshair_texture(&mut self) {
+        match image::open(&self.cfg.ui.crosshair_path) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let color_image =
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                self.crosshair_tex = Some(self.egui_ctx.load_texture(
+                    "crosshair",
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "failed to load crosshair image {}: {e}",
+                    self.cfg.ui.crosshair_path
+                );
+                self.crosshair_tex = None;
+            }
+        }
+    }
+
+    /// Paints the crosshair centered on the viewport, InGame only. Uses the
+    /// raw layer painter rather than an egui::Window/Area, so it's pure
+    /// drawing — no hit-testing, no risk of swallowing the mouse clicks
+    /// break/place/pick rely on during InGame.
+    fn build_crosshair_ui(&self, ctx: &egui::Context) {
+        let Some(tex) = &self.crosshair_tex else {
+            return;
+        };
+        let size = self.cfg.ui.crosshair_size;
+        let center = ctx.content_rect().center();
+        let rect = egui::Rect::from_center_size(center, egui::vec2(size, size));
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("crosshair"),
+        ));
+        painter.image(
+            tex.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
     /// Free-fly camera controls, used only while no WASM game is loaded
     /// (`wasm_game.is_none()`) — once one is, RedrawRequested's tick handler
     /// feeds input/mouse-look into the guest via on-tick instead, and the
@@ -2893,6 +3027,7 @@ impl App {
             AppState::Launcher => self.build_launcher_ui(ctx),
             AppState::Paused => self.build_pause_ui(ctx),
             AppState::InGame => {
+                self.build_crosshair_ui(ctx);
                 if self.show_diagnostics {
                     self.build_diagnostics_ui(ctx);
                 }
@@ -3176,6 +3311,30 @@ impl App {
                         .add(egui::Slider::new(
                             &mut self.cfg.player.sprint_multiplier,
                             1.0..=3.0,
+                        ))
+                        .changed();
+                });
+                if changed {
+                    save_global_cfg(&self.cfg);
+                }
+            });
+
+            ui.collapsing("Crosshair", |ui| {
+                let mut changed = false;
+                ui.horizontal(|ui| {
+                    ui.label("Image path");
+                    let resp = ui.text_edit_singleline(&mut self.cfg.ui.crosshair_path);
+                    if resp.lost_focus() {
+                        changed = true;
+                        self.load_crosshair_texture();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Size (px)");
+                    changed |= ui
+                        .add(egui::Slider::new(
+                            &mut self.cfg.ui.crosshair_size,
+                            4.0..=128.0,
                         ))
                         .changed();
                 });
@@ -3766,6 +3925,7 @@ fn main() -> Result<()> {
         egui_ctx: egui::Context::default(),
         egui_winit: None,
         show_diagnostics: false,
+        crosshair_tex: None, // loaded in resumed(), once egui_ctx/window exist
         controls,
         camera: Camera {
             position: Vec3::new(0.0, (CHUNK_SIZE / 2) as f32 * VOXEL_SIZE + 12.0, 0.0),
@@ -3829,10 +3989,37 @@ mod tests {
         let mut input = InputState::default();
 
         press(&mut input, KeyCode::KeyF, true);
-        assert_eq!(tracker.update(&input, 0.016), vec!["x".to_string()]);
+        assert_eq!(tracker.update(&mut input, 0.016), vec!["x".to_string()]);
 
         // Still held on the next tick — must not re-fire.
-        assert!(tracker.update(&input, 0.016).is_empty());
+        assert!(tracker.update(&mut input, 0.016).is_empty());
+    }
+
+    #[test]
+    fn tap_trigger_fires_even_if_released_before_the_next_update_call() {
+        // Regression test: a press *and* its matching release both landing
+        // between two InputTracker::update calls (same rendered frame) used
+        // to be invisible — binding_active only ever saw the source's final
+        // state, "not held," so the tap silently vanished. Seen in practice
+        // with some trackpoint drivers (e.g. ThinkPad middle-click doubling
+        // as a scroll-mode toggle) synthesizing a press/release pair well
+        // under one frame long.
+        let mut tracker = tracker_for(
+            "x",
+            binding(KeyCode::KeyF, ModifierKey::None, TriggerKind::Tap),
+        );
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::KeyF, true);
+        press(&mut input, KeyCode::KeyF, false); // released again before update() ever runs
+        assert_eq!(
+            tracker.update(&mut input, 0.016),
+            vec!["x".to_string()],
+            "a same-frame press+release must still fire the tap"
+        );
+
+        // The blip shouldn't leave the action stuck "held" afterward.
+        assert!(tracker.update(&mut input, 0.016).is_empty());
     }
 
     #[test]
@@ -3845,7 +4032,7 @@ mod tests {
 
         press(&mut input, KeyCode::Space, true);
         assert!(
-            tracker.update(&input, 0.05).is_empty(),
+            tracker.update(&mut input, 0.05).is_empty(),
             "a lone tap must not fire a DoubleTap-configured control \
              (this is the exact bug being fixed: toggle_third_person set to \
              DoubleTap used to fire on a single press)"
@@ -3861,14 +4048,14 @@ mod tests {
         let mut input = InputState::default();
 
         press(&mut input, KeyCode::Space, true);
-        assert!(tracker.update(&input, 0.05).is_empty()); // elapsed 0.05
+        assert!(tracker.update(&mut input, 0.05).is_empty()); // elapsed 0.05
 
         press(&mut input, KeyCode::Space, false);
-        tracker.update(&input, 0.05); // elapsed 0.10, Released
+        tracker.update(&mut input, 0.05); // elapsed 0.10, Released
 
         press(&mut input, KeyCode::Space, true); // second press 0.10s after the first
         assert_eq!(
-            tracker.update(&input, 0.05), // elapsed 0.15
+            tracker.update(&mut input, 0.05), // elapsed 0.15
             vec!["x".to_string()],
             "a rapid second press within the 0.3s window must fire"
         );
@@ -3883,14 +4070,14 @@ mod tests {
         let mut input = InputState::default();
 
         press(&mut input, KeyCode::Space, true);
-        tracker.update(&input, 0.05); // elapsed 0.05
+        tracker.update(&mut input, 0.05); // elapsed 0.05
 
         press(&mut input, KeyCode::Space, false);
-        tracker.update(&input, 0.05); // elapsed 0.10
+        tracker.update(&mut input, 0.05); // elapsed 0.10
 
         press(&mut input, KeyCode::Space, true); // second press ~1s after the first
         assert!(
-            tracker.update(&input, 1.0).is_empty(), // elapsed 1.10
+            tracker.update(&mut input, 1.0).is_empty(), // elapsed 1.10
             "two taps more than 0.3s apart must not count as a double-tap"
         );
     }

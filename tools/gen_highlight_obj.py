@@ -7,8 +7,13 @@ proportions (VOXEL_SIZE, inflation, bar thickness) ever need to change.
 """
 
 size = 0.5  # VOXEL_SIZE
-pad = 0.006  # outward inflation
-thick = 0.03  # edge bar cross-section width
+# Outward inflation. Needs to be comfortably larger than the depth buffer's
+# resolvable gap at typical interaction range (a few metres) — 0.006 was
+# too tight and z-fought with the block's own faces depending on view
+# angle (worse at grazing angles / near multiple faces at once, e.g.
+# looking at a block corner), even with reverse-Z + infinite far plane.
+pad = 0.0035
+thick = 0.0025  # edge bar cross-section width
 
 lo = -pad
 hi = size + pad
@@ -23,8 +28,14 @@ faces = []  # each: list of (vi, ti, ni) 1-indexed, per triangle
 def add_box(x0, x1, y0, y1, z0, z1):
     base = len(verts)
     corners = [
-        (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
-        (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+        (x0, y0, z0),
+        (x1, y0, z0),
+        (x1, y1, z0),
+        (x0, y1, z0),
+        (x0, y0, z1),
+        (x1, y0, z1),
+        (x1, y1, z1),
+        (x0, y1, z1),
     ]
     verts.extend(corners)
     face_defs = [

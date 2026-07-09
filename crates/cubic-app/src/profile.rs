@@ -50,6 +50,8 @@ pub struct ProfileCfg {
     pub player: Option<PlayerOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controls: Option<ControlsOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<UiOverride>,
     // Not an AppCfg override like the sections above — window mode/size are
     // launcher-only UI state with no corresponding engine config field —
     // but profile.toml is the natural place to remember them per profile.
@@ -114,6 +116,14 @@ pub struct PlayerOverride {
     pub gravity: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sprint_multiplier: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+pub struct UiOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crosshair_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub crosshair_size: Option<f32>,
 }
 
 /// Sparse override for one control's binding. All three parts are
