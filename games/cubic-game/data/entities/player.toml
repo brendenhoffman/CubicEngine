@@ -1,0 +1,3 @@
+[model]
+mesh = "assets/models/player.obj"
+texture = "assets/textures/player.png"

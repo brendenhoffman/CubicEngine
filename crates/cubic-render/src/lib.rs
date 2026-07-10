@@ -2,6 +2,10 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
+// Re-exported so downstream crates (cubic-app) can name egui's paint-job
+// types in their own renderer-backend abstractions without taking a direct
+// dependency on egui themselves.
+pub use egui;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 // ---------------------------------------------------------------------------
@@ -64,5 +68,15 @@ pub trait Renderer {
     fn free_mesh(&mut self, _handle: MeshHandle) {} // default no-op
     fn upload_texture(&mut self, _pixels: &[u8], _width: u32, _height: u32) -> Result<u32> {
         Ok(0) // default no-op
+    }
+    fn queue_egui(
+        &mut self,
+        _textures_delta: egui::TexturesDelta,
+        _paint_jobs: Vec<egui::ClippedPrimitive>,
+        _screen_width: u32,
+        _screen_height: u32,
+        _pixels_per_point: f32,
+    ) {
+        // default no-op
     }
 }

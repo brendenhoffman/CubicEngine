@@ -1,8 +1,34 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
+mod backend;
+mod config;
 #[cfg(debug_assertions)]
 mod flat_generator;
 mod frustum;
+mod game_override;
+mod guest;
+mod input;
+mod loader;
+mod profile;
+mod ui;
+mod world;
+
+use backend::{Backend, RendererBackend};
+use config::{
+    apply_game_override, apply_profile, build_custom_controls, load_cfg, AppCfg, CustomControl,
+    RenderCfg, UnfocusedPolicy, VsyncMode,
+};
+#[cfg(test)]
+use config::{KeyBinding, ModifierKey, TriggerKind};
+#[cfg(test)]
+use cubic_platform::winit::event::MouseButton;
+#[cfg(test)]
+use input::{input_source_to_string, str_to_input_source, ActionTracker, ResolvedBinding};
+use input::{resolve_controls, InputSource, InputState, InputTracker, ResolvedControls, MAX_PITCH};
+use ui::{
+    scan_games, str_to_window_mode, LauncherState, LauncherTab, PendingWindowedResize, WindowMode,
+    REMAP_TIMEOUT,
+};
 
 use anyhow::Result;
 use clap::Parser;
@@ -10,158 +36,28 @@ use cubic_core::init_tracing;
 use cubic_math::{Camera, Vec3};
 use cubic_platform::winit::{
     application::ApplicationHandler,
+    dpi::PhysicalSize,
     event::{DeviceEvent, DeviceId, ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
     window::{CursorGrabMode, Window, WindowId},
 };
-use cubic_render::{MeshHandle, PushData, RenderSize, Renderer, Vertex};
+use cubic_render::{RenderSize, Renderer};
 use cubic_render_gl::GlRenderer;
-use cubic_render_vk::{Filter, HdrFlavor, SamplerMipmapMode, VkRenderer, VkVsyncMode};
-use cubic_wasm::{WasmPlugin, WasmWorldGenerator};
-use cubic_world::{
-    mesh_chunk, world_pos_to_chunk, AsyncWorldStream, BlockFaceTextures, ChunkPos, WorldGenerator,
-    CHUNK_SIZE, VOXEL_SIZE,
-};
-use frustum::Frustum;
-use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::sync::Arc;
+use cubic_render_vk::VkRenderer;
+use cubic_world::{CHUNK_SIZE, VOXEL_SIZE};
 use tracing::{error, info};
 
 // ---------------------------------------------------------------------------
-// Backend abstraction
+// App state machine
 // ---------------------------------------------------------------------------
 
-trait RendererBackend {
-    fn resize(&mut self, size: RenderSize) -> Result<()>;
-    fn set_clear_color(&mut self, rgba: [f32; 4]);
-    fn set_vsync(&mut self, on: bool);
-    fn configure_advanced(&mut self, cfg: &RenderCfg);
-    fn upload_mesh(&mut self, verts: &[Vertex], idxs: &[u32]) -> Result<MeshHandle>;
-    fn set_camera(&mut self, camera: Camera);
-    fn draw_mesh(&mut self, handle: MeshHandle, push: PushData);
-    fn render(&mut self) -> Result<()>;
-    fn free_mesh(&mut self, _handle: MeshHandle) {} // default no-op
-    fn upload_texture(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<u32>;
-}
-
-enum Backend {
-    Gl(Box<GlRenderer>),
-    Vk(Box<VkRenderer>),
-}
-
-impl RendererBackend for Backend {
-    fn resize(&mut self, size: RenderSize) -> Result<()> {
-        match self {
-            Backend::Gl(r) => r.resize(size),
-            Backend::Vk(r) => r.resize(size),
-        }
-    }
-
-    fn set_clear_color(&mut self, rgba: [f32; 4]) {
-        match self {
-            Backend::Gl(r) => r.set_clear_color(rgba),
-            Backend::Vk(r) => r.set_clear_color(rgba),
-        }
-    }
-
-    fn set_vsync(&mut self, on: bool) {
-        match self {
-            Backend::Gl(r) => r.set_vsync(on),
-            Backend::Vk(r) => r.set_vsync(on),
-        }
-    }
-
-    fn configure_advanced(&mut self, cfg: &RenderCfg) {
-        // GL has no advanced knobs yet.
-        if let Backend::Vk(r) = self {
-            let mode = match cfg.vsync_mode {
-                VsyncMode::Fifo => VkVsyncMode::Fifo,
-                VsyncMode::Mailbox => VkVsyncMode::Mailbox,
-            };
-            r.set_vsync_mode(mode);
-            r.set_hdr_enabled(cfg.hdr);
-            let flavor = match cfg.hdr_flavor {
-                HdrFlavorCfg::PreferScrgb => HdrFlavor::PreferScrgb,
-                HdrFlavorCfg::PreferHdr10 => HdrFlavor::PreferHdr10,
-            };
-            r.set_hdr_flavor(flavor);
-
-            let filter = match cfg.texture_filter {
-                TextureFilter::Nearest => Filter::NEAREST,
-                TextureFilter::Linear => Filter::LINEAR,
-            };
-            let mipmap_mode = match cfg.mipmap_mode {
-                MipmapMode::Nearest => SamplerMipmapMode::NEAREST,
-                MipmapMode::Linear => SamplerMipmapMode::LINEAR,
-            };
-            r.set_sampler_config(filter, filter, mipmap_mode, cfg.anisotropy, cfg.lod_bias);
-        }
-    }
-
-    fn upload_mesh(&mut self, verts: &[Vertex], idxs: &[u32]) -> Result<MeshHandle> {
-        match self {
-            // GL mesh API not yet implemented; uploaded meshes are silently
-            // dropped until the GL backend card is complete.
-            Backend::Gl(_) => Ok(MeshHandle(u32::MAX)),
-            Backend::Vk(r) => r.upload_mesh(verts, idxs),
-        }
-    }
-
-    fn set_camera(&mut self, camera: Camera) {
-        match self {
-            Backend::Gl(_) => {} // GL camera via uniforms — not yet implemented.
-            Backend::Vk(r) => r.set_camera(camera),
-        }
-    }
-
-    fn draw_mesh(&mut self, handle: MeshHandle, push: PushData) {
-        match self {
-            Backend::Gl(_) => {} // GL draw_mesh — not yet implemented.
-            Backend::Vk(r) => r.draw_mesh(handle, push),
-        }
-    }
-
-    fn free_mesh(&mut self, handle: MeshHandle) {
-        match self {
-            Backend::Gl(_) => {}
-            Backend::Vk(r) => r.free_mesh(handle),
-        }
-    }
-
-    fn render(&mut self) -> Result<()> {
-        match self {
-            Backend::Gl(r) => r.render(),
-            Backend::Vk(r) => r.render(),
-        }
-    }
-
-    fn upload_texture(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<u32> {
-        match self {
-            // GL texture API not yet implemented.
-            Backend::Gl(_) => Ok(0),
-            Backend::Vk(r) => r.upload_texture(pixels, width, height),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize, Default)]
-struct AppCfg {
-    #[serde(default)]
-    render: RenderCfg,
-    #[serde(default)]
-    world: WorldCfg,
-    #[serde(default)]
-    camera: CameraCfg,
-    #[serde(default)]
-    game: GameCfg,
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AppState {
+    Launcher, // egui launcher shown, no world loaded, cursor free
+    InGame,   // world running, cursor locked, no egui (except diagnostics)
+    Paused,   // world paused, cursor free, egui pause menu shown
 }
 
 #[derive(Parser, Debug)]
@@ -170,234 +66,6 @@ struct Args {
     /// Choose renderer backend: gl | vk
     #[arg(long, default_value = "vk")]
     backend: String,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum VsyncMode {
-    Fifo,
-    #[default]
-    Mailbox,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum UnfocusedPolicy {
-    None,
-    #[default]
-    VsyncOn,
-    Throttle,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum HdrFlavorCfg {
-    #[default]
-    PreferScrgb,
-    PreferHdr10,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum TextureFilter {
-    Nearest,
-    #[default]
-    Linear,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum MipmapMode {
-    Nearest,
-    #[default]
-    Linear,
-}
-
-#[derive(Debug, Deserialize, Clone, Copy)]
-struct RenderCfg {
-    #[serde(default = "default_clear")]
-    clear_color: [f32; 4],
-    #[serde(default = "default_vsync")]
-    vsync: bool,
-    #[serde(default)]
-    vsync_mode: VsyncMode,
-    #[serde(default)]
-    unfocused: UnfocusedPolicy,
-    #[serde(default)]
-    unfocused_fps: u32,
-    #[serde(default)]
-    fps_when_vsync_off: u32,
-    #[serde(default)]
-    hdr: bool,
-    #[serde(default)]
-    hdr_flavor: HdrFlavorCfg,
-    #[serde(default)]
-    texture_filter: TextureFilter,
-    #[serde(default)]
-    mipmap_mode: MipmapMode,
-    #[serde(default = "default_anisotropy")]
-    anisotropy: f32,
-    #[serde(default)]
-    lod_bias: f32,
-}
-
-impl Default for RenderCfg {
-    fn default() -> Self {
-        RenderCfg {
-            clear_color: default_clear(),
-            vsync: true,
-            vsync_mode: VsyncMode::Mailbox,
-            unfocused: UnfocusedPolicy::Throttle,
-            unfocused_fps: 30,
-            fps_when_vsync_off: 0,
-            hdr: false,
-            hdr_flavor: HdrFlavorCfg::PreferScrgb,
-            texture_filter: TextureFilter::Linear,
-            mipmap_mode: MipmapMode::Linear,
-            anisotropy: default_anisotropy(),
-            lod_bias: 0.0,
-        }
-    }
-}
-
-fn default_clear() -> [f32; 4] {
-    [0.02, 0.02, 0.04, 1.0]
-}
-fn default_vsync() -> bool {
-    true
-}
-fn default_anisotropy() -> f32 {
-    0.0
-}
-fn load_cfg() -> AppCfg {
-    match fs::read_to_string("cubic.toml") {
-        Ok(s) => toml::from_str::<AppCfg>(&s).unwrap_or_default(),
-        Err(_) => AppCfg::default(),
-    }
-}
-
-fn default_stream_radius() -> i32 {
-    8
-}
-
-#[derive(Debug, Deserialize, Clone, Copy)]
-struct WorldCfg {
-    #[serde(default = "default_stream_radius")]
-    stream_radius: i32,
-    #[serde(default)]
-    seed: u64,
-    #[serde(default)] // 0.0 = auto
-    upload_budget_ms: f32,
-    #[serde(default = "default_upload_budget_min_ms")]
-    upload_budget_min_ms: f32,
-    #[serde(default = "default_stream_radius_y")]
-    stream_radius_y: i32,
-}
-
-impl Default for WorldCfg {
-    fn default() -> Self {
-        WorldCfg {
-            stream_radius: default_stream_radius(),
-            seed: 0,
-            upload_budget_ms: 0.0,
-            upload_budget_min_ms: default_upload_budget_min_ms(),
-            stream_radius_y: default_stream_radius_y(),
-        }
-    }
-}
-
-fn default_move_speed() -> f32 {
-    3.0
-}
-
-fn default_mouse_sensitivity() -> f32 {
-    0.0025
-}
-
-#[derive(Debug, Deserialize, Clone, Copy)]
-struct CameraCfg {
-    #[serde(default = "default_move_speed")]
-    move_speed: f32,
-    #[serde(default = "default_mouse_sensitivity")]
-    mouse_sensitivity: f32,
-}
-
-impl Default for CameraCfg {
-    fn default() -> Self {
-        CameraCfg {
-            move_speed: default_move_speed(),
-            mouse_sensitivity: default_mouse_sensitivity(),
-        }
-    }
-}
-
-fn default_upload_budget_min_ms() -> f32 {
-    0.5
-}
-
-fn default_stream_radius_y() -> i32 {
-    2
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct GameCfg {
-    #[serde(default = "default_game_path")]
-    path: String,
-    #[serde(default = "default_wasm_memory_mb")]
-    wasm_memory_mb: usize,
-}
-
-fn default_game_path() -> String {
-    "games/cubic-game/game.wasm".to_string()
-}
-
-fn default_wasm_memory_mb() -> usize {
-    16
-}
-
-impl Default for GameCfg {
-    fn default() -> Self {
-        GameCfg {
-            path: default_game_path(),
-            wasm_memory_mb: default_wasm_memory_mb(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Input
-// ---------------------------------------------------------------------------
-
-const MAX_PITCH: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
-
-#[derive(Default)]
-struct InputState {
-    held_keys: HashSet<KeyCode>,
-    mouse_delta: (f32, f32),
-}
-
-impl InputState {
-    fn set_key(&mut self, code: KeyCode, pressed: bool) {
-        if pressed {
-            self.held_keys.insert(code);
-        } else {
-            self.held_keys.remove(&code);
-        }
-    }
-
-    fn is_held(&self, code: KeyCode) -> bool {
-        self.held_keys.contains(&code)
-    }
-
-    fn accumulate_mouse_delta(&mut self, dx: f32, dy: f32) {
-        self.mouse_delta.0 += dx;
-        self.mouse_delta.1 += dy;
-    }
-
-    /// Returns the accumulated delta and resets it to zero.
-    fn take_mouse_delta(&mut self) -> (f32, f32) {
-        std::mem::take(&mut self.mouse_delta)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -411,31 +79,82 @@ struct App {
     render_size: RenderSize,
 
     cfg: AppCfg,
+    // The profile actively in use — apply_control_remap() updates and saves
+    // this (see current_profile_name/current_game_name below) whenever a
+    // control is rebound in the launcher/pause Controls tab.
+    current_profile: profile::ProfileCfg,
+    current_profile_name: String,
+    current_game_name: String,
+    // Not yet read anywhere: needed by the launcher settings tab to show
+    // "(game override)" labels next to affected knobs (future card).
+    #[allow(dead_code)]
+    game_overrides: game_override::GameOverrideCfg,
+    // Controls the currently loaded game registered itself (see
+    // CustomControl/build_custom_controls) — resolved once at startup from
+    // game_overrides + current_profile, same as `controls`/`input_tracker`.
+    custom_controls: Vec<CustomControl>,
+    // Transient launcher UI state (selected game/profile, seed field,
+    // window-mode radio, remap-in-progress, ...).
+    launcher: LauncherState,
+    launcher_tab: LauncherTab,
+    // Toggled by the pause menu's Settings button; shows the same content
+    // as the launcher's Settings tab in a floating egui::Window.
+    pause_settings_open: bool,
+    // Same idea, for the Controls tab — so bindings (including a game's own
+    // custom_controls) can be changed mid-game without quitting to the
+    // launcher; persist_control_change already applies changes live.
+    pause_controls_open: bool,
+    // See PendingWindowedResize doc comment. None when no dance is in
+    // flight (the common case — only set by handle_launch's Windowed arm).
+    pending_windowed_resize: Option<PendingWindowedResize>,
     exiting: bool,
+    // Set by the pause menu's Quit button; event_loop.exit() is only
+    // callable from ApplicationHandler methods that receive an
+    // &ActiveEventLoop (build_pause_ui doesn't), so the actual exit is
+    // deferred to about_to_wait.
+    quit_requested: bool,
     frames: u32,
+    // Snapshot of `frames` taken once per completed second (see
+    // about_to_wait); `frames` itself is a live in-progress counter that
+    // resets every second, so UI reading it directly saw a 0→N sawtooth.
+    last_fps: u32,
     last_fps_instant: std::time::Instant,
 
     paused: bool,
     focused: bool,
     next_frame_deadline: Option<std::time::Instant>,
 
-    stream: AsyncWorldStream,
-    generator: Arc<dyn WorldGenerator>,
-    plugin: Arc<WasmPlugin>,
-    chunk_meshes: HashMap<ChunkPos, MeshHandle>,
-    seed: u64,
+    state: AppState,
+    egui_ctx: egui::Context,
+    // Option because it's initialized in resumed(), once the window exists.
+    egui_winit: Option<egui_winit::State>,
+    show_diagnostics: bool,
+    // Loaded once in resumed() from cfg.ui.crosshair_path (see
+    // load_crosshair_texture) — None if that image failed to load, in
+    // which case the crosshair is just silently skipped rather than
+    // crashing the app over a missing/bad HUD asset.
+    crosshair_tex: Option<egui::TextureHandle>,
+    // Resolved once at startup from cfg.controls (see resolve_controls).
+    controls: ResolvedControls,
+
+    // Empty until load_world() (called from handle_launch()) actually
+    // constructs the WASM plugin with that launch's seed baked in — see
+    // GuestPlugin's doc comment.
+    guest: guest::GuestPlugin,
+    // Renderer-facing world state (chunk/entity meshes, bindless texture
+    // lookups, streaming) — see WorldRenderer's doc comment.
+    world: world::WorldRenderer,
     camera: Camera,
     input: InputState,
     last_frame_instant: std::time::Instant,
+    last_frame_dt: f32,
     detected_refresh_hz: f32,
-    remesh_scratch: HashSet<ChunkPos>,
-    // Path (relative to the game's data dir) -> bindless texture index,
-    // populated once in resumed() from the WASM plugin's block registry.
-    // Consumed by the mesher to assign tex_index per face.
-    tex_map: HashMap<String, u32>,
-    // Per-block-per-face bindless texture index lookup built from tex_map
-    // once in resumed(); Arc'd so streaming worker threads can share it.
-    face_textures: Arc<BlockFaceTextures>,
+    input_tracker: InputTracker,
+    // None if no gamepad backend is available on this platform (Gilrs::new
+    // can fail, e.g. no udev) — gamepad support is then simply absent
+    // rather than a hard error, same spirit as backend/render fallbacks
+    // elsewhere in this file.
+    gilrs: Option<gilrs::Gilrs>,
 }
 
 impl ApplicationHandler for App {
@@ -444,9 +163,16 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let window = event_loop
-            .create_window(Window::default_attributes().with_title("cubic"))
-            .expect("create_window");
+        // The launcher itself always opens at a fixed size from cubic.toml
+        // (not the remembered game window_mode/size in self.launcher —
+        // that's applied to the *game's* window only, in handle_launch()).
+        let attrs = Window::default_attributes()
+            .with_title("cubic")
+            .with_inner_size(PhysicalSize::new(
+                self.cfg.launcher.width,
+                self.cfg.launcher.height,
+            ));
+        let window = event_loop.create_window(attrs).expect("create_window");
 
         self.detected_refresh_hz = event_loop
             .primary_monitor()
@@ -459,6 +185,17 @@ impl ApplicationHandler for App {
             width: size.width.max(1),
             height: size.height.max(1),
         };
+
+        let egui_winit = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            self.egui_ctx.viewport_id(),
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        self.egui_winit = Some(egui_winit);
+        self.load_crosshair_texture();
 
         let wh = window.window_handle().expect("window_handle");
         let dh = window.display_handle().expect("display_handle");
@@ -483,72 +220,6 @@ impl ApplicationHandler for App {
         backend.set_clear_color(self.cfg.render.clear_color);
         backend.set_vsync(self.cfg.render.vsync);
         backend.configure_advanced(&self.cfg.render);
-
-        // --- 2b. Load block face textures into the bindless array ---
-        let unique_paths: HashSet<String> = {
-            let registry_arc = self.plugin.block_registry();
-            let registry = registry_arc.lock().unwrap();
-            registry
-                .all_defs()
-                .flat_map(|def| {
-                    [
-                        def.faces.top.clone(),
-                        def.faces.bottom.clone(),
-                        def.faces.front.clone(),
-                        def.faces.back.clone(),
-                        def.faces.left.clone(),
-                        def.faces.right.clone(),
-                    ]
-                })
-                .filter(|p| !p.is_empty())
-                .collect()
-        };
-
-        let game_dir = std::path::Path::new(&self.cfg.game.path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-
-        let mut tex_map: HashMap<String, u32> = HashMap::new();
-        for path in unique_paths {
-            let full = game_dir.join(&path);
-            match image::open(&full) {
-                Ok(img) => {
-                    let rgba = img.to_rgba8();
-                    let (w, h) = rgba.dimensions();
-                    match backend.upload_texture(rgba.as_raw(), w, h) {
-                        Ok(index) => {
-                            tex_map.insert(path, index);
-                        }
-                        Err(e) => error!("texture upload failed {full:?}: {e}"),
-                    }
-                }
-                Err(e) => error!("failed to load texture {full:?}: {e}"),
-            }
-        }
-        self.tex_map = tex_map;
-
-        // Build the per-block-per-face texture lookup the mesher indexes by
-        // BlockTypeId, now that tex_map has the path -> bindless index
-        // mapping.
-        {
-            let registry_arc = self.plugin.block_registry();
-            let registry = registry_arc.lock().unwrap();
-            let mut face_textures = BlockFaceTextures::new();
-            for def in registry.all_defs() {
-                // dir order: -X, +X, -Y, +Y, -Z, +Z
-                // face mapping: left/right=sides, bottom=-Y, top=+Y, front/back=sides
-                let get = |path: &str| self.tex_map.get(path).copied().unwrap_or(0);
-                face_textures.push([
-                    get(&def.faces.left),   // -X
-                    get(&def.faces.right),  // +X
-                    get(&def.faces.bottom), // -Y
-                    get(&def.faces.top),    // +Y
-                    get(&def.faces.front),  // -Z
-                    get(&def.faces.back),   // +Z
-                ]);
-            }
-            self.face_textures = Arc::new(face_textures);
-        }
 
         info!(
             "backend = {}",
@@ -590,43 +261,87 @@ impl ApplicationHandler for App {
             }
         }
 
+        // While the Controls tab is capturing a new binding (see
+        // build_controls_tab), intercept keyboard/mouse presses here,
+        // before egui or the normal match below ever sees them. This has
+        // to happen pre-egui because otherwise most mouse clicks would
+        // already be consumed by whatever panel/button is under the
+        // cursor (egui covers the whole window in Launcher/Paused state),
+        // and it has to use the raw winit event streams rather than
+        // egui's because egui's `Key` enum has no variants for bare
+        // modifier presses and its event stream doesn't expose mouse
+        // buttons the same way — see keycode_to_str's doc comment for the
+        // same reasoning applied to keyboard alone. Gamepad button
+        // capture is handled separately in poll_gamepads, since gilrs
+        // events don't arrive as WindowEvents.
+        if let Some((binding, _)) = self.launcher.remapping.clone() {
+            match &event {
+                WindowEvent::KeyboardInput {
+                    event: key_event, ..
+                } if key_event.state == ElementState::Pressed => {
+                    if let PhysicalKey::Code(code) = key_event.physical_key {
+                        if code == KeyCode::Escape {
+                            self.launcher.remapping = None;
+                        } else {
+                            self.complete_remap(&binding, InputSource::Key(code));
+                        }
+                    }
+                    return;
+                }
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    button,
+                    ..
+                } => {
+                    self.complete_remap(&binding, InputSource::Mouse(*button));
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Feed event to egui first
+        if let Some(egui_winit) = &mut self.egui_winit {
+            if let Some(window) = &self.window {
+                let response = egui_winit.on_window_event(window, &event);
+                // Only consume the event if egui wants it AND we are not in
+                // InGame state (in InGame, the cursor is locked and egui is
+                // not shown, so don't consume).
+                if response.consumed && self.state != AppState::InGame {
+                    return;
+                }
+            }
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 info!("CloseRequested");
                 self.exiting = true;
                 self.backend = None;
+                // Drop before the window: its clipboard wraps a raw pointer
+                // into the window's Wayland display, and destroying that
+                // clipboard after the display is gone segfaults on Wayland.
+                self.egui_winit = None;
                 self.window = None;
                 event_loop.exit();
             }
 
             WindowEvent::Resized(new_size) => {
-                self.render_size = RenderSize {
-                    width: new_size.width,
-                    height: new_size.height,
+                self.apply_resized(new_size);
+
+                // Note this resize as confirmed, if it's one step of the
+                // maximize/unmaximize dance (see PendingWindowedResize) —
+                // the *next* request goes out on the following
+                // RedrawRequested, not from inside this handler.
+                self.pending_windowed_resize = match self.pending_windowed_resize.take() {
+                    Some(PendingWindowedResize::AwaitingMaximizeConfirm { width, height }) => {
+                        Some(PendingWindowedResize::MaximizeConfirmed { width, height })
+                    }
+                    Some(PendingWindowedResize::AwaitingUnmaximizeConfirm { width, height }) => {
+                        Some(PendingWindowedResize::UnmaximizeConfirmed { width, height })
+                    }
+                    other => other,
                 };
-                let now_paused = self.render_size.width == 0 || self.render_size.height == 0;
-
-                if self.paused != now_paused {
-                    self.paused = now_paused;
-                    info!(
-                        "Resized → {}x{} (paused={})",
-                        self.render_size.width, self.render_size.height, self.paused
-                    );
-                } else {
-                    info!(
-                        "Resized → {}x{} (paused unchanged={})",
-                        self.render_size.width, self.render_size.height, self.paused
-                    );
-                }
-
-                if !self.paused {
-                    if let Some(backend) = &mut self.backend {
-                        let _ = backend.resize(self.render_size);
-                    }
-                    if let Some(w) = &self.window {
-                        w.request_redraw();
-                    }
-                }
             }
 
             WindowEvent::Occluded(occluded) => {
@@ -663,32 +378,55 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    if let Some(window) = &self.window {
-                        if focused {
-                            let _ = window
-                                .set_cursor_grab(CursorGrabMode::Locked)
-                                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
-                            window.set_cursor_visible(false);
-                        } else {
-                            let _ = window.set_cursor_grab(CursorGrabMode::None);
-                            window.set_cursor_visible(true);
-                        }
-                    }
+                    self.apply_cursor_state();
 
                     if focused {
                         self.next_frame_deadline = None;
                     } else {
                         // Can't reliably observe key-up events while unfocused;
                         // clear held keys so movement doesn't get stuck on alt-tab.
-                        self.input.held_keys.clear();
+                        self.input.clear_held();
                     }
                 }
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                // A press that started/completed a remap capture is
+                // already handled (and consumed) above, before egui and
+                // before this match — this only ever sees ordinary clicks.
+                self.input
+                    .set_source(InputSource::Mouse(button), state == ElementState::Pressed);
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
                     self.input
-                        .set_key(code, event.state == ElementState::Pressed);
+                        .set_source(InputSource::Key(code), event.state == ElementState::Pressed);
+                }
+
+                if event.state == ElementState::Pressed {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        // toggle_diagnostics used to be special-cased here
+                        // too, but that bypassed trigger-kind gating
+                        // entirely (any press toggled it, regardless of
+                        // Tap/DoubleTap) — it's now handled generically
+                        // through InputTracker instead, same as
+                        // toggle_third_person/spectate/fly. See its
+                        // RedrawRequested call site.
+                        if code == KeyCode::Escape {
+                            match self.state {
+                                AppState::InGame => {
+                                    self.state = AppState::Paused;
+                                    self.apply_cursor_state();
+                                }
+                                AppState::Paused => {
+                                    self.state = AppState::InGame;
+                                    self.apply_cursor_state();
+                                }
+                                AppState::Launcher => {} // egui handles escape
+                            }
+                        }
+                    }
                 }
             }
 
@@ -700,113 +438,117 @@ impl ApplicationHandler for App {
                 let now = std::time::Instant::now();
                 let dt = now.duration_since(self.last_frame_instant).as_secs_f32();
                 self.last_frame_instant = now;
-                self.apply_input(dt);
+                self.last_frame_dt = dt;
 
-                if let Some(backend) = &mut self.backend {
-                    // --- Stream update ---
-                    let center = world_pos_to_chunk(self.camera.position);
-                    let delta =
-                        self.stream
-                            .update(center, &self.generator, self.seed, &self.face_textures);
+                self.poll_gamepads();
 
-                    for pos in delta.unloaded {
-                        if let Some(handle) = self.chunk_meshes.remove(&pos) {
-                            backend.free_mesh(handle);
+                // Auto-cancel an in-progress remap capture that's gone
+                // unanswered too long — without this, clicking the capture
+                // button and walking away would leave the Controls tab
+                // stuck showing "Press a key..." forever.
+                if let Some((_, started)) = &self.launcher.remapping {
+                    if started.elapsed() > REMAP_TIMEOUT {
+                        self.launcher.remapping = None;
+                    }
+                }
+
+                // Advance the maximize/unmaximize dance one step, if the
+                // previous step's resize was confirmed on a prior
+                // WindowEvent::Resized (see PendingWindowedResize) — done
+                // here, a full event-loop turn later, rather than inline
+                // in that handler; see the type's doc comment for why.
+                match self.pending_windowed_resize.take() {
+                    Some(PendingWindowedResize::MaximizeConfirmed { width, height }) => {
+                        if let Some(window) = &self.window {
+                            window.set_maximized(false);
+                        }
+                        self.pending_windowed_resize =
+                            Some(PendingWindowedResize::AwaitingUnmaximizeConfirm {
+                                width,
+                                height,
+                            });
+                    }
+                    Some(PendingWindowedResize::UnmaximizeConfirmed { width, height }) => {
+                        // request_inner_size's return is the authoritative
+                        // result here — winit's Wayland backend never
+                        // synthesizes a WindowEvent::Resized for a resize
+                        // *the client itself* requested (only for
+                        // compositor-initiated ones), so without applying
+                        // this directly, render_size/the swapchain would
+                        // never learn about a resize that actually worked.
+                        let result = self
+                            .window
+                            .as_ref()
+                            .and_then(|w| w.request_inner_size(PhysicalSize::new(width, height)));
+                        if let Some(size) = result {
+                            self.apply_resized(size);
                         }
                     }
+                    other => self.pending_windowed_resize = other,
+                }
 
-                    // Compute this frame's mesh budget
-                    let frame_budget_ms = (dt * 1000.0).min(33.3);
-                    let upload_ms = if self.cfg.world.upload_budget_ms == 0.0 {
-                        (frame_budget_ms * 0.25).max(self.cfg.world.upload_budget_min_ms)
-                    } else {
-                        self.cfg.world.upload_budget_ms
-                    };
-                    let budget_deadline =
-                        now + std::time::Duration::from_secs_f32(upload_ms / 1000.0);
+                // Game input and streaming only when world is active
+                if self.state == AppState::InGame {
+                    self.apply_input(dt);
+                }
 
-                    // Upload new chunks
-                    while std::time::Instant::now() < budget_deadline {
-                        let Some((pos, verts, idxs)) = self.stream.ready_meshes.pop() else {
-                            break;
-                        };
-                        match backend.upload_mesh(&verts, &idxs) {
-                            Ok(handle) => {
-                                self.chunk_meshes.insert(pos, handle);
-                            }
-                            Err(e) => error!("chunk {pos:?} upload failed: {e}"),
-                        }
+                // Build this frame's egui output before borrowing
+                // `self.backend` mutably below — build_ui() needs `&mut
+                // self`, so it can't run while any other field is already
+                // borrowed. take_egui_input/handle_platform_output are kept
+                // in their own scopes (rather than spanning the run() call)
+                // for the same reason.
+                let raw_input = match (&mut self.egui_winit, &self.window) {
+                    (Some(egui_winit), Some(window)) => Some(egui_winit.take_egui_input(window)),
+                    _ => None,
+                };
+                let egui_frame = raw_input.map(|raw_input| {
+                    // Context is a cheap Arc handle to shared state; clone it
+                    // so `run`'s receiver borrow doesn't overlap with the
+                    // closure's need for `&mut self` (build_ui).
+                    let egui_ctx = self.egui_ctx.clone();
+                    let full_output = egui_ctx.run(raw_input, |ctx| {
+                        self.build_ui(ctx);
+                    });
+                    if let (Some(egui_winit), Some(window)) = (&mut self.egui_winit, &self.window) {
+                        egui_winit.handle_platform_output(window, full_output.platform_output);
+                    }
+                    let paint_jobs =
+                        egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+                    (
+                        full_output.textures_delta,
+                        paint_jobs,
+                        full_output.pixels_per_point,
+                    )
+                });
+
+                // Taken out of `self` (rather than borrowed) for the
+                // duration of this block so world_tick_and_draw can take
+                // `&mut self` without aliasing a live `&mut self.backend`
+                // borrow — put back before returning either way.
+                if let Some(mut backend) = self.backend.take() {
+                    // Scene render only when world is active
+                    if self.state == AppState::InGame || self.state == AppState::Paused {
+                        self.world_tick_and_draw(&mut backend, now, dt);
                     }
 
-                    // Boundary remesh — shares the same deadline
-                    self.remesh_scratch.clear();
-                    self.remesh_scratch
-                        .extend(self.stream.remesh_queue.drain(..));
-                    let mut deferred = Vec::new();
-                    for &pos in &self.remesh_scratch {
-                        if std::time::Instant::now() >= budget_deadline {
-                            deferred.push(pos);
-                            continue;
-                        }
-                        let neighbors = self.stream.neighbors(pos);
-                        if neighbors.iter().all(Option::is_none) {
-                            continue;
-                        }
-                        let chunk = match self.stream.chunks().get(&pos) {
-                            Some(c) => c,
-                            None => continue,
-                        };
-                        let (verts, idxs) = mesh_chunk(chunk, neighbors, &self.face_textures);
-                        if let Some(old) = self.chunk_meshes.remove(&pos) {
-                            backend.free_mesh(old);
-                        }
-                        if !verts.is_empty() {
-                            match backend.upload_mesh(&verts, &idxs) {
-                                Ok(handle) => {
-                                    self.chunk_meshes.insert(pos, handle);
-                                    self.stream.mark_remeshed(pos);
-                                }
-                                Err(e) => error!("remesh {pos:?} failed: {e}"),
-                            }
-                        }
-                    }
-                    self.stream.remesh_queue.extend(deferred);
-
-                    // --- Draw ---
-                    backend.set_camera(self.camera);
-
-                    let aspect = self.render_size.width as f32 / self.render_size.height as f32;
-                    let view_proj = self.camera.projection_matrix(aspect)
-                        * self.camera.view_matrix_no_translation();
-                    let frustum = Frustum::from_view_proj(&view_proj);
-                    let chunk_world_size = CHUNK_SIZE as f32 * VOXEL_SIZE;
-                    let cam_pos = self.camera.position; // snapshot once
-
-                    for (&pos, &handle) in &self.chunk_meshes {
-                        let world_origin = pos.to_world_origin();
-                        let relative = world_origin - cam_pos; // camera-relative translation
-                        let min = relative;
-                        let max = relative + Vec3::splat(chunk_world_size);
-                        if frustum.contains_aabb(min, max) {
-                            let push = PushData {
-                                model: [
-                                    [1.0, 0.0, 0.0, 0.0],
-                                    [0.0, 1.0, 0.0, 0.0],
-                                    [0.0, 0.0, 1.0, 0.0],
-                                    [relative.x, relative.y, relative.z, 1.0],
-                                ],
-                                tint: [1.0, 1.0, 1.0, 1.0],
-                                tex_index: 0,
-                                _pad: [0; 3],
-                            };
-                            backend.draw_mesh(handle, push);
-                        }
+                    // egui -- runs every frame regardless of state
+                    if let Some((textures_delta, paint_jobs, pixels_per_point)) = egui_frame {
+                        backend.queue_egui(
+                            textures_delta,
+                            paint_jobs,
+                            self.render_size.width,
+                            self.render_size.height,
+                            pixels_per_point,
+                        );
                     }
 
                     match backend.render() {
                         Ok(()) => self.frames = self.frames.saturating_add(1),
                         Err(e) => error!("render error: {e}"),
                     }
+
+                    self.backend = Some(backend);
                 }
             }
 
@@ -821,7 +563,7 @@ impl ApplicationHandler for App {
         event: DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
-            if self.focused {
+            if self.focused && self.state == AppState::InGame {
                 self.input
                     .accumulate_mouse_delta(delta.0 as f32, delta.1 as f32);
             }
@@ -830,6 +572,17 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.exiting {
+            return;
+        }
+
+        if self.quit_requested {
+            self.exiting = true;
+            self.backend = None;
+            // See the CloseRequested handler above for why this must come
+            // before self.window = None.
+            self.egui_winit = None;
+            self.window = None;
+            event_loop.exit();
             return;
         }
 
@@ -890,7 +643,12 @@ impl ApplicationHandler for App {
         // FPS counter
         let now = std::time::Instant::now();
         if now.duration_since(self.last_fps_instant).as_secs_f32() >= 1.0 {
-            info!("fps ~ {} | loaded={}", self.frames, self.chunk_meshes.len());
+            self.last_fps = self.frames;
+            info!(
+                "fps ~ {} | loaded={}",
+                self.last_fps,
+                self.world.chunk_meshes.len()
+            );
             self.frames = 0;
             self.last_fps_instant = now;
         }
@@ -898,36 +656,104 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// (Re)load the crosshair image from `cfg.ui.crosshair_path` into an
+    /// egui texture — called once from resumed(), and again by the
+    /// Settings tab whenever the path/size is edited, so swapping in a
+    /// custom crosshair.png takes effect immediately without a relaunch.
+    /// On failure, logs a warning and leaves `crosshair_tex` as None —
+    /// build_crosshair_ui just skips drawing rather than the app crashing
+    /// over a missing/corrupt HUD asset.
+    /// Free-fly camera controls, used only while no WASM game is loaded
+    /// (`wasm_game.is_none()`) — once one is, RedrawRequested's tick handler
+    /// feeds input/mouse-look into the guest via on-tick instead, and the
+    /// guest owns the camera via set-camera. Skipping both blocks here below
+    /// avoids double-applying the same mouse delta to the camera.
     fn apply_input(&mut self, dt: f32) {
-        let (dx, dy) = self.input.take_mouse_delta();
-        self.camera.yaw -= dx * self.cfg.camera.mouse_sensitivity;
-        self.camera.pitch = (self.camera.pitch - dy * self.cfg.camera.mouse_sensitivity)
-            .clamp(-MAX_PITCH, MAX_PITCH);
-
-        let forward = self.camera.forward();
-        let right = forward.cross(Vec3::Y).normalize_or_zero();
-        let mut movement = Vec3::ZERO;
-
-        if self.input.is_held(KeyCode::KeyW) {
-            movement += forward;
-        }
-        if self.input.is_held(KeyCode::KeyS) {
-            movement -= forward;
-        }
-        if self.input.is_held(KeyCode::KeyD) {
-            movement += right;
-        }
-        if self.input.is_held(KeyCode::KeyA) {
-            movement -= right;
-        }
-        if self.input.is_held(KeyCode::Space) {
-            movement += Vec3::Y;
-        }
-        if self.input.is_held(KeyCode::ShiftLeft) {
-            movement -= Vec3::Y;
+        if self.guest.wasm_game.is_none() {
+            let (dx, dy) = self.input.take_mouse_delta();
+            self.camera.yaw -= dx * self.cfg.camera.mouse_sensitivity;
+            self.camera.pitch = (self.camera.pitch - dy * self.cfg.camera.mouse_sensitivity)
+                .clamp(-MAX_PITCH, MAX_PITCH);
         }
 
-        self.camera.position += movement.normalize_or_zero() * self.cfg.camera.move_speed * dt;
+        if self.guest.wasm_game.is_none() {
+            let forward = self.camera.forward();
+            let right = forward.cross(Vec3::Y).normalize_or_zero();
+            let mut movement = Vec3::ZERO;
+
+            if self.input.binding_active(&self.controls.forward) {
+                movement += forward;
+            }
+            if self.input.binding_active(&self.controls.back) {
+                movement -= forward;
+            }
+            if self.input.binding_active(&self.controls.right) {
+                movement += right;
+            }
+            if self.input.binding_active(&self.controls.left) {
+                movement -= right;
+            }
+            if self.input.binding_active(&self.controls.jump) {
+                movement += Vec3::Y;
+            }
+            if self.input.binding_active(&self.controls.sneak) {
+                movement -= Vec3::Y;
+            }
+
+            self.camera.position += movement.normalize_or_zero() * self.cfg.camera.move_speed * dt;
+        }
+    }
+
+    /// Apply a new window size to render_size/paused/backend — shared by
+    /// the WindowEvent::Resized handler and the tail of the
+    /// maximize/unmaximize dance (see PendingWindowedResize). The latter
+    /// needs this because winit's Wayland backend only ever synthesizes
+    /// WindowEvent::Resized from a *compositor*-initiated configure, never
+    /// from a client's own successful request_inner_size() call — so
+    /// without calling this directly, a resize that actually succeeded
+    /// would still leave render_size/the swapchain stuck at the old size.
+    fn apply_resized(&mut self, new_size: PhysicalSize<u32>) {
+        self.render_size = RenderSize {
+            width: new_size.width,
+            height: new_size.height,
+        };
+        let now_paused = self.render_size.width == 0 || self.render_size.height == 0;
+
+        if self.paused != now_paused {
+            self.paused = now_paused;
+            info!(
+                "Resized → {}x{} (paused={})",
+                self.render_size.width, self.render_size.height, self.paused
+            );
+        } else {
+            info!(
+                "Resized → {}x{} (paused unchanged={})",
+                self.render_size.width, self.render_size.height, self.paused
+            );
+        }
+
+        if !self.paused {
+            if let Some(backend) = &mut self.backend {
+                let _ = backend.resize(self.render_size);
+            }
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
+    }
+
+    fn apply_cursor_state(&self) {
+        let Some(window) = &self.window else { return };
+        let should_lock = self.focused && self.state == AppState::InGame;
+        if should_lock {
+            let _ = window
+                .set_cursor_grab(CursorGrabMode::Locked)
+                .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+            window.set_cursor_visible(false);
+        } else {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
     }
 }
 
@@ -935,31 +761,65 @@ fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
     let event_loop: EventLoop<()> = EventLoop::new()?;
-    let cfg = load_cfg();
 
-    let seed = if cfg.world.seed == 0 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos() as u64
-    } else {
-        cfg.world.seed
+    let game_name = "cubic-game".to_string();
+    let profile_name = "default".to_string();
+    let current_profile = profile::load_or_create(&game_name, &profile_name).unwrap_or_default();
+    tracing::info!(
+        "profile: {}",
+        profile::profile_toml_path(&game_name, &profile_name).display()
+    );
+    // Create the XDG directory structure at startup so it exists even if
+    // empty; the user-mods layer lands in a future card.
+    let _ = std::fs::create_dir_all(profile::user_games_dir());
+    let _ = std::fs::create_dir_all(profile::user_mods_dir());
+
+    // Resolution chain: cubic.toml (global) -> game_overrides.toml (game) ->
+    // profile.toml (user). game.path only ever comes from cubic.toml, so
+    // it's already known from this same load_cfg() call — no need to read
+    // and parse cubic.toml a second time just to find game_dir.
+    let base_cfg = load_cfg();
+    let game_dir = std::path::Path::new(&base_cfg.game.path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let game_overrides = game_override::load(&game_dir);
+
+    let cfg = apply_profile(
+        apply_game_override(base_cfg, &game_overrides),
+        &current_profile,
+    );
+    let controls = resolve_controls(&cfg);
+    let custom_controls = build_custom_controls(&game_overrides, &current_profile);
+
+    // Remembered from a previous launch, if this profile has ever saved one
+    // (see handle_launch/persist_window_prefs); otherwise sensible defaults.
+    let remembered_window = current_profile.window.as_ref();
+    let window_mode = remembered_window
+        .and_then(|w| w.mode.as_deref())
+        .and_then(str_to_window_mode)
+        .unwrap_or(WindowMode::Windowed);
+    let window_width_str = remembered_window
+        .and_then(|w| w.width)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "1280".to_string());
+    let window_height_str = remembered_window
+        .and_then(|w| w.height)
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "720".to_string());
+
+    let launcher = LauncherState {
+        selected_game: game_name.clone(),
+        available_games: scan_games(),
+        selected_profile: profile_name.clone(),
+        available_profiles: profile::list_profiles(&game_name),
+        seed_str: cfg.world.seed.to_string(),
+        window_mode,
+        window_width_str,
+        window_height_str,
+        settings_open: false,
+        remapping: None,
     };
-
-    let worker_count = std::thread::available_parallelism()
-        .map_or(4, |n| n.get())
-        .saturating_sub(1)
-        .max(1);
-
-    let plugin = Arc::new(WasmPlugin::load(
-        &cfg.game.path,
-        worker_count,
-        cfg.game.wasm_memory_mb,
-        seed,
-    )?);
-    plugin.warm_up(); // populates block_registry via on_load
-    let generator =
-        Arc::new(WasmWorldGenerator::new(Arc::clone(&plugin))) as Arc<dyn WorldGenerator>;
 
     let mut app = App {
         backend_choice: args.backend,
@@ -969,22 +829,33 @@ fn main() -> Result<()> {
             width: 1,
             height: 1,
         },
-        stream: AsyncWorldStream::new(
-            cfg.world.stream_radius,
-            cfg.world.stream_radius_y,
-            Some(Arc::new(cubic_wasm::set_worker_id as fn(usize))),
-        ),
-        generator,
-        plugin,
-        chunk_meshes: HashMap::new(),
-        seed,
+        world: world::WorldRenderer::new(cfg.world.stream_radius, cfg.world.stream_radius_y),
+        guest: guest::GuestPlugin::default(),
         cfg,
+        current_profile,
+        current_profile_name: profile_name,
+        current_game_name: game_name,
+        game_overrides,
+        custom_controls: custom_controls.clone(),
+        launcher,
+        launcher_tab: LauncherTab::Game,
+        pause_settings_open: false,
+        pause_controls_open: false,
+        pending_windowed_resize: None,
         exiting: false,
+        quit_requested: false,
         frames: 0,
+        last_fps: 0,
         last_fps_instant: std::time::Instant::now(),
         paused: false,
         focused: true,
         next_frame_deadline: None,
+        state: AppState::Launcher,
+        egui_ctx: egui::Context::default(),
+        egui_winit: None,
+        show_diagnostics: false,
+        crosshair_tex: None, // loaded in resumed(), once egui_ctx/window exist
+        controls,
         camera: Camera {
             position: Vec3::new(0.0, (CHUNK_SIZE / 2) as f32 * VOXEL_SIZE + 12.0, 0.0),
             pitch: -0.3,
@@ -992,11 +863,303 @@ fn main() -> Result<()> {
         },
         input: InputState::default(),
         last_frame_instant: std::time::Instant::now(),
+        last_frame_dt: 0.0,
         detected_refresh_hz: 60.0, // overwritten in resumed()
-        remesh_scratch: HashSet::new(),
-        tex_map: HashMap::new(),
-        face_textures: Arc::new(BlockFaceTextures::new()), // populated in resumed()
+        input_tracker: InputTracker::new(&controls, &custom_controls),
+        gilrs: gilrs::Gilrs::new()
+            .inspect_err(|e| tracing::warn!("gamepad support unavailable: {e}"))
+            .ok(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binding(key: KeyCode, modifier: ModifierKey, trigger: TriggerKind) -> ResolvedBinding {
+        ResolvedBinding {
+            source: Some(InputSource::Key(key)),
+            modifier,
+            trigger,
+        }
+    }
+
+    fn tracker_for(name: &str, binding: ResolvedBinding) -> InputTracker {
+        InputTracker {
+            actions: vec![(
+                name.to_string(),
+                binding,
+                ActionTracker {
+                    was_held: false,
+                    last_press_time: -1.0,
+                },
+            )],
+            elapsed: 0.0,
+        }
+    }
+
+    fn press(input: &mut InputState, key: KeyCode, pressed: bool) {
+        input.set_source(InputSource::Key(key), pressed);
+    }
+
+    #[test]
+    fn tap_trigger_fires_once_on_press_not_while_held() {
+        let mut tracker = tracker_for(
+            "x",
+            binding(KeyCode::KeyF, ModifierKey::None, TriggerKind::Tap),
+        );
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::KeyF, true);
+        assert_eq!(tracker.update(&mut input, 0.016), vec!["x".to_string()]);
+
+        // Still held on the next tick — must not re-fire.
+        assert!(tracker.update(&mut input, 0.016).is_empty());
+    }
+
+    #[test]
+    fn tap_trigger_fires_even_if_released_before_the_next_update_call() {
+        // Regression test: a press *and* its matching release both landing
+        // between two InputTracker::update calls (same rendered frame) used
+        // to be invisible — binding_active only ever saw the source's final
+        // state, "not held," so the tap silently vanished. Seen in practice
+        // with some trackpoint drivers (e.g. ThinkPad middle-click doubling
+        // as a scroll-mode toggle) synthesizing a press/release pair well
+        // under one frame long.
+        let mut tracker = tracker_for(
+            "x",
+            binding(KeyCode::KeyF, ModifierKey::None, TriggerKind::Tap),
+        );
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::KeyF, true);
+        press(&mut input, KeyCode::KeyF, false); // released again before update() ever runs
+        assert_eq!(
+            tracker.update(&mut input, 0.016),
+            vec!["x".to_string()],
+            "a same-frame press+release must still fire the tap"
+        );
+
+        // The blip shouldn't leave the action stuck "held" afterward.
+        assert!(tracker.update(&mut input, 0.016).is_empty());
+    }
+
+    #[test]
+    fn double_tap_trigger_suppresses_a_lone_tap() {
+        let mut tracker = tracker_for(
+            "x",
+            binding(KeyCode::Space, ModifierKey::None, TriggerKind::DoubleTap),
+        );
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::Space, true);
+        assert!(
+            tracker.update(&mut input, 0.05).is_empty(),
+            "a lone tap must not fire a DoubleTap-configured control \
+             (this is the exact bug being fixed: toggle_third_person set to \
+             DoubleTap used to fire on a single press)"
+        );
+    }
+
+    #[test]
+    fn double_tap_trigger_fires_on_a_genuine_rapid_double_press() {
+        let mut tracker = tracker_for(
+            "x",
+            binding(KeyCode::Space, ModifierKey::None, TriggerKind::DoubleTap),
+        );
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::Space, true);
+        assert!(tracker.update(&mut input, 0.05).is_empty()); // elapsed 0.05
+
+        press(&mut input, KeyCode::Space, false);
+        tracker.update(&mut input, 0.05); // elapsed 0.10, Released
+
+        press(&mut input, KeyCode::Space, true); // second press 0.10s after the first
+        assert_eq!(
+            tracker.update(&mut input, 0.05), // elapsed 0.15
+            vec!["x".to_string()],
+            "a rapid second press within the 0.3s window must fire"
+        );
+    }
+
+    #[test]
+    fn double_tap_trigger_does_not_fire_on_two_slow_taps() {
+        let mut tracker = tracker_for(
+            "x",
+            binding(KeyCode::Space, ModifierKey::None, TriggerKind::DoubleTap),
+        );
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::Space, true);
+        tracker.update(&mut input, 0.05); // elapsed 0.05
+
+        press(&mut input, KeyCode::Space, false);
+        tracker.update(&mut input, 0.05); // elapsed 0.10
+
+        press(&mut input, KeyCode::Space, true); // second press ~1s after the first
+        assert!(
+            tracker.update(&mut input, 1.0).is_empty(), // elapsed 1.10
+            "two taps more than 0.3s apart must not count as a double-tap"
+        );
+    }
+
+    #[test]
+    fn modifier_gates_activation_and_is_side_agnostic() {
+        let b = binding(KeyCode::F6, ModifierKey::Shift, TriggerKind::Tap);
+        let mut input = InputState::default();
+
+        press(&mut input, KeyCode::F6, true);
+        assert!(
+            !input.binding_active(&b),
+            "key alone shouldn't activate a Shift-gated binding"
+        );
+
+        press(&mut input, KeyCode::ShiftLeft, true);
+        assert!(
+            input.binding_active(&b),
+            "key + ShiftLeft should activate it"
+        );
+
+        press(&mut input, KeyCode::ShiftLeft, false);
+        press(&mut input, KeyCode::ShiftRight, true);
+        assert!(
+            input.binding_active(&b),
+            "either shift side should satisfy a generic Shift modifier"
+        );
+    }
+
+    #[test]
+    fn unbound_binding_never_activates() {
+        let b = ResolvedBinding {
+            source: None,
+            modifier: ModifierKey::None,
+            trigger: TriggerKind::Tap,
+        };
+        let mut input = InputState::default();
+        press(&mut input, KeyCode::F6, true); // holding some unrelated key
+        assert!(!input.binding_active(&b));
+    }
+
+    #[test]
+    fn mouse_button_activates_a_binding_the_same_as_a_key() {
+        let b = ResolvedBinding {
+            source: Some(InputSource::Mouse(MouseButton::Right)),
+            modifier: ModifierKey::None,
+            trigger: TriggerKind::Tap,
+        };
+        let mut input = InputState::default();
+        assert!(!input.binding_active(&b));
+
+        input.set_source(InputSource::Mouse(MouseButton::Right), true);
+        assert!(input.binding_active(&b));
+
+        input.set_source(InputSource::Mouse(MouseButton::Right), false);
+        assert!(!input.binding_active(&b));
+    }
+
+    #[test]
+    fn gamepad_button_activates_a_binding_the_same_as_a_key() {
+        let b = ResolvedBinding {
+            source: Some(InputSource::Gamepad(gilrs::Button::South)),
+            modifier: ModifierKey::None,
+            trigger: TriggerKind::Tap,
+        };
+        let mut input = InputState::default();
+        input.set_source(InputSource::Gamepad(gilrs::Button::South), true);
+        assert!(input.binding_active(&b));
+    }
+
+    #[test]
+    fn input_source_round_trips_through_config_strings() {
+        for source in [
+            InputSource::Key(KeyCode::KeyW),
+            InputSource::Mouse(MouseButton::Left),
+            InputSource::Mouse(MouseButton::Other(7)),
+            InputSource::Gamepad(gilrs::Button::South),
+            InputSource::Gamepad(gilrs::Button::DPadUp),
+        ] {
+            let s = input_source_to_string(source).expect("source should stringify");
+            assert_eq!(
+                str_to_input_source(&s),
+                Some(source),
+                "round trip failed for {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_kind_has_no_hold_variant() {
+        // Regression guard for the removed Hold trigger: legacy/empty
+        // bindings and KeyBinding::key's default must land on Tap instead
+        // (Hold and Tap fired identically anyway, so this is a pure label
+        // change, not a behavior change).
+        assert_eq!(KeyBinding::key("KeyW").trigger, TriggerKind::Tap);
+        assert_eq!(
+            KeyBinding::unbound(TriggerKind::Tap).trigger,
+            TriggerKind::Tap
+        );
+    }
+
+    #[test]
+    fn custom_control_resolves_game_default_with_no_profile_override() {
+        let overrides = game_override::GameOverrideCfg {
+            controls: vec![game_override::CustomControlDef {
+                name: "sprint".to_string(),
+                label: Some("Sprint".to_string()),
+                key: Some("KeyW".to_string()),
+                modifier: None,
+                trigger: Some("double_tap".to_string()),
+            }],
+            ..Default::default()
+        };
+        let profile = profile::ProfileCfg::default();
+
+        let custom = build_custom_controls(&overrides, &profile);
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom[0].name, "sprint");
+        assert_eq!(custom[0].label, "Sprint");
+        assert_eq!(custom[0].binding.key.as_deref(), Some("KeyW"));
+        assert_eq!(custom[0].binding.trigger, TriggerKind::DoubleTap);
+        assert_eq!(custom[0].binding.modifier, ModifierKey::None);
+    }
+
+    #[test]
+    fn custom_control_profile_override_takes_precedence_over_game_default() {
+        let overrides = game_override::GameOverrideCfg {
+            controls: vec![game_override::CustomControlDef {
+                name: "sprint".to_string(),
+                label: None,
+                key: Some("KeyW".to_string()),
+                modifier: None,
+                trigger: Some("double_tap".to_string()),
+            }],
+            ..Default::default()
+        };
+        let mut custom_override = std::collections::HashMap::new();
+        custom_override.insert(
+            "sprint".to_string(),
+            profile::KeyBindingOverride {
+                key: Some("KeyR".to_string()),
+                modifier: None,
+                trigger: Some("tap".to_string()),
+            },
+        );
+        let profile = profile::ProfileCfg {
+            controls: Some(profile::ControlsOverride {
+                custom: custom_override,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let custom = build_custom_controls(&overrides, &profile);
+        assert_eq!(custom.len(), 1);
+        // Falls back to the control's own name when no label is declared.
+        assert_eq!(custom[0].label, "sprint");
+        assert_eq!(custom[0].binding.key.as_deref(), Some("KeyR"));
+        assert_eq!(custom[0].binding.trigger, TriggerKind::Tap);
+    }
 }

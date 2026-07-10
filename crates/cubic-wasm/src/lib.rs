@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod tick;
+pub use tick::{
+    call_load_mesh, call_load_tex, clear_tick_query, get_player_feet, get_tick_input,
+    push_block_edit, push_draw_request, push_input_event, set_camera_update, set_load_fns,
+    set_player_feet, set_tick_input, set_tick_query, take_block_edits, take_camera_update,
+    take_draw_queue, take_input_events, with_chunk_query, BlockEditRequest, CameraUpdate,
+    DrawRequest, InputEvent, InputSnapshot, PlayerFeet,
+};
+
 use anyhow::{anyhow, Context, Result};
 use cubic_world::{
     Chunk, ChunkLocalPos, ChunkPos, FaceDef, WorldGenerator, CHUNK_SIZE, CHUNK_VOLUME,
@@ -28,7 +37,11 @@ const EXPORT_ON_LOAD: &str = "cubic:game/world-gen@0.1.0#on-load";
 const EXPORT_GENERATE: &str = "cubic:game/world-gen@0.1.0#generate";
 const EXPORT_IS_DEFINITELY_AIR: &str = "cubic:game/world-gen@0.1.0#is-definitely-air";
 const IMPORT_DATA_MODULE: &str = "cubic:game/data@0.1.0";
-const IMPORT_DATA_LIST_DIR: &str = "cubic:game/data@0.1.0";
+const IMPORT_PHYSICS_MODULE: &str = "cubic:game/physics@0.1.0";
+const IMPORT_INPUT_MODULE: &str = "cubic:game/input@0.1.0";
+const IMPORT_CAMERA_MODULE: &str = "cubic:game/camera@0.1.0";
+const EXPORT_ON_TICK: &str = "cubic:game/tick@0.1.0#on-tick";
+const IMPORT_RENDER_MODULE: &str = "cubic:game/render@0.1.0";
 
 // ---------------------------------------------------------------------------
 // Memory layout
@@ -72,8 +85,9 @@ impl WasmMemoryLayout {
 }
 
 // ---------------------------------------------------------------------------
-// Host state (passed into Store)
+// DataStore — layered data directory lookup
 // ---------------------------------------------------------------------------
+
 pub struct DataStore {
     /// Data directories in load order. Later entries win for the same path.
     dirs: Vec<std::path::PathBuf>,
@@ -87,7 +101,6 @@ impl DataStore {
     }
 
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
-        // Iterate in reverse — last dir wins
         for dir in self.dirs.iter().rev() {
             let full = dir.join(path);
             if full.exists() {
@@ -104,8 +117,6 @@ impl DataStore {
     pub fn list_dir(&self, path: &str) -> Vec<String> {
         let mut seen = std::collections::HashSet::new();
         let mut result = Vec::new();
-        // Iterate in reverse so later dirs (mods) override earlier (base game)
-        // For listing we want all files, deduped by filename — later wins
         for dir in self.dirs.iter().rev() {
             let full = dir.join(path);
             if let Ok(entries) = std::fs::read_dir(&full) {
@@ -117,10 +128,14 @@ impl DataStore {
                 }
             }
         }
-        result.sort(); // deterministic load order
+        result.sort();
         result
     }
 }
+
+// ---------------------------------------------------------------------------
+// Host state (passed into Store)
+// ---------------------------------------------------------------------------
 
 struct HostState {
     block_registry: Arc<Mutex<cubic_world::BlockRegistry>>,
@@ -136,6 +151,9 @@ struct WasmInstance {
     memory: Memory,
     fn_generate: TypedFunc<(u32, i32, i32, i32, u32), u32>,
     fn_is_definitely_air: TypedFunc<(u32, i32, i32, i32), u32>,
+    // None until cubic-game implements the `tick` interface's `on-tick`
+    // export — tick() is a no-op until then.
+    fn_on_tick: Option<TypedFunc<f32, ()>>,
     generator_handle: u32,
 }
 
@@ -158,7 +176,8 @@ impl WasmInstance {
 
         let mut linker = Linker::new(engine);
 
-        // Host function: block_registry::register_block
+        // --- block-registry ---
+
         linker.func_wrap(
             IMPORT_BLOCK_REGISTRY_MODULE,
             "register-block",
@@ -226,6 +245,8 @@ impl WasmInstance {
             },
         )?;
 
+        // --- data ---
+
         linker.func_wrap(
             IMPORT_DATA_MODULE,
             "read-file",
@@ -239,14 +260,11 @@ impl WasmInstance {
                     .get_export("memory")
                     .and_then(|e| e.into_memory())
                     .expect("guest has no memory export");
-
-                // Read path string from guest memory
                 let path = {
                     let data = mem.data(&caller);
                     let bytes = &data[path_ptr as usize..(path_ptr + path_len) as usize];
                     std::str::from_utf8(bytes).unwrap_or("").to_owned()
                 };
-
                 let store = Arc::clone(&caller.data().data_store);
                 match store.read_file(&path) {
                     None => 0,
@@ -262,7 +280,7 @@ impl WasmInstance {
         )?;
 
         linker.func_wrap(
-            IMPORT_DATA_LIST_DIR,
+            IMPORT_DATA_MODULE,
             "list-dir",
             |mut caller: wasmtime::Caller<'_, HostState>,
              path_ptr: i32,
@@ -274,13 +292,11 @@ impl WasmInstance {
                     .get_export("memory")
                     .and_then(|e| e.into_memory())
                     .expect("guest has no memory export");
-
                 let path = {
                     let data = mem.data(&caller);
                     let bytes = &data[path_ptr as usize..(path_ptr + path_len) as usize];
                     std::str::from_utf8(bytes).unwrap_or("").to_owned()
                 };
-
                 let store = Arc::clone(&caller.data().data_store);
                 let listing = store.list_dir(&path);
                 let result = listing.join("\n");
@@ -293,9 +309,236 @@ impl WasmInstance {
             },
         )?;
 
+        // --- physics ---
+
+        linker.func_wrap(
+            IMPORT_PHYSICS_MODULE,
+            "is-solid",
+            |_caller: wasmtime::Caller<'_, HostState>, x: f32, y: f32, z: f32| -> i32 {
+                with_chunk_query(|q| q.map(|q| q.is_solid(x, y, z) as i32).unwrap_or(0))
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_PHYSICS_MODULE,
+            "get-block",
+            |_caller: wasmtime::Caller<'_, HostState>, x: f32, y: f32, z: f32| -> i32 {
+                with_chunk_query(|q| q.map(|q| q.get_block_at(x, y, z).0 as i32).unwrap_or(0))
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_PHYSICS_MODULE,
+            "request-set-block",
+            |_caller: wasmtime::Caller<'_, HostState>, x: f32, y: f32, z: f32, block_id: i32| {
+                push_block_edit(BlockEditRequest {
+                    x,
+                    y,
+                    z,
+                    block_id: block_id as u32,
+                });
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_PHYSICS_MODULE,
+            "sweep-aabb",
+            |mut caller: wasmtime::Caller<'_, HostState>,
+             ox: f32,
+             oy: f32,
+             oz: f32,
+             dx: f32,
+             dy: f32,
+             dz: f32,
+             hw: f32,
+             height: f32,
+             hd: f32,
+             out_ptr: i32|
+             -> i32 {
+                let result = with_chunk_query(|q| match q {
+                    Some(q) => cubic_world::sweep_aabb(
+                        q,
+                        cubic_math::Vec3::new(ox, oy, oz),
+                        cubic_math::Vec3::new(dx, dy, dz),
+                        hw,
+                        height,
+                        hd,
+                    ),
+                    None => cubic_world::SweepResult {
+                        pos: cubic_math::Vec3::new(ox, oy, oz),
+                        hit_x: false,
+                        hit_y: false,
+                        hit_z: false,
+                    },
+                });
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+                let data = mem.data_mut(&mut caller);
+                let base = out_ptr as usize;
+                data[base..base + 4].copy_from_slice(&result.pos.x.to_le_bytes());
+                data[base + 4..base + 8].copy_from_slice(&result.pos.y.to_le_bytes());
+                data[base + 8..base + 12].copy_from_slice(&result.pos.z.to_le_bytes());
+                data[base + 12..base + 16].copy_from_slice(&(result.hit_x as i32).to_le_bytes());
+                data[base + 16..base + 20].copy_from_slice(&(result.hit_y as i32).to_le_bytes());
+                data[base + 20..base + 24].copy_from_slice(&(result.hit_z as i32).to_le_bytes());
+                24i32
+            },
+        )?;
+
+        // --- input ---
+
+        linker.func_wrap(
+            IMPORT_INPUT_MODULE,
+            "get-input",
+            |mut caller: wasmtime::Caller<'_, HostState>, out_ptr: i32| -> i32 {
+                let snap = get_tick_input();
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+                let data = mem.data_mut(&mut caller);
+                let base = out_ptr as usize;
+                data[base..base + 4].copy_from_slice(&(snap.move_forward as i32).to_le_bytes());
+                data[base + 4..base + 8].copy_from_slice(&(snap.move_back as i32).to_le_bytes());
+                data[base + 8..base + 12].copy_from_slice(&(snap.move_left as i32).to_le_bytes());
+                data[base + 12..base + 16].copy_from_slice(&(snap.move_right as i32).to_le_bytes());
+                data[base + 16..base + 20].copy_from_slice(&(snap.jump as i32).to_le_bytes());
+                data[base + 20..base + 24].copy_from_slice(&(snap.sneak as i32).to_le_bytes());
+                data[base + 24..base + 28].copy_from_slice(&snap.look_dx.to_le_bytes());
+                data[base + 28..base + 32].copy_from_slice(&snap.look_dy.to_le_bytes());
+                // player movement/physics config at bytes 32-52
+                data[base + 32..base + 36].copy_from_slice(&snap.walk_speed.to_le_bytes());
+                data[base + 36..base + 40].copy_from_slice(&snap.fly_speed.to_le_bytes());
+                data[base + 40..base + 44].copy_from_slice(&snap.jump_velocity.to_le_bytes());
+                data[base + 44..base + 48].copy_from_slice(&snap.gravity.to_le_bytes());
+                data[base + 48..base + 52].copy_from_slice(&snap.sprint_multiplier.to_le_bytes());
+                52i32
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_INPUT_MODULE,
+            "get-events",
+            |mut caller: wasmtime::Caller<'_, HostState>, out_ptr: i32, max_bytes: i32| -> i32 {
+                let events = take_input_events();
+                if events.is_empty() {
+                    return 0;
+                }
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+                let data = mem.data_mut(&mut caller);
+                let mut written = 0usize;
+                let base = out_ptr as usize;
+                for event in &events {
+                    if written + 40 > max_bytes as usize {
+                        break;
+                    }
+                    let slot = &mut data[base + written..base + written + 40];
+                    slot[..40].fill(0);
+                    let name_bytes = event.name.as_bytes();
+                    let name_len = name_bytes.len().min(31);
+                    slot[..name_len].copy_from_slice(&name_bytes[..name_len]);
+                    slot[32..36].copy_from_slice(&event.kind.to_le_bytes());
+                    written += 40;
+                }
+                written as i32
+            },
+        )?;
+
+        // --- camera ---
+
+        linker.func_wrap(
+            IMPORT_CAMERA_MODULE,
+            "set-camera",
+            |_caller: wasmtime::Caller<'_, HostState>,
+             x: f32,
+             y: f32,
+             z: f32,
+             yaw: f32,
+             pitch: f32| {
+                set_camera_update(CameraUpdate {
+                    x,
+                    y,
+                    z,
+                    yaw,
+                    pitch,
+                });
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_CAMERA_MODULE,
+            "set-player-feet",
+            |_caller: wasmtime::Caller<'_, HostState>, x: f32, y: f32, z: f32| {
+                set_player_feet(PlayerFeet { x, y, z });
+            },
+        )?;
+
+        // --- render ---
+
+        linker.func_wrap(
+            IMPORT_RENDER_MODULE,
+            "load-mesh",
+            |mut caller: wasmtime::Caller<'_, HostState>, path_ptr: i32, path_len: i32| -> i32 {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+                let path = {
+                    let data = mem.data(&caller);
+                    let bytes = &data[path_ptr as usize..(path_ptr + path_len) as usize];
+                    std::str::from_utf8(bytes).unwrap_or("").to_owned()
+                };
+                call_load_mesh(&path) as i32
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_RENDER_MODULE,
+            "load-texture",
+            |mut caller: wasmtime::Caller<'_, HostState>, path_ptr: i32, path_len: i32| -> i32 {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+                let path = {
+                    let data = mem.data(&caller);
+                    let bytes = &data[path_ptr as usize..(path_ptr + path_len) as usize];
+                    std::str::from_utf8(bytes).unwrap_or("").to_owned()
+                };
+                call_load_tex(&path) as i32
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_RENDER_MODULE,
+            "draw-mesh",
+            |_caller: wasmtime::Caller<'_, HostState>,
+             mesh: i32,
+             tex: i32,
+             x: f32,
+             y: f32,
+             z: f32,
+             yaw: f32| {
+                push_draw_request(DrawRequest {
+                    mesh_handle: mesh as u32,
+                    tex_index: tex as u32,
+                    x,
+                    y,
+                    z,
+                    yaw,
+                });
+            },
+        )?;
+
+        // --- instantiate and get exports ---
+
         let instance = linker.instantiate(&mut store, module)?;
 
-        // Grow memory to required size if needed
         let memory = instance
             .get_memory(&mut store, "memory")
             .ok_or_else(|| anyhow!("guest has no 'memory' export"))?;
@@ -305,8 +548,6 @@ impl WasmInstance {
             memory.grow(&mut store, pages_needed as u64)?;
         }
 
-        // Get exported functions. Names are the wit-bindgen-mangled forms —
-        // see the EXPORT_* constants above.
         let fn_on_load = instance
             .get_typed_func::<u64, u32>(&mut store, EXPORT_ON_LOAD)
             .map_err(anyhow::Error::from)
@@ -319,8 +560,10 @@ impl WasmInstance {
             .get_typed_func::<(u32, i32, i32, i32), u32>(&mut store, EXPORT_IS_DEFINITELY_AIR)
             .map_err(anyhow::Error::from)
             .context("guest missing 'is-definitely-air' export")?;
+        let fn_on_tick = instance
+            .get_typed_func::<f32, ()>(&mut store, EXPORT_ON_TICK)
+            .ok();
 
-        // Call on_load — guest registers blocks and returns generator handle
         let generator_handle = fn_on_load.call(&mut store, seed)?;
         tracing::info!("WASM guest on_load complete, generator_handle={generator_handle}");
 
@@ -329,16 +572,16 @@ impl WasmInstance {
             memory,
             fn_generate,
             fn_is_definitely_air,
+            fn_on_tick,
             generator_handle,
         })
     }
 
     fn generate(&mut self, pos: ChunkPos, out_ptr: u32) -> Result<u32> {
         let handle = self.generator_handle;
-        let n = self
-            .fn_generate
-            .call(&mut self.store, (handle, pos.x, pos.y, pos.z, out_ptr))?;
-        Ok(n)
+        self.fn_generate
+            .call(&mut self.store, (handle, pos.x, pos.y, pos.z, out_ptr))
+            .map_err(anyhow::Error::from)
     }
 
     fn is_definitely_air(&mut self, pos: ChunkPos) -> Result<bool> {
@@ -347,6 +590,13 @@ impl WasmInstance {
             .fn_is_definitely_air
             .call(&mut self.store, (handle, pos.x, pos.y, pos.z))?;
         Ok(result != 0)
+    }
+
+    fn tick(&mut self, dt: f32) -> Result<()> {
+        if let Some(f) = &self.fn_on_tick {
+            f.call(&mut self.store, dt)?;
+        }
+        Ok(())
     }
 
     fn read_chunk(&self, out_ptr: u32) -> Chunk {
@@ -426,8 +676,7 @@ impl WasmPlugin {
         )
     }
 
-    /// Shared handle to the block registry the guest populates via
-    /// `on_load` (see `register-block`/`register-block-with-faces`).
+    /// Shared handle to the block registry the guest populates via on_load.
     pub fn block_registry(&self) -> Arc<Mutex<cubic_world::BlockRegistry>> {
         Arc::clone(&self.block_registry)
     }
@@ -437,8 +686,6 @@ impl WasmPlugin {
     /// immediately — otherwise it only happens lazily on a worker thread's
     /// first `generate()`/`is_definitely_air()` call, which is too late for
     /// callers (like texture loading) that need it right after `load()`.
-    /// Worker threads still lazily create their own instances later; this
-    /// only guarantees one exists up front.
     pub fn warm_up(&self) {
         WASM_INSTANCE.with(|cell| {
             let mut opt = cell.borrow_mut();
@@ -456,17 +703,15 @@ impl WasmPlugin {
 // WasmWorldGenerator — implements WorldGenerator
 // ---------------------------------------------------------------------------
 
-// Thread-local storage for per-worker WASM instances.
-// Initialized lazily on first generate() call per thread.
 thread_local! {
     static WASM_INSTANCE: std::cell::RefCell<Option<WasmInstance>> =
         const { std::cell::RefCell::new(None) };
-    static WORKER_ID: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    static WORKER_ID: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(usize::MAX) };
 }
 
 /// Called by each streaming worker thread at startup to assign its WASM
-/// shared memory buffer slot. Must be called before any generate() calls
-/// on that thread.
+/// shared memory buffer slot. Must be called before any generate() calls.
 pub fn set_worker_id(id: usize) {
     WORKER_ID.set(id);
 }
@@ -479,13 +724,31 @@ impl WasmWorldGenerator {
     pub fn new(plugin: Arc<WasmPlugin>) -> Self {
         Self { plugin }
     }
+
+    /// Run the guest's `on-tick` export using the main thread's WASM_INSTANCE.
+    /// Worker threads have their own instances used only for generate/is_definitely_air.
+    pub fn tick(&self, dt: f32) {
+        WASM_INSTANCE.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if opt.is_none() {
+                let plugin = Arc::clone(&self.plugin);
+                *opt = Some(
+                    plugin
+                        .make_instance()
+                        .expect("failed to create WASM instance"),
+                );
+            }
+            if let Some(instance) = opt.as_mut() {
+                let _ = instance.tick(dt);
+            }
+        });
+    }
 }
 
 impl WorldGenerator for WasmWorldGenerator {
     fn generate(&self, pos: ChunkPos, _seed: u64) -> Chunk {
         let worker_id = WORKER_ID.get();
         let out_ptr = if worker_id == usize::MAX {
-            // Main thread fallback — use slot 0
             self.plugin.layout.worker_buffer_offset(0)
         } else {
             self.plugin
@@ -495,11 +758,9 @@ impl WorldGenerator for WasmWorldGenerator {
 
         let plugin = Arc::clone(&self.plugin);
 
-        // NB: don't lock block_registry here. The lazy `make_instance()` call
-        // below runs the guest's on-load export, which calls back into the
-        // host's register-block import — that import also locks
-        // block_registry, so holding the lock across instance creation would
-        // self-deadlock on every worker thread's first generate() call.
+        // NB: don't lock block_registry here — would self-deadlock on the
+        // worker thread's first call since make_instance runs on_load which
+        // calls register-block which also locks block_registry.
         WASM_INSTANCE.with(|cell| {
             let mut opt = cell.borrow_mut();
             if opt.is_none() {

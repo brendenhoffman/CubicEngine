@@ -3,8 +3,11 @@
 use anyhow::{anyhow, Context, Result};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
+use cubic_math::Camera;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator};
 use gpu_allocator::MemoryLocation;
+
+use crate::VkRenderer;
 
 // Vertex and PushData now live in cubic-render (the shared trait crate) so
 // that cubic-world's mesher can produce them without depending on Vulkan.
@@ -83,6 +86,31 @@ pub(crate) struct CameraUbo {
     pub(crate) view_proj: [[f32; 4]; 4],
 }
 
+impl VkRenderer {
+    pub(crate) fn update_camera_ubo_for_image(
+        &self,
+        image_index: usize,
+        camera: &Camera,
+        aspect: f32,
+    ) -> anyhow::Result<()> {
+        let view_proj = camera.projection_matrix(aspect) * camera.view_matrix_no_translation();
+        let data = CameraUbo {
+            view_proj: view_proj.to_cols_array_2d(),
+        };
+
+        let dst = self.ubo_ptrs[image_index];
+        if dst.is_null() {
+            return Err(anyhow::anyhow!("UBO memory not mapped"));
+        }
+        let src = bytemuck::bytes_of(&data);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst as *mut u8, src.len());
+        }
+        Ok(())
+    }
+}
+
 /// Per-draw data for the GPU-driven indirect path: one entry per candidate
 /// in `VkRenderer::pending_draws`, written by the CPU each frame and read
 /// both by the indirect-cull compute shader (to build
@@ -114,6 +142,67 @@ pub(crate) struct SamplerConfig {
     /// values bias toward blurrier/lower-resolution mips, negative toward
     /// sharper/higher-resolution ones.
     pub lod_bias: f32,
+}
+
+impl VkRenderer {
+    /// Push cubic.toml's texture_filter/mipmap_mode/anisotropy/lod_bias
+    /// settings into the renderer. Only affects textures uploaded *after*
+    /// this call — the dummy texture created in `build_renderer` already
+    /// has its sampler baked in. `anisotropy` is clamped to the device's
+    /// actual `max_sampler_anisotropy` limit (0.0 disables anisotropic
+    /// filtering regardless of the device limit).
+    pub fn set_sampler_config(
+        &mut self,
+        mag_filter: vk::Filter,
+        min_filter: vk::Filter,
+        mipmap_mode: vk::SamplerMipmapMode,
+        anisotropy: f32,
+        lod_bias: f32,
+    ) {
+        let limits = unsafe {
+            self.instance
+                .get_physical_device_properties(self.phys)
+                .limits
+        };
+        let max_anisotropy = anisotropy.clamp(0.0, limits.max_sampler_anisotropy);
+        self.sampler_config = SamplerConfig {
+            mag_filter,
+            min_filter,
+            mipmap_mode,
+            max_anisotropy,
+            lod_bias,
+        };
+    }
+
+    /// Upload an RGBA8 texture and register it into the bindless descriptor
+    /// array, returning its index (see `PushData::tex_index`). Index 0 is
+    /// permanently the dummy texture created in `build_renderer`; this
+    /// starts handing out indices at 1.
+    pub fn upload_texture(&mut self, pixels: &[u8], width: u32, height: u32) -> Result<u32> {
+        if self.next_tex_index >= MAX_TEXTURES {
+            return Err(anyhow!(
+                "upload_texture: bindless texture array full (MAX_TEXTURES = {MAX_TEXTURES})"
+            ));
+        }
+
+        let (image, alloc, view, sampler) = create_texture_and_sampler(
+            &self.device,
+            self.allocator.as_mut().expect("allocator missing"),
+            self.queue,
+            self.cmd_pool,
+            pixels,
+            vk::Extent2D { width, height },
+            &self.sampler_config,
+        )?;
+
+        let index = self.next_tex_index;
+        write_material_descriptors(&self.device, self.material_desc_set, index, view, sampler);
+
+        self.tex_store.push((image, alloc, view, sampler));
+        self.next_tex_index += 1;
+
+        Ok(index)
+    }
 }
 
 struct ImageAllocInfo {

@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use crate::physics::{world_to_chunk_local, ChunkQuery};
 use crate::{
-    mesh_chunk, BlockFaceTextures, Chunk, ChunkPos, StreamDelta, WorldGenerator, WorldStream,
+    mesh_chunk, BlockFaceTextures, BlockTypeId, Chunk, ChunkPos, StreamDelta, WorldGenerator,
+    WorldStream, CHUNK_SIZE,
 };
 use cubic_render::Vertex;
 use std::collections::{HashMap, HashSet};
@@ -31,6 +33,16 @@ struct WorkResult {
 // ---------------------------------------------------------------------------
 // AsyncWorldStream
 // ---------------------------------------------------------------------------
+
+pub struct ChunkQueryView<'a> {
+    chunks: &'a HashMap<ChunkPos, Chunk>,
+}
+
+impl ChunkQuery for ChunkQueryView<'_> {
+    fn get_block_at(&self, wx: f32, wy: f32, wz: f32) -> BlockTypeId {
+        self.chunks.get_block_at(wx, wy, wz)
+    }
+}
 
 /// Wraps `WorldStream` with a background worker pool so chunk generation
 /// never blocks the main thread. Call `update` each frame exactly like
@@ -278,6 +290,67 @@ impl AsyncWorldStream {
         let mask = neighbor_mask(&self.inner.chunks, pos);
         self.remeshed_with.insert(pos, mask);
     }
+
+    pub fn query_view(&self) -> ChunkQueryView<'_> {
+        ChunkQueryView {
+            chunks: &self.inner.chunks,
+        }
+    }
+
+    /// Edit a single voxel in the currently loaded world (break/place),
+    /// queuing this chunk — and any face-adjacent neighbor whose mesh culls
+    /// faces against this voxel — for remesh via the same `remesh_queue`
+    /// the boundary-stitching path already drains every frame (see
+    /// RedrawRequested in cubic-app), so callers don't need any separate
+    /// "apply this edit's mesh" step.
+    ///
+    /// Returns false (no-op) if the containing chunk isn't currently
+    /// materialized — either out of the streamed range, or one whose last
+    /// mesh had zero geometry and so was never stored (see `known_empty`
+    /// on `AsyncWorldStream`; the same "revisit when block removal exists"
+    /// gap the mesher's dirty-chunk comment already flags). In practice
+    /// this only matters for pure-air/fully-buried chunks the player can't
+    /// have raycast a hit into anyway, since a hit implies a real stored
+    /// non-air voxel.
+    pub fn set_block_at(&mut self, wx: f32, wy: f32, wz: f32, id: BlockTypeId) -> bool {
+        let (cp, lp) = world_to_chunk_local(wx, wy, wz);
+        let Some(chunk) = self.inner.chunks.get_mut(&cp) else {
+            return false;
+        };
+        chunk.set(lp, id);
+        self.remesh_queue.push(cp);
+        self.remesh_queue.extend(boundary_neighbors(cp, lp));
+        true
+    }
+}
+
+/// Chunk positions adjacent to `cp` that a mesh-culling boundary edit at
+/// `lp` also affects — i.e. `lp` sits on one of the 6 chunk faces, so the
+/// neighbor's mesh (which culls its own faces against this chunk's
+/// occupancy) needs to be recomputed too. Pure and separately testable from
+/// `set_block_at`, which just needs live chunk data to exercise otherwise.
+fn boundary_neighbors(cp: ChunkPos, lp: crate::ChunkLocalPos) -> Vec<ChunkPos> {
+    let max = (CHUNK_SIZE - 1) as u8;
+    let mut out = Vec::new();
+    if lp.x == 0 {
+        out.push(ChunkPos { x: cp.x - 1, ..cp });
+    }
+    if lp.x == max {
+        out.push(ChunkPos { x: cp.x + 1, ..cp });
+    }
+    if lp.y == 0 {
+        out.push(ChunkPos { y: cp.y - 1, ..cp });
+    }
+    if lp.y == max {
+        out.push(ChunkPos { y: cp.y + 1, ..cp });
+    }
+    if lp.z == 0 {
+        out.push(ChunkPos { z: cp.z - 1, ..cp });
+    }
+    if lp.z == max {
+        out.push(ChunkPos { z: cp.z + 1, ..cp });
+    }
+    out
 }
 
 fn neighbor_mask(chunks: &std::collections::HashMap<ChunkPos, Chunk>, pos: ChunkPos) -> u8 {
@@ -327,4 +400,37 @@ fn six_neighbors(pos: ChunkPos) -> [ChunkPos; 6] {
             ..pos
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ChunkLocalPos;
+
+    #[test]
+    fn boundary_neighbors_empty_for_interior_voxel() {
+        let cp = ChunkPos { x: 0, y: 0, z: 0 };
+        let lp = ChunkLocalPos::new(5, 5, 5);
+        assert!(boundary_neighbors(cp, lp).is_empty());
+    }
+
+    #[test]
+    fn boundary_neighbors_one_face() {
+        let cp = ChunkPos { x: 2, y: 0, z: 0 };
+        let lp = ChunkLocalPos::new(0, 5, 5); // on the -X face only
+        let out = boundary_neighbors(cp, lp);
+        assert_eq!(out, vec![ChunkPos { x: 1, y: 0, z: 0 }]);
+    }
+
+    #[test]
+    fn boundary_neighbors_corner_hits_three_faces() {
+        let cp = ChunkPos { x: 0, y: 0, z: 0 };
+        let max = (CHUNK_SIZE - 1) as u8;
+        let lp = ChunkLocalPos::new(0, max, 0); // -X, +Y, -Z corner
+        let out = boundary_neighbors(cp, lp);
+        assert_eq!(out.len(), 3);
+        assert!(out.contains(&ChunkPos { x: -1, y: 0, z: 0 }));
+        assert!(out.contains(&ChunkPos { x: 0, y: 1, z: 0 }));
+        assert!(out.contains(&ChunkPos { x: 0, y: 0, z: -1 }));
+    }
 }

@@ -18,8 +18,13 @@ cubic-platform = { path = "../cubic-platform" }
 cubic-wasm = { path = "../cubic-wasm"}
 serde = { workspace = true }
 toml = { workspace = true }
-tobj = "4"
+toml_edit = { workspace = true }
+tobj = { workspace = true }
 cubic-world = { path = "../cubic-world" }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
+egui = { workspace = true }
+egui-winit = { workspace = true }
+dirs = { workspace = true }
+gilrs = { workspace = true }
 
 # winit lives in cubic-platform for now, APIs in use here via that crate

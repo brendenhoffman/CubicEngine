@@ -58,6 +58,13 @@ void main() {
     v_normal = mat3(c.model) * in_normal;
 
     // Per-vertex texture index (assigned per block face by the mesher) takes
-    // precedence over the per-draw candidate value.
-    v_tex_index = in_tex_index;
+    // precedence over the per-draw candidate value, except when unset (0 —
+    // the bindless dummy/checkerboard slot): OBJ-loaded entity meshes (see
+    // loader::load_obj_mesh) have no per-face texture concept and always
+    // bake 0 into every vertex, so they fall through to the per-draw value
+    // instead — that's how draw-mesh's separate tex-index argument is meant
+    // to control a single-textured entity's appearance. Chunk draws already
+    // pass 0 as their own per-draw tex_index too, so this is a no-op for
+    // untextured block faces, which still render the dummy as before.
+    v_tex_index = in_tex_index != 0u ? in_tex_index : c.tex_index;
 }

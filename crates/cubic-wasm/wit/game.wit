@@ -46,6 +46,41 @@ interface block-registry {
     register-block-with-faces: func(name: string, faces: face-def) -> u32;
 }
 
+interface physics {
+    record sweep-result {
+        x: f32,
+        y: f32,
+        z: f32,
+        hit-x: bool,
+        hit-y: bool,
+        hit-z: bool,
+    }
+
+    /// Writes SweepResult into out-ptr: [x: f32, y: f32, z: f32, hit_x: i32, hit_y: i32, hit_z: i32]
+    /// Total: 6 * 4 = 24 bytes
+    sweep-aabb: func(
+        ox: f32, oy: f32, oz: f32,
+        dx: f32, dy: f32, dz: f32,
+        half-w: f32, height: f32, half-d: f32,
+        out-ptr: u32,
+    ) -> u32;
+
+    is-solid: func(x: f32, y: f32, z: f32) -> bool;
+
+    /// Raw BlockTypeId at the given world position (0 = air, or "no chunk
+    /// loaded there"). Used for pick-block; is-solid stays the cheap bool
+    /// check everything else (movement, raycasting) uses.
+    get-block: func(x: f32, y: f32, z: f32) -> u32;
+
+    /// Request that the voxel at the given world position be set to
+    /// block-id (0 = air, i.e. break). Fire-and-forget, like draw-mesh: the
+    /// edit can't be applied until after this tick's chunk-query borrow
+    /// ends (see cubic-wasm's tick.rs), so the host queues it and applies +
+    /// remeshes after on-tick returns. No-ops if the containing chunk isn't
+    /// currently loaded.
+    request-set-block: func(x: f32, y: f32, z: f32, block-id: u32);
+}
+
 interface data {
     /// Read a file from the game's data directory into a pre-allocated buffer.
     /// Returns the actual number of bytes written, or 0 if the file doesn't exist.
@@ -54,8 +89,73 @@ interface data {
     list-dir: func(path: string, out-ptr: u32, max-len: u32) -> u32;
 }
 
+interface input {
+    record input-state {
+        move-forward: bool,
+        move-back: bool,
+        move-left: bool,
+        move-right: bool,
+        jump: bool,
+        sneak: bool,
+        look-dx: f32,
+        look-dy: f32,
+        walk-speed: f32,
+        fly-speed: f32,
+        jump-velocity: f32,
+        gravity: f32,
+        sprint-multiplier: f32,
+    }
+
+    /// Writes an input-state into out-ptr.
+    /// Layout: [move_forward: i32, move_back: i32, move_left: i32, move_right: i32,
+    ///          jump: i32, sneak: i32, look_dx: f32, look_dy: f32,
+    ///          walk_speed: f32, fly_speed: f32, jump_velocity: f32,
+    ///          gravity: f32, sprint_multiplier: f32] = 13 * 4 = 52 bytes.
+    ///
+    /// Purely discrete/toggle-style controls (toggle-third-person, spectate,
+    /// fly, ...) are deliberately not here — they go through get-events
+    /// instead, since the host only forwards an event once a control's
+    /// configured trigger condition (tap / double-tap) is actually
+    /// satisfied. A continuous boolean here can't express that: it goes
+    /// true the instant the key is pressed no matter how the control is
+    /// configured, which is exactly the bug that toggle-third-person had
+    /// before it moved to this interface.
+    get-input: func(out-ptr: u32) -> u32;
+
+    /// Writes discrete input events that occurred this tick into out-ptr.
+    /// Each event is 40 bytes: [name: u8[32] (null-padded), kind: u32, _pad: u32]
+    /// kind: 0=Pressed, 1=Released, 2=DoubleTap
+    /// Returns number of bytes written (multiple of 40).
+    get-events: func(out-ptr: u32, max-bytes: u32) -> u32;
+}
+
+interface camera {
+    set-camera: func(x: f32, y: f32, z: f32, yaw: f32, pitch: f32);
+
+    /// Player feet position (pos, not eye) — tracked separately from the
+    /// camera since third-person orbit moves the camera away from the
+    /// player. Used by diagnostics (XYZ / block position) instead of the
+    /// camera position when a WASM game is driving it.
+    set-player-feet: func(x: f32, y: f32, z: f32);
+}
+
+interface tick {
+    on-tick: func(dt: f32);
+}
+
+interface render {
+    load-mesh: func(path-ptr: u32, path-len: u32) -> u32;
+    load-texture: func(path-ptr: u32, path-len: u32) -> u32;
+    draw-mesh: func(mesh-handle: u32, tex-index: u32, x: f32, y: f32, z: f32, yaw: f32);
+}
+
 world game {
     export world-gen;
+    export tick;
     import block-registry;
     import data;
+    import physics;
+    import input;
+    import camera;
+    import render;
 }
