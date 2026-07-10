@@ -58,6 +58,13 @@ jobs:
       # Clippy only needs to type-check; it won't actually link,
       # so we don't need cross linkers.
       - name: cargo clippy (fail on warnings)
+        # gilrs's udev feature (libudev-sys) probes for libudev via
+        # pkg-config at build-script time, which refuses to run at all when
+        # cross-compiling unless this is set — it's a safety guard, not an
+        # actual missing-library error. clippy never links, so it's fine
+        # that the target's libudev isn't actually present.
+        env:
+          PKG_CONFIG_ALLOW_CROSS: "1"
         run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
   # Separate from the clippy matrix above: these two targets can't be
   # cross-compiled from ubuntu-latest (no free/installable Apple SDK), so they

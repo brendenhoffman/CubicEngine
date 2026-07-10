@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
 //! Renderer-backend abstraction: a small trait over the concrete GL/Vulkan
 //! renderers so the rest of the app doesn't match on which one is active.
 

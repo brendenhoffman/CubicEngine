@@ -19,6 +19,14 @@ TARGETS=(
 CARGO_ARGS=(--workspace --all-targets)
 FAILED=()
 
+# gilrs's udev feature (libudev-sys) probes for libudev via pkg-config at
+# build-script time, which refuses to run at all when cross-compiling unless
+# this is set — it's a safety guard, not an actual missing-library error.
+# clippy only type-checks and never links, so it's fine that the target's
+# libudev isn't actually present; PKG_CONFIG_ALLOW_CROSS just lets the
+# build script proceed instead of aborting outright.
+export PKG_CONFIG_ALLOW_CROSS=1
+
 for t in "${TARGETS[@]}"; do
   echo "===== cargo clippy --target $t ====="
   if ! cargo clippy "${CARGO_ARGS[@]}" --target "$t" -- -D warnings; then

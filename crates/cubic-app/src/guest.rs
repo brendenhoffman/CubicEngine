@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: CEPL-1.0
+#![deny(unsafe_op_in_unsafe_fn)]
 //! The currently loaded WASM game plugin and the world generator(s) wrapping
 //! it — grouped together since load_world() always sets all three at once
 //! (there's no way to change the seed on an existing WasmPlugin, so a
