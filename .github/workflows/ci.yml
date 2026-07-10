@@ -47,14 +47,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: rustup target add
         run: rustup target add ${{ matrix.target }}
+      # gilrs's udev feature (libudev-sys) needs libudev.pc on PATH for
+      # pkg-config to find, for every target including the native one —
+      # ubuntu-latest doesn't ship it by default. It doesn't need to be the
+      # right architecture for the cross targets below (clippy never links,
+      # it just needs pkg-config to succeed at all so the build script can
+      # emit cflags), so one native install covers the whole matrix.
+      - name: install libudev-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
       # wasmtime's build.rs compiles a small C helper (src/runtime/vm/helpers.c)
       # via cc-rs for every target, even though clippy itself only type-checks
       # and never links — so these two still need a real cross C compiler.
       - name: install cross C compiler
         if: matrix.target == 'aarch64-unknown-linux-gnu' || matrix.target == 'riscv64gc-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
+        run: sudo apt-get install -y gcc-aarch64-linux-gnu gcc-riscv64-linux-gnu
       # Clippy only needs to type-check; it won't actually link,
       # so we don't need cross linkers.
       - name: cargo clippy (fail on warnings)
