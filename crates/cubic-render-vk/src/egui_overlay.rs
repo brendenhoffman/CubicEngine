@@ -64,6 +64,7 @@ pub(crate) fn build_egui_renderer(
             // this pipeline doesn't test/write depth (both disabled via
             // Options below).
             depth_attachment_format: Some(depth_format),
+            stencil_attachment_format: None, //added for egui 0.35 compat
         },
         egui_ash_renderer::Options {
             srgb_framebuffer: format_needs_srgb_egui(color_format),

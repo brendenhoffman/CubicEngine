@@ -41,7 +41,7 @@ impl Camera {
 
     /// Right-handed view matrix looking from `position` along `forward()`.
     pub fn view_matrix(&self) -> Mat4 {
-        Mat4::look_to_rh(self.position, self.forward(), Vec3::Y)
+        camera::rh::view::look_to_mat4(self.position, self.forward(), Vec3::Y)
     }
 
     /// Right-handed, Vulkan depth range [0, 1], reverse-Z, infinite far
@@ -62,6 +62,6 @@ impl Camera {
     /// Use this instead of view_matrix() when model matrices are built
     /// relative to the camera position.
     pub fn view_matrix_no_translation(&self) -> Mat4 {
-        Mat4::look_to_rh(Vec3::ZERO, self.forward(), Vec3::Y)
+        camera::rh::view::look_to_mat4(Vec3::ZERO, self.forward(), Vec3::Y)
     }
 }

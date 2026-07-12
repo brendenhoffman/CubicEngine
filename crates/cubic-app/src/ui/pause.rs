@@ -6,10 +6,10 @@ use crate::App;
 use crate::AppState;
 
 impl App {
-    pub(crate) fn build_pause_ui(&mut self, ctx: &egui::Context) {
+    pub(crate) fn build_pause_ui(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(egui::Color32::from_black_alpha(180)))
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(ui.available_height() / 3.0);
 
@@ -71,7 +71,7 @@ impl App {
         if self.pause_settings_open {
             egui::Window::new("Settings")
                 .collapsible(false)
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     self.build_settings_tab(ui);
                 });
         }
@@ -79,14 +79,14 @@ impl App {
         if self.pause_controls_open {
             egui::Window::new("Controls")
                 .collapsible(false)
-                .show(ctx, |ui| {
+                .show(ui.ctx(), |ui| {
                     self.build_controls_tab(ui);
                 });
         }
 
         // Diagnostics overlay still visible while paused
         if self.show_diagnostics {
-            self.build_diagnostics_ui(ctx);
+            self.build_diagnostics_ui(ui.ctx());
         }
     }
 }

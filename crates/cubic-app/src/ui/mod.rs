@@ -110,14 +110,14 @@ pub(crate) enum LauncherTab {
 }
 
 impl App {
-    pub(crate) fn build_ui(&mut self, ctx: &egui::Context) {
+    pub(crate) fn build_ui(&mut self, ui: &mut egui::Ui) {
         match self.state {
-            crate::AppState::Launcher => self.build_launcher_ui(ctx),
-            crate::AppState::Paused => self.build_pause_ui(ctx),
+            crate::AppState::Launcher => self.build_launcher_ui(ui),
+            crate::AppState::Paused => self.build_pause_ui(ui),
             crate::AppState::InGame => {
-                self.build_crosshair_ui(ctx);
+                self.build_crosshair_ui(ui);
                 if self.show_diagnostics {
-                    self.build_diagnostics_ui(ctx);
+                    self.build_diagnostics_ui(ui);
                 }
             }
         }

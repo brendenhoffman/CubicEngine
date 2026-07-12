@@ -646,6 +646,7 @@ impl VkRenderer {
                 let _ = egui_renderer.set_dynamic_rendering(egui_ash_renderer::DynamicRendering {
                     color_attachment_format: self.format,
                     depth_attachment_format: Some(self.depth_format),
+                    stencil_attachment_format: None, //added for egui 0.35 compat
                 });
             }
         }

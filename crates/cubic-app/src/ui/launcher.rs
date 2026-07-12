@@ -141,8 +141,8 @@ impl App {
         }
     }
 
-    pub(crate) fn build_launcher_ui(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    pub(crate) fn build_launcher_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
             ui.heading("CubicEngine");
             ui.add_space(8.0);
 

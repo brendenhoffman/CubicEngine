@@ -502,7 +502,7 @@ impl ApplicationHandler for App {
                     // so `run`'s receiver borrow doesn't overlap with the
                     // closure's need for `&mut self` (build_ui).
                     let egui_ctx = self.egui_ctx.clone();
-                    let full_output = egui_ctx.run(raw_input, |ctx| {
+                    let full_output = egui_ctx.run_ui(raw_input, |ctx| {
                         self.build_ui(ctx);
                     });
                     if let (Some(egui_winit), Some(window)) = (&mut self.egui_winit, &self.window) {
