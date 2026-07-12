@@ -34,6 +34,22 @@ pub fn user_mods_dir() -> std::path::PathBuf {
     data_root().join("mods")
 }
 
+pub fn worlds_dir(game_name: &str, profile_name: &str) -> std::path::PathBuf {
+    profile_dir(game_name, profile_name).join("worlds")
+}
+
+pub fn world_dir(game_name: &str, profile_name: &str, world_name: &str) -> std::path::PathBuf {
+    worlds_dir(game_name, profile_name).join(world_name)
+}
+
+pub fn world_toml_path(
+    game_name: &str,
+    profile_name: &str,
+    world_name: &str,
+) -> std::path::PathBuf {
+    world_dir(game_name, profile_name, world_name).join("world.toml")
+}
+
 // ---------------------------------------------------------------------------
 // Profile TOML schema — sparse override, every field Option<T>
 // ---------------------------------------------------------------------------
@@ -94,6 +110,8 @@ pub struct WorldOverride {
     pub seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_budget_ms: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_world: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -174,6 +192,16 @@ pub struct ControlsOverride {
     pub custom: std::collections::HashMap<String, KeyBindingOverride>,
 }
 
+/// Immutable metadata written once when a world is created and never
+/// overwritten. Read back to show seed/date in the world picker UI.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct WorldToml {
+    pub seed: u64,
+    pub generator: String,
+    pub created_at: String, // RFC 3339
+    pub engine_version: String,
+}
+
 // ---------------------------------------------------------------------------
 // Profile loading and creation
 // ---------------------------------------------------------------------------
@@ -208,6 +236,43 @@ pub fn save(profile: &ProfileCfg, game_name: &str, profile_name: &str) -> anyhow
 /// List profile names for a game. Returns empty vec if no profiles exist yet.
 pub fn list_profiles(game_name: &str) -> Vec<String> {
     let dir = profiles_dir(game_name);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return vec![];
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+pub fn write_world_toml(
+    game_name: &str,
+    profile_name: &str,
+    world_name: &str,
+    meta: &WorldToml,
+) -> anyhow::Result<()> {
+    let path = world_toml_path(game_name, profile_name, world_name);
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, toml::to_string_pretty(meta)?)?;
+    Ok(())
+}
+
+pub fn read_world_toml(
+    game_name: &str,
+    profile_name: &str,
+    world_name: &str,
+) -> anyhow::Result<WorldToml> {
+    let path = world_toml_path(game_name, profile_name, world_name);
+    let s = std::fs::read_to_string(&path)?;
+    Ok(toml::from_str(&s)?)
+}
+
+/// List world names for a profile. Returns empty vec if none exist yet.
+pub fn list_worlds(game_name: &str, profile_name: &str) -> Vec<String> {
+    let dir = worlds_dir(game_name, profile_name);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return vec![];
     };

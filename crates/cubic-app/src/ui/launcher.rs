@@ -97,6 +97,8 @@ impl App {
         // options without launching doesn't churn profile.toml.
         self.persist_window_prefs();
 
+        self.persist_world_prefs();
+
         // Load world -- the world loading code formerly in resumed()
         self.load_world();
 
@@ -121,6 +123,21 @@ impl App {
             &self.current_profile_name,
         ) {
             tracing::warn!("failed to save profile window prefs: {e}");
+        }
+    }
+
+    fn persist_world_prefs(&mut self) {
+        let world = self
+            .current_profile
+            .world
+            .get_or_insert_with(Default::default);
+        world.last_world = Some(self.current_world_name.clone());
+        if let Err(e) = profile::save(
+            &self.current_profile,
+            &self.current_game_name,
+            &self.current_profile_name,
+        ) {
+            tracing::warn!("failed to save profile after world launch: {e}");
         }
     }
 

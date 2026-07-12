@@ -15,12 +15,9 @@ use ash::khr::surface;
 use ash::{vk, Entry};
 use cubic_math::Camera;
 use cubic_render::{RenderSize, Renderer};
+use device::{decide_path_and_create_device, select_device_and_queue, RenderPath};
 use gpu_allocator::vulkan::{Allocation, Allocator, AllocatorCreateDesc};
 use gpu_allocator::MemoryLocation;
-use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-use tracing::info;
-
-use device::{decide_path_and_create_device, select_device_and_queue, RenderPath};
 #[cfg(debug_assertions)]
 use instance::destroy_debug_messenger;
 use instance::{init_instance_and_surface, recreate_surface};
@@ -30,6 +27,7 @@ use pipeline::{
     create_compute_pipeline, create_or_load_pipeline_cache, create_pipeline, load_spv_file,
     pipeline_cache_path, save_pipeline_cache, shader_dir, PipelineConfig,
 };
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 use resources::{
     create_buffer_and_memory, create_camera_desc_set_layout, create_depth_resources,
     create_dummy_texture_and_sampler, create_frame_uniforms_and_sets,
@@ -38,6 +36,7 @@ use resources::{
     create_material_desc_set_layout, pick_depth_format, upload_via_staging,
     write_material_descriptors, RangeAlloc, SamplerConfig, MAX_SHARED_INDICES, MAX_SHARED_VERTICES,
 };
+use tracing::info;
 // Vertex, PushData, and MeshHandle are now defined in cubic-render so that
 // cubic-world can use them without depending on Vulkan. Re-export them from
 // here so existing callers (cubic-app etc.) import from cubic-render-vk

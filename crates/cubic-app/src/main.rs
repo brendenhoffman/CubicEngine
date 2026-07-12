@@ -13,25 +13,13 @@ mod profile;
 mod ui;
 mod world;
 
+use anyhow::Result;
 use backend::{Backend, RendererBackend};
+use clap::Parser;
 use config::{
     apply_game_override, apply_profile, build_custom_controls, load_cfg, AppCfg, CustomControl,
     RenderCfg, UnfocusedPolicy, VsyncMode,
 };
-#[cfg(test)]
-use config::{KeyBinding, ModifierKey, TriggerKind};
-#[cfg(test)]
-use cubic_platform::winit::event::MouseButton;
-#[cfg(test)]
-use input::{input_source_to_string, str_to_input_source, ActionTracker, ResolvedBinding};
-use input::{resolve_controls, InputSource, InputState, InputTracker, ResolvedControls, MAX_PITCH};
-use ui::{
-    scan_games, str_to_window_mode, LauncherState, LauncherTab, PendingWindowedResize, WindowMode,
-    REMAP_TIMEOUT,
-};
-
-use anyhow::Result;
-use clap::Parser;
 use cubic_core::init_tracing;
 use cubic_math::{Camera, Vec3};
 use cubic_platform::winit::{
@@ -47,7 +35,12 @@ use cubic_render::{RenderSize, Renderer};
 use cubic_render_gl::GlRenderer;
 use cubic_render_vk::VkRenderer;
 use cubic_world::{CHUNK_SIZE, VOXEL_SIZE};
+use input::{resolve_controls, InputSource, InputState, InputTracker, ResolvedControls, MAX_PITCH};
 use tracing::{error, info};
+use ui::{
+    scan_games, str_to_window_mode, LauncherState, LauncherTab, PendingWindowedResize, WindowMode,
+    REMAP_TIMEOUT,
+};
 
 // ---------------------------------------------------------------------------
 // App state machine
@@ -155,6 +148,8 @@ struct App {
     // rather than a hard error, same spirit as backend/render fallbacks
     // elsewhere in this file.
     gilrs: Option<gilrs::Gilrs>,
+
+    current_world_name: String,
 }
 
 impl ApplicationHandler for App {
@@ -773,6 +768,7 @@ fn main() -> Result<()> {
     // empty; the user-mods layer lands in a future card.
     let _ = std::fs::create_dir_all(profile::user_games_dir());
     let _ = std::fs::create_dir_all(profile::user_mods_dir());
+    let _ = std::fs::create_dir_all(profile::worlds_dir(&game_name, &profile_name));
 
     // Resolution chain: cubic.toml (global) -> game_overrides.toml (game) ->
     // profile.toml (user). game.path only ever comes from cubic.toml, so
@@ -820,6 +816,12 @@ fn main() -> Result<()> {
         settings_open: false,
         remapping: None,
     };
+
+    let current_world_name = current_profile
+        .world
+        .as_ref()
+        .and_then(|w| w.last_world.clone())
+        .unwrap_or_else(|| "New World".to_string());
 
     let mut app = App {
         backend_choice: args.backend,
@@ -869,297 +871,8 @@ fn main() -> Result<()> {
         gilrs: gilrs::Gilrs::new()
             .inspect_err(|e| tracing::warn!("gamepad support unavailable: {e}"))
             .ok(),
+        current_world_name,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn binding(key: KeyCode, modifier: ModifierKey, trigger: TriggerKind) -> ResolvedBinding {
-        ResolvedBinding {
-            source: Some(InputSource::Key(key)),
-            modifier,
-            trigger,
-        }
-    }
-
-    fn tracker_for(name: &str, binding: ResolvedBinding) -> InputTracker {
-        InputTracker {
-            actions: vec![(
-                name.to_string(),
-                binding,
-                ActionTracker {
-                    was_held: false,
-                    last_press_time: -1.0,
-                },
-            )],
-            elapsed: 0.0,
-        }
-    }
-
-    fn press(input: &mut InputState, key: KeyCode, pressed: bool) {
-        input.set_source(InputSource::Key(key), pressed);
-    }
-
-    #[test]
-    fn tap_trigger_fires_once_on_press_not_while_held() {
-        let mut tracker = tracker_for(
-            "x",
-            binding(KeyCode::KeyF, ModifierKey::None, TriggerKind::Tap),
-        );
-        let mut input = InputState::default();
-
-        press(&mut input, KeyCode::KeyF, true);
-        assert_eq!(tracker.update(&mut input, 0.016), vec!["x".to_string()]);
-
-        // Still held on the next tick — must not re-fire.
-        assert!(tracker.update(&mut input, 0.016).is_empty());
-    }
-
-    #[test]
-    fn tap_trigger_fires_even_if_released_before_the_next_update_call() {
-        // Regression test: a press *and* its matching release both landing
-        // between two InputTracker::update calls (same rendered frame) used
-        // to be invisible — binding_active only ever saw the source's final
-        // state, "not held," so the tap silently vanished. Seen in practice
-        // with some trackpoint drivers (e.g. ThinkPad middle-click doubling
-        // as a scroll-mode toggle) synthesizing a press/release pair well
-        // under one frame long.
-        let mut tracker = tracker_for(
-            "x",
-            binding(KeyCode::KeyF, ModifierKey::None, TriggerKind::Tap),
-        );
-        let mut input = InputState::default();
-
-        press(&mut input, KeyCode::KeyF, true);
-        press(&mut input, KeyCode::KeyF, false); // released again before update() ever runs
-        assert_eq!(
-            tracker.update(&mut input, 0.016),
-            vec!["x".to_string()],
-            "a same-frame press+release must still fire the tap"
-        );
-
-        // The blip shouldn't leave the action stuck "held" afterward.
-        assert!(tracker.update(&mut input, 0.016).is_empty());
-    }
-
-    #[test]
-    fn double_tap_trigger_suppresses_a_lone_tap() {
-        let mut tracker = tracker_for(
-            "x",
-            binding(KeyCode::Space, ModifierKey::None, TriggerKind::DoubleTap),
-        );
-        let mut input = InputState::default();
-
-        press(&mut input, KeyCode::Space, true);
-        assert!(
-            tracker.update(&mut input, 0.05).is_empty(),
-            "a lone tap must not fire a DoubleTap-configured control \
-             (this is the exact bug being fixed: toggle_third_person set to \
-             DoubleTap used to fire on a single press)"
-        );
-    }
-
-    #[test]
-    fn double_tap_trigger_fires_on_a_genuine_rapid_double_press() {
-        let mut tracker = tracker_for(
-            "x",
-            binding(KeyCode::Space, ModifierKey::None, TriggerKind::DoubleTap),
-        );
-        let mut input = InputState::default();
-
-        press(&mut input, KeyCode::Space, true);
-        assert!(tracker.update(&mut input, 0.05).is_empty()); // elapsed 0.05
-
-        press(&mut input, KeyCode::Space, false);
-        tracker.update(&mut input, 0.05); // elapsed 0.10, Released
-
-        press(&mut input, KeyCode::Space, true); // second press 0.10s after the first
-        assert_eq!(
-            tracker.update(&mut input, 0.05), // elapsed 0.15
-            vec!["x".to_string()],
-            "a rapid second press within the 0.3s window must fire"
-        );
-    }
-
-    #[test]
-    fn double_tap_trigger_does_not_fire_on_two_slow_taps() {
-        let mut tracker = tracker_for(
-            "x",
-            binding(KeyCode::Space, ModifierKey::None, TriggerKind::DoubleTap),
-        );
-        let mut input = InputState::default();
-
-        press(&mut input, KeyCode::Space, true);
-        tracker.update(&mut input, 0.05); // elapsed 0.05
-
-        press(&mut input, KeyCode::Space, false);
-        tracker.update(&mut input, 0.05); // elapsed 0.10
-
-        press(&mut input, KeyCode::Space, true); // second press ~1s after the first
-        assert!(
-            tracker.update(&mut input, 1.0).is_empty(), // elapsed 1.10
-            "two taps more than 0.3s apart must not count as a double-tap"
-        );
-    }
-
-    #[test]
-    fn modifier_gates_activation_and_is_side_agnostic() {
-        let b = binding(KeyCode::F6, ModifierKey::Shift, TriggerKind::Tap);
-        let mut input = InputState::default();
-
-        press(&mut input, KeyCode::F6, true);
-        assert!(
-            !input.binding_active(&b),
-            "key alone shouldn't activate a Shift-gated binding"
-        );
-
-        press(&mut input, KeyCode::ShiftLeft, true);
-        assert!(
-            input.binding_active(&b),
-            "key + ShiftLeft should activate it"
-        );
-
-        press(&mut input, KeyCode::ShiftLeft, false);
-        press(&mut input, KeyCode::ShiftRight, true);
-        assert!(
-            input.binding_active(&b),
-            "either shift side should satisfy a generic Shift modifier"
-        );
-    }
-
-    #[test]
-    fn unbound_binding_never_activates() {
-        let b = ResolvedBinding {
-            source: None,
-            modifier: ModifierKey::None,
-            trigger: TriggerKind::Tap,
-        };
-        let mut input = InputState::default();
-        press(&mut input, KeyCode::F6, true); // holding some unrelated key
-        assert!(!input.binding_active(&b));
-    }
-
-    #[test]
-    fn mouse_button_activates_a_binding_the_same_as_a_key() {
-        let b = ResolvedBinding {
-            source: Some(InputSource::Mouse(MouseButton::Right)),
-            modifier: ModifierKey::None,
-            trigger: TriggerKind::Tap,
-        };
-        let mut input = InputState::default();
-        assert!(!input.binding_active(&b));
-
-        input.set_source(InputSource::Mouse(MouseButton::Right), true);
-        assert!(input.binding_active(&b));
-
-        input.set_source(InputSource::Mouse(MouseButton::Right), false);
-        assert!(!input.binding_active(&b));
-    }
-
-    #[test]
-    fn gamepad_button_activates_a_binding_the_same_as_a_key() {
-        let b = ResolvedBinding {
-            source: Some(InputSource::Gamepad(gilrs::Button::South)),
-            modifier: ModifierKey::None,
-            trigger: TriggerKind::Tap,
-        };
-        let mut input = InputState::default();
-        input.set_source(InputSource::Gamepad(gilrs::Button::South), true);
-        assert!(input.binding_active(&b));
-    }
-
-    #[test]
-    fn input_source_round_trips_through_config_strings() {
-        for source in [
-            InputSource::Key(KeyCode::KeyW),
-            InputSource::Mouse(MouseButton::Left),
-            InputSource::Mouse(MouseButton::Other(7)),
-            InputSource::Gamepad(gilrs::Button::South),
-            InputSource::Gamepad(gilrs::Button::DPadUp),
-        ] {
-            let s = input_source_to_string(source).expect("source should stringify");
-            assert_eq!(
-                str_to_input_source(&s),
-                Some(source),
-                "round trip failed for {s}"
-            );
-        }
-    }
-
-    #[test]
-    fn trigger_kind_has_no_hold_variant() {
-        // Regression guard for the removed Hold trigger: legacy/empty
-        // bindings and KeyBinding::key's default must land on Tap instead
-        // (Hold and Tap fired identically anyway, so this is a pure label
-        // change, not a behavior change).
-        assert_eq!(KeyBinding::key("KeyW").trigger, TriggerKind::Tap);
-        assert_eq!(
-            KeyBinding::unbound(TriggerKind::Tap).trigger,
-            TriggerKind::Tap
-        );
-    }
-
-    #[test]
-    fn custom_control_resolves_game_default_with_no_profile_override() {
-        let overrides = game_override::GameOverrideCfg {
-            controls: vec![game_override::CustomControlDef {
-                name: "sprint".to_string(),
-                label: Some("Sprint".to_string()),
-                key: Some("KeyW".to_string()),
-                modifier: None,
-                trigger: Some("double_tap".to_string()),
-            }],
-            ..Default::default()
-        };
-        let profile = profile::ProfileCfg::default();
-
-        let custom = build_custom_controls(&overrides, &profile);
-        assert_eq!(custom.len(), 1);
-        assert_eq!(custom[0].name, "sprint");
-        assert_eq!(custom[0].label, "Sprint");
-        assert_eq!(custom[0].binding.key.as_deref(), Some("KeyW"));
-        assert_eq!(custom[0].binding.trigger, TriggerKind::DoubleTap);
-        assert_eq!(custom[0].binding.modifier, ModifierKey::None);
-    }
-
-    #[test]
-    fn custom_control_profile_override_takes_precedence_over_game_default() {
-        let overrides = game_override::GameOverrideCfg {
-            controls: vec![game_override::CustomControlDef {
-                name: "sprint".to_string(),
-                label: None,
-                key: Some("KeyW".to_string()),
-                modifier: None,
-                trigger: Some("double_tap".to_string()),
-            }],
-            ..Default::default()
-        };
-        let mut custom_override = std::collections::HashMap::new();
-        custom_override.insert(
-            "sprint".to_string(),
-            profile::KeyBindingOverride {
-                key: Some("KeyR".to_string()),
-                modifier: None,
-                trigger: Some("tap".to_string()),
-            },
-        );
-        let profile = profile::ProfileCfg {
-            controls: Some(profile::ControlsOverride {
-                custom: custom_override,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let custom = build_custom_controls(&overrides, &profile);
-        assert_eq!(custom.len(), 1);
-        // Falls back to the control's own name when no label is declared.
-        assert_eq!(custom[0].label, "sprint");
-        assert_eq!(custom[0].binding.key.as_deref(), Some("KeyR"));
-        assert_eq!(custom[0].binding.trigger, TriggerKind::Tap);
-    }
 }

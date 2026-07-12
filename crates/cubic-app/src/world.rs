@@ -3,12 +3,17 @@
 //! World (re)loading and the per-frame guest tick / chunk streaming /
 //! upload / remesh / draw pipeline driven from RedrawRequested.
 
+use crate::backend::{Backend, RendererBackend};
+use crate::frustum::Frustum;
+use crate::profile;
+use crate::App;
 use cubic_math::Vec3;
 use cubic_render::{MeshHandle, PushData};
 use cubic_wasm::{
     clear_tick_query, set_tick_input, set_tick_query, take_camera_update, InputSnapshot,
     WasmPlugin, WasmWorldGenerator,
 };
+use cubic_world::ChunkPos;
 use cubic_world::{
     mesh_chunk, world_pos_to_chunk, AsyncWorldStream, BlockFaceTextures, WorldGenerator,
     CHUNK_SIZE, VOXEL_SIZE,
@@ -16,12 +21,6 @@ use cubic_world::{
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tracing::error;
-
-use cubic_world::ChunkPos;
-
-use crate::backend::{Backend, RendererBackend};
-use crate::frustum::Frustum;
-use crate::App;
 
 /// Renderer-facing world state: chunk/entity mesh handles, the bindless
 /// texture-index lookups meshing needs, and the streaming pipeline that
@@ -76,6 +75,49 @@ impl App {
         self.world.chunk_meshes.clear();
         self.world.face_textures = Arc::new(BlockFaceTextures::new());
         self.world.tex_map = HashMap::new();
+
+        // Derive world directory from profile — not from cubic.toml. The path is
+        // always: $XDG_DATA_HOME/CubicEngine/profiles/<game>/<profile>/worlds/<world>/
+        let world_dir = profile::world_dir(
+            &self.current_game_name,
+            &self.current_profile_name,
+            &self.current_world_name,
+        );
+        let regions_dir = world_dir.join("regions");
+        if let Err(e) = std::fs::create_dir_all(&regions_dir) {
+            tracing::error!("failed to create world dir {regions_dir:?}: {e}");
+        }
+
+        // Write world.toml once on first launch of this world — seed and generator
+        // are immutable for a world's lifetime so we never overwrite it.
+        let world_toml = profile::world_toml_path(
+            &self.current_game_name,
+            &self.current_profile_name,
+            &self.current_world_name,
+        );
+        if !world_toml.exists() {
+            let meta = profile::WorldToml {
+                seed: self.cfg.world.seed,
+                generator: self.current_game_name.clone(),
+                created_at: {
+                    let secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    // Minimal RFC 3339 — no chrono dep needed
+                    format_unix_as_rfc3339(secs)
+                },
+                engine_version: env!("CARGO_PKG_VERSION").to_string(),
+            };
+            if let Err(e) = profile::write_world_toml(
+                &self.current_game_name,
+                &self.current_profile_name,
+                &self.current_world_name,
+                &meta,
+            ) {
+                tracing::warn!("failed to write world.toml: {e}");
+            }
+        }
 
         // Reinitialize seed
         let seed = if self.cfg.world.seed == 0 {
@@ -478,4 +520,53 @@ impl App {
             }
         }
     }
+}
+
+/// Formats a Unix timestamp as a bare RFC 3339 UTC string without pulling
+/// in chrono. Accurate for dates from 1970 through ~2099.
+fn format_unix_as_rfc3339(secs: u64) -> String {
+    // Days since epoch
+    let mut days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let h = time_of_day / 3600;
+    let m = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+
+    // Gregorian calendar from day count
+    let mut year = 1970u64;
+    loop {
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_per_month = [
+        31u64,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1u64;
+    for &dim in &days_per_month {
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    let day = days + 1;
+
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }
