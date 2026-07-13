@@ -40,12 +40,18 @@ struct NoiseGenerator {
 }
 
 impl NoiseGenerator {
-    fn surface_height(&self, world_x: f32, world_z: f32) -> f32 {
+    /// `world_x`/`world_z` are f64 — X/Z are unbounded (per the
+    /// f64-world-coordinates card), and f32 loses adjacent-voxel precision
+    /// past ~16.78M metres (2^24), causing many consecutive voxel columns to
+    /// round to the same noise sample and the terrain to visibly alias/flatten
+    /// at extreme distance. `h` (a terrain height, always small — capped
+    /// ~12,000m by the generator) stays f32.
+    fn surface_height(&self, world_x: f64, world_z: f64) -> f32 {
         let mut h = self.base_height;
         for layer in &self.layers {
             h += self.noise.get([
-                (world_x * layer.frequency) as f64,
-                (world_z * layer.frequency) as f64,
+                world_x * layer.frequency as f64,
+                world_z * layer.frequency as f64,
             ]) as f32
                 * layer.amplitude;
         }
@@ -201,11 +207,12 @@ enum BlockAction {
 /// target voxel, not its min corner (`RayHit::block`/`place`) — floating
 /// point could otherwise land exactly on a boundary and floor into the
 /// wrong voxel. Shifting to the voxel's center is a cheap, exact fix.
-fn voxel_center(min_corner: [f32; 3]) -> [f32; 3] {
+fn voxel_center(min_corner: [f64; 3]) -> [f64; 3] {
+    let half_voxel = VOXEL_SIZE as f64 * 0.5;
     [
-        min_corner[0] + VOXEL_SIZE * 0.5,
-        min_corner[1] + VOXEL_SIZE * 0.5,
-        min_corner[2] + VOXEL_SIZE * 0.5,
+        min_corner[0] + half_voxel,
+        min_corner[1] + half_voxel,
+        min_corner[2] + half_voxel,
     ]
 }
 
@@ -328,9 +335,12 @@ impl Guest for GamePlugin {
 
     fn generate(_handle: u32, cx: i32, cy: i32, cz: i32, out_ptr: u32) -> u32 {
         let noise_gen = generator();
-        let origin_x = (cx as f32) * (CHUNK_SIZE as f32) * VOXEL_SIZE;
+        // X/Z origins are f64 — see surface_height's doc comment for why.
+        // Y stays f32: height is capped ~12,000m by the generator, nowhere
+        // near f32's ~16.78M precision cliff.
+        let origin_x = (cx as f64) * (CHUNK_SIZE as f64) * VOXEL_SIZE as f64;
         let origin_y = (cy as f32) * (CHUNK_SIZE as f32) * VOXEL_SIZE;
-        let origin_z = (cz as f32) * (CHUNK_SIZE as f32) * VOXEL_SIZE;
+        let origin_z = (cz as f64) * (CHUNK_SIZE as f64) * VOXEL_SIZE as f64;
 
         // Write voxels into shared memory at out_ptr.
         // Layout: index = x + z*CHUNK_SIZE + y*CHUNK_SIZE*CHUNK_SIZE
@@ -340,9 +350,9 @@ impl Guest for GamePlugin {
         for y in 0..CHUNK_SIZE {
             let world_y = origin_y + y as f32 * VOXEL_SIZE;
             for z in 0..CHUNK_SIZE {
-                let world_z = origin_z + z as f32 * VOXEL_SIZE;
+                let world_z = origin_z + z as f64 * VOXEL_SIZE as f64;
                 for x in 0..CHUNK_SIZE {
-                    let world_x = origin_x + x as f32 * VOXEL_SIZE;
+                    let world_x = origin_x + x as f64 * VOXEL_SIZE as f64;
                     let surface = noise_gen.surface_height(world_x, world_z);
                     let index = x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE;
                     let id = if world_y < surface {
@@ -394,8 +404,8 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
             sprint_multiplier: f32::from_le_bytes(buf[48..52].try_into().unwrap()),
         };
 
-        // Read discrete events — up to 64 events * 56 bytes = 3584 bytes
-        let mut evt_buf = [0u8; 3584];
+        // Read discrete events — up to 64 events * 64 bytes = 4096 bytes
+        let mut evt_buf = [0u8; 4096];
         let evt_bytes =
             cubic::game::input::get_events(evt_buf.as_mut_ptr() as u32, evt_buf.len() as u32)
                 as usize;
@@ -419,19 +429,19 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
             // toggle-style actions. kind==1 (Released) is still delivered
             // for cases that do care, like "sprint" below.
             let mut i = 0;
-            while i + 56 <= evt_bytes {
+            while i + 64 <= evt_bytes {
                 let name_bytes = &evt_buf[i..i + 32];
                 let name = std::str::from_utf8(name_bytes)
                     .unwrap_or("")
                     .trim_end_matches('\0');
                 let kind = u32::from_le_bytes(evt_buf[i + 32..i + 36].try_into().unwrap());
                 // i+36..i+40 padding
-                let px = f32::from_le_bytes(evt_buf[i + 40..i + 44].try_into().unwrap());
-                let py = f32::from_le_bytes(evt_buf[i + 44..i + 48].try_into().unwrap());
-                let pz = f32::from_le_bytes(evt_buf[i + 48..i + 52].try_into().unwrap());
+                let px = f64::from_le_bytes(evt_buf[i + 40..i + 48].try_into().unwrap());
+                let py = f64::from_le_bytes(evt_buf[i + 48..i + 56].try_into().unwrap());
+                let pz = f64::from_le_bytes(evt_buf[i + 56..i + 64].try_into().unwrap());
                 match name {
                     "teleport" if kind != 1 => {
-                        player.pos = [px, py - EYE_HEIGHT, pz];
+                        player.pos = [px, py - EYE_HEIGHT as f64, pz];
                         player.vel = [0.0; 3];
                         player.grounded = false;
                     }
@@ -468,7 +478,7 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
                     "pick_block" if kind != 1 => block_action = Some(BlockAction::Pick),
                     _ => {}
                 }
-                i += 56;
+                i += 64;
             }
 
             player.tick(dt, &input_state);

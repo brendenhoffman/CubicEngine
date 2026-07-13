@@ -314,7 +314,7 @@ impl WasmInstance {
         linker.func_wrap(
             IMPORT_PHYSICS_MODULE,
             "is-solid",
-            |_caller: wasmtime::Caller<'_, HostState>, x: f32, y: f32, z: f32| -> i32 {
+            |_caller: wasmtime::Caller<'_, HostState>, x: f64, y: f64, z: f64| -> i32 {
                 with_chunk_query(|q| q.map(|q| q.is_solid(x, y, z) as i32).unwrap_or(0))
             },
         )?;
@@ -322,7 +322,7 @@ impl WasmInstance {
         linker.func_wrap(
             IMPORT_PHYSICS_MODULE,
             "get-block",
-            |_caller: wasmtime::Caller<'_, HostState>, x: f32, y: f32, z: f32| -> i32 {
+            |_caller: wasmtime::Caller<'_, HostState>, x: f64, y: f64, z: f64| -> i32 {
                 with_chunk_query(|q| q.map(|q| q.get_block_at(x, y, z).0 as i32).unwrap_or(0))
             },
         )?;
@@ -330,7 +330,7 @@ impl WasmInstance {
         linker.func_wrap(
             IMPORT_PHYSICS_MODULE,
             "request-set-block",
-            |_caller: wasmtime::Caller<'_, HostState>, x: f32, y: f32, z: f32, block_id: i32| {
+            |_caller: wasmtime::Caller<'_, HostState>, x: f64, y: f64, z: f64, block_id: i32| {
                 push_block_edit(BlockEditRequest {
                     x,
                     y,
@@ -344,9 +344,9 @@ impl WasmInstance {
             IMPORT_PHYSICS_MODULE,
             "sweep-aabb",
             |mut caller: wasmtime::Caller<'_, HostState>,
-             ox: f32,
-             oy: f32,
-             oz: f32,
+             ox: f64,
+             oy: f64,
+             oz: f64,
              dx: f32,
              dy: f32,
              dz: f32,
@@ -358,14 +358,14 @@ impl WasmInstance {
                 let result = with_chunk_query(|q| match q {
                     Some(q) => cubic_world::sweep_aabb(
                         q,
-                        cubic_math::Vec3::new(ox, oy, oz),
+                        cubic_math::DVec3::new(ox, oy, oz),
                         cubic_math::Vec3::new(dx, dy, dz),
                         hw,
                         height,
                         hd,
                     ),
                     None => cubic_world::SweepResult {
-                        pos: cubic_math::Vec3::new(ox, oy, oz),
+                        pos: cubic_math::DVec3::new(ox, oy, oz),
                         hit_x: false,
                         hit_y: false,
                         hit_z: false,
@@ -377,13 +377,13 @@ impl WasmInstance {
                     .expect("guest has no memory export");
                 let data = mem.data_mut(&mut caller);
                 let base = out_ptr as usize;
-                data[base..base + 4].copy_from_slice(&result.pos.x.to_le_bytes());
-                data[base + 4..base + 8].copy_from_slice(&result.pos.y.to_le_bytes());
-                data[base + 8..base + 12].copy_from_slice(&result.pos.z.to_le_bytes());
-                data[base + 12..base + 16].copy_from_slice(&(result.hit_x as i32).to_le_bytes());
-                data[base + 16..base + 20].copy_from_slice(&(result.hit_y as i32).to_le_bytes());
-                data[base + 20..base + 24].copy_from_slice(&(result.hit_z as i32).to_le_bytes());
-                24i32
+                data[base..base + 8].copy_from_slice(&result.pos.x.to_le_bytes());
+                data[base + 8..base + 16].copy_from_slice(&result.pos.y.to_le_bytes());
+                data[base + 16..base + 24].copy_from_slice(&result.pos.z.to_le_bytes());
+                data[base + 24..base + 28].copy_from_slice(&(result.hit_x as i32).to_le_bytes());
+                data[base + 28..base + 32].copy_from_slice(&(result.hit_y as i32).to_le_bytes());
+                data[base + 32..base + 36].copy_from_slice(&(result.hit_z as i32).to_le_bytes());
+                36i32
             },
         )?;
 
@@ -434,20 +434,20 @@ impl WasmInstance {
                 let mut written = 0usize;
                 let base = out_ptr as usize;
                 for event in &events {
-                    if written + 56 > max_bytes as usize {
+                    if written + 64 > max_bytes as usize {
                         break;
                     }
-                    let slot = &mut data[base + written..base + written + 56];
-                    slot[..56].fill(0);
+                    let slot = &mut data[base + written..base + written + 64];
+                    slot[..64].fill(0);
                     let name_bytes = event.name.as_bytes();
                     let name_len = name_bytes.len().min(31);
                     slot[..name_len].copy_from_slice(&name_bytes[..name_len]);
                     slot[32..36].copy_from_slice(&event.kind.to_le_bytes());
                     // slot[36..40] padding, already zeroed
-                    slot[40..44].copy_from_slice(&event.payload[0].to_le_bytes());
-                    slot[44..48].copy_from_slice(&event.payload[1].to_le_bytes());
-                    slot[48..52].copy_from_slice(&event.payload[2].to_le_bytes());
-                    written += 56;
+                    slot[40..48].copy_from_slice(&event.payload[0].to_le_bytes());
+                    slot[48..56].copy_from_slice(&event.payload[1].to_le_bytes());
+                    slot[56..64].copy_from_slice(&event.payload[2].to_le_bytes());
+                    written += 64;
                 }
                 written as i32
             },
@@ -459,9 +459,9 @@ impl WasmInstance {
             IMPORT_CAMERA_MODULE,
             "set-camera",
             |_caller: wasmtime::Caller<'_, HostState>,
-             x: f32,
-             y: f32,
-             z: f32,
+             x: f64,
+             y: f64,
+             z: f64,
              yaw: f32,
              pitch: f32| {
                 set_camera_update(CameraUpdate {
@@ -477,7 +477,7 @@ impl WasmInstance {
         linker.func_wrap(
             IMPORT_CAMERA_MODULE,
             "set-player-feet",
-            |_caller: wasmtime::Caller<'_, HostState>, x: f32, y: f32, z: f32| {
+            |_caller: wasmtime::Caller<'_, HostState>, x: f64, y: f64, z: f64| {
                 set_player_feet(PlayerFeet { x, y, z });
             },
         )?;
@@ -524,9 +524,9 @@ impl WasmInstance {
             |_caller: wasmtime::Caller<'_, HostState>,
              mesh: i32,
              tex: i32,
-             x: f32,
-             y: f32,
-             z: f32,
+             x: f64,
+             y: f64,
+             z: f64,
              yaw: f32| {
                 push_draw_request(DrawRequest {
                     mesh_handle: mesh as u32,

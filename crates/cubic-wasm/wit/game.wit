@@ -47,30 +47,35 @@ interface block-registry {
 }
 
 interface physics {
+    // x/y/z below are f64 (absolute world position) throughout this
+    // interface — f32 loses adjacent-voxel precision past ~8.4M metres,
+    // which this engine must support (see the f64-world-coordinates card).
+    // dx/dy/dz/half-w/height/half-d stay f32: they're always small (one
+    // tick's movement, or AABB half-extents), never absolute positions.
     record sweep-result {
-        x: f32,
-        y: f32,
-        z: f32,
+        x: f64,
+        y: f64,
+        z: f64,
         hit-x: bool,
         hit-y: bool,
         hit-z: bool,
     }
 
-    /// Writes SweepResult into out-ptr: [x: f32, y: f32, z: f32, hit_x: i32, hit_y: i32, hit_z: i32]
-    /// Total: 6 * 4 = 24 bytes
+    /// Writes SweepResult into out-ptr: [x: f64, y: f64, z: f64, hit_x: i32, hit_y: i32, hit_z: i32]
+    /// Total: 3*8 + 3*4 = 36 bytes
     sweep-aabb: func(
-        ox: f32, oy: f32, oz: f32,
+        ox: f64, oy: f64, oz: f64,
         dx: f32, dy: f32, dz: f32,
         half-w: f32, height: f32, half-d: f32,
         out-ptr: u32,
     ) -> u32;
 
-    is-solid: func(x: f32, y: f32, z: f32) -> bool;
+    is-solid: func(x: f64, y: f64, z: f64) -> bool;
 
     /// Raw BlockTypeId at the given world position (0 = air, or "no chunk
     /// loaded there"). Used for pick-block; is-solid stays the cheap bool
     /// check everything else (movement, raycasting) uses.
-    get-block: func(x: f32, y: f32, z: f32) -> u32;
+    get-block: func(x: f64, y: f64, z: f64) -> u32;
 
     /// Request that the voxel at the given world position be set to
     /// block-id (0 = air, i.e. break). Fire-and-forget, like draw-mesh: the
@@ -78,7 +83,7 @@ interface physics {
     /// ends (see cubic-wasm's tick.rs), so the host queues it and applies +
     /// remeshes after on-tick returns. No-ops if the containing chunk isn't
     /// currently loaded.
-    request-set-block: func(x: f32, y: f32, z: f32, block-id: u32);
+    request-set-block: func(x: f64, y: f64, z: f64, block-id: u32);
 }
 
 interface data {
@@ -123,9 +128,11 @@ interface input {
     get-input: func(out-ptr: u32) -> u32;
 
     /// Writes discrete input events that occurred this tick into out-ptr.
-    /// Each event is 40 bytes: [name: u8[32] (null-padded), kind: u32, _pad: u32]
-    /// kind: 0=Pressed, 1=Released, 2=DoubleTap
-    /// Returns number of bytes written (multiple of 40).
+    /// Each event is 64 bytes: [name: u8[32] (null-padded), kind: u32,
+    /// _pad: u32, payload: f64[3]]. kind: 0=Pressed, 1=Released, 2=DoubleTap.
+    /// payload is f64 (not f32) since it can carry an absolute world
+    /// position (e.g. /tp's teleport target) — see the f64-world-coordinates
+    /// card. Returns number of bytes written (multiple of 64).
     get-events: func(out-ptr: u32, max-bytes: u32) -> u32;
 
     record input-event {
@@ -136,13 +143,15 @@ interface input {
 }
 
 interface camera {
-    set-camera: func(x: f32, y: f32, z: f32, yaw: f32, pitch: f32);
+    // x/y/z are f64 absolute world position (see the physics interface's
+    // comment for why); yaw/pitch stay f32 (orientation, not position).
+    set-camera: func(x: f64, y: f64, z: f64, yaw: f32, pitch: f32);
 
     /// Player feet position (pos, not eye) — tracked separately from the
     /// camera since third-person orbit moves the camera away from the
     /// player. Used by diagnostics (XYZ / block position) instead of the
     /// camera position when a WASM game is driving it.
-    set-player-feet: func(x: f32, y: f32, z: f32);
+    set-player-feet: func(x: f64, y: f64, z: f64);
 }
 
 interface tick {
@@ -152,7 +161,9 @@ interface tick {
 interface render {
     load-mesh: func(path-ptr: u32, path-len: u32) -> u32;
     load-texture: func(path-ptr: u32, path-len: u32) -> u32;
-    draw-mesh: func(mesh-handle: u32, tex-index: u32, x: f32, y: f32, z: f32, yaw: f32);
+    // x/y/z are f64 absolute world position (an entity draw request, same
+    // category as camera/physics positions — see that comment above).
+    draw-mesh: func(mesh-handle: u32, tex-index: u32, x: f64, y: f64, z: f64, yaw: f32);
 }
 
 world game {

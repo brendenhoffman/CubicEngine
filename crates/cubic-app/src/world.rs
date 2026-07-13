@@ -7,7 +7,7 @@ use crate::backend::{Backend, RendererBackend};
 use crate::frustum::Frustum;
 use crate::profile;
 use crate::App;
-use cubic_math::Vec3;
+use cubic_math::{DVec3, Vec3};
 use cubic_render::{MeshHandle, PushData};
 use cubic_wasm::{
     clear_tick_query, set_tick_input, set_tick_query, take_camera_update, InputSnapshot,
@@ -375,7 +375,7 @@ impl App {
         }
 
         if let Some(cam) = take_camera_update() {
-            self.camera.position = Vec3::new(cam.x, cam.y, cam.z);
+            self.camera.position = DVec3::new(cam.x, cam.y, cam.z);
             self.camera.yaw = cam.yaw;
             self.camera.pitch = cam.pitch;
         }
@@ -401,7 +401,7 @@ impl App {
         let cam_pos = self.camera.position;
         for req in cubic_wasm::take_draw_queue() {
             if let Some(&handle) = self.world.entity_meshes.get(&req.mesh_handle) {
-                let relative = Vec3::new(req.x, req.y, req.z) - cam_pos;
+                let relative = (DVec3::new(req.x, req.y, req.z) - cam_pos).as_vec3();
                 let cos_y = req.yaw.cos();
                 // Negated (not req.yaw + PI): at yaw=0 this matrix already
                 // maps the model's -Z front (see player.obj) to world -Z
@@ -516,7 +516,7 @@ impl App {
 
         for (&pos, &handle) in &self.world.chunk_meshes {
             let world_origin = pos.to_world_origin();
-            let relative = world_origin - cam_pos; // camera-relative translation
+            let relative = (world_origin - cam_pos).as_vec3(); // camera-relative translation
             let min = relative;
             let max = relative + Vec3::splat(chunk_world_size);
             if frustum.contains_aabb(min, max) {

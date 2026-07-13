@@ -6,7 +6,11 @@ pub use glam::*;
 /// +Y up, matching the renderer's right-handed convention.
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
-    pub position: Vec3,
+    /// World-space position, f64 so precision survives at large distances
+    /// from the origin. Never sent to the GPU directly — rendering always
+    /// goes through `view_matrix_no_translation()` plus a per-object
+    /// camera-relative f32 translation (see cubic-app's world.rs).
+    pub position: DVec3,
     /// Radians; rotation around the world Y axis.
     pub yaw: f32,
     /// Radians; rotation around the camera's local X axis.
@@ -20,7 +24,7 @@ pub struct Camera {
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            position: Vec3::ZERO,
+            position: DVec3::ZERO,
             yaw: 0.0,
             pitch: 0.0,
             fovy: std::f32::consts::FRAC_PI_3,
@@ -40,8 +44,12 @@ impl Camera {
     }
 
     /// Right-handed view matrix looking from `position` along `forward()`.
+    /// Casts `position` down to f32, so this loses precision at extreme
+    /// distances from the origin — the main render camera never uses this,
+    /// it always goes through `view_matrix_no_translation()` instead (see
+    /// that method's doc comment).
     pub fn view_matrix(&self) -> Mat4 {
-        camera::rh::view::look_to_mat4(self.position, self.forward(), Vec3::Y)
+        camera::rh::view::look_to_mat4(self.position.as_vec3(), self.forward(), Vec3::Y)
     }
 
     /// Right-handed, Vulkan depth range [0, 1], reverse-Z, infinite far

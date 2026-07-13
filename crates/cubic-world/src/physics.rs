@@ -2,7 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use crate::{BlockTypeId, Chunk, ChunkLocalPos, ChunkPos, CHUNK_SIZE, VOXEL_SIZE};
-use cubic_math::Vec3;
+use cubic_math::{DVec3, Vec3};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -10,8 +10,8 @@ use std::collections::HashMap;
 // ---------------------------------------------------------------------------
 
 pub trait ChunkQuery {
-    fn get_block_at(&self, wx: f32, wy: f32, wz: f32) -> BlockTypeId;
-    fn is_solid(&self, wx: f32, wy: f32, wz: f32) -> bool {
+    fn get_block_at(&self, wx: f64, wy: f64, wz: f64) -> BlockTypeId;
+    fn is_solid(&self, wx: f64, wy: f64, wz: f64) -> bool {
         self.get_block_at(wx, wy, wz) != BlockTypeId(0)
     }
 }
@@ -19,22 +19,25 @@ pub trait ChunkQuery {
 /// Which chunk a world-space position falls in, and its position within
 /// that chunk in voxel-local coordinates — shared by `get_block_at` (read)
 /// and `AsyncWorldStream::set_block_at` (write, see stream_pool.rs) so both
-/// use the exact same world->chunk mapping.
-pub fn world_to_chunk_local(wx: f32, wy: f32, wz: f32) -> (ChunkPos, ChunkLocalPos) {
-    let s = CHUNK_SIZE as f32 * VOXEL_SIZE;
+/// use the exact same world->chunk mapping. f64 input so the chunk index
+/// stays exact at any distance from the origin — the local voxel index
+/// (0..CHUNK_SIZE) only ever needs a few bits of precision, but the chunk
+/// index itself must not drift.
+pub fn world_to_chunk_local(wx: f64, wy: f64, wz: f64) -> (ChunkPos, ChunkLocalPos) {
+    let s = CHUNK_SIZE as f64 * VOXEL_SIZE as f64;
     let cp = ChunkPos {
         x: (wx / s).floor() as i32,
         y: (wy / s).floor() as i32,
         z: (wz / s).floor() as i32,
     };
-    let lx = ((wx / VOXEL_SIZE).floor() as i32).rem_euclid(CHUNK_SIZE as i32) as u8;
-    let ly = ((wy / VOXEL_SIZE).floor() as i32).rem_euclid(CHUNK_SIZE as i32) as u8;
-    let lz = ((wz / VOXEL_SIZE).floor() as i32).rem_euclid(CHUNK_SIZE as i32) as u8;
+    let lx = ((wx / VOXEL_SIZE as f64).floor() as i64).rem_euclid(CHUNK_SIZE as i64) as u8;
+    let ly = ((wy / VOXEL_SIZE as f64).floor() as i64).rem_euclid(CHUNK_SIZE as i64) as u8;
+    let lz = ((wz / VOXEL_SIZE as f64).floor() as i64).rem_euclid(CHUNK_SIZE as i64) as u8;
     (cp, ChunkLocalPos::new(lx, ly, lz))
 }
 
 impl ChunkQuery for HashMap<ChunkPos, Chunk> {
-    fn get_block_at(&self, wx: f32, wy: f32, wz: f32) -> BlockTypeId {
+    fn get_block_at(&self, wx: f64, wy: f64, wz: f64) -> BlockTypeId {
         let (cp, lp) = world_to_chunk_local(wx, wy, wz);
         match self.get(&cp) {
             Some(chunk) => chunk.get(lp),
@@ -48,27 +51,30 @@ impl ChunkQuery for HashMap<ChunkPos, Chunk> {
 // ---------------------------------------------------------------------------
 
 pub struct SweepResult {
-    pub pos: Vec3,
+    pub pos: DVec3,
     pub hit_x: bool,
     pub hit_y: bool,
     pub hit_z: bool,
 }
 
 /// Check whether an AABB at `pos` (center-bottom) overlaps any solid voxel.
-fn overlaps_solid(world: &dyn ChunkQuery, pos: Vec3, hw: f32, height: f32, hd: f32) -> bool {
-    let min_x = ((pos.x - hw) / VOXEL_SIZE).floor() as i32;
-    let max_x = ((pos.x + hw) / VOXEL_SIZE).ceil() as i32;
-    let min_y = (pos.y / VOXEL_SIZE).floor() as i32;
-    let max_y = ((pos.y + height) / VOXEL_SIZE).ceil() as i32;
-    let min_z = ((pos.z - hd) / VOXEL_SIZE).floor() as i32;
-    let max_z = ((pos.z + hd) / VOXEL_SIZE).ceil() as i32;
+/// `pos` is f64 (absolute world position); `hw`/`height`/`hd` stay f32 —
+/// they're AABB half-extents, always small regardless of world position.
+fn overlaps_solid(world: &dyn ChunkQuery, pos: DVec3, hw: f32, height: f32, hd: f32) -> bool {
+    let voxel = VOXEL_SIZE as f64;
+    let min_x = ((pos.x - hw as f64) / voxel).floor() as i64;
+    let max_x = ((pos.x + hw as f64) / voxel).ceil() as i64;
+    let min_y = (pos.y / voxel).floor() as i64;
+    let max_y = ((pos.y + height as f64) / voxel).ceil() as i64;
+    let min_z = ((pos.z - hd as f64) / voxel).floor() as i64;
+    let max_z = ((pos.z + hd as f64) / voxel).ceil() as i64;
 
     for vx in min_x..max_x {
         for vy in min_y..max_y {
             for vz in min_z..max_z {
-                let wx = vx as f32 * VOXEL_SIZE + VOXEL_SIZE * 0.5;
-                let wy = vy as f32 * VOXEL_SIZE + VOXEL_SIZE * 0.5;
-                let wz = vz as f32 * VOXEL_SIZE + VOXEL_SIZE * 0.5;
+                let wx = vx as f64 * voxel + voxel * 0.5;
+                let wy = vy as f64 * voxel + voxel * 0.5;
+                let wz = vz as f64 * voxel + voxel * 0.5;
                 if world.is_solid(wx, wy, wz) {
                     return true;
                 }
@@ -84,9 +90,13 @@ fn overlaps_solid(world: &dyn ChunkQuery, pos: Vec3, hw: f32, height: f32, hd: f
 /// underground) can't loop forever.
 const MAX_UNSTICK_STEPS: u32 = 40;
 
+/// `origin` is f64 (absolute world position, precise at any distance from
+/// the origin); `delta`/`hw`/`height`/`hd` stay f32 — one tick's movement
+/// and the AABB's half-extents are always small regardless of where in the
+/// world this sweep happens.
 pub fn sweep_aabb(
     world: &dyn ChunkQuery,
-    origin: Vec3,
+    origin: DVec3,
     delta: Vec3,
     hw: f32,
     height: f32,
@@ -109,14 +119,14 @@ pub fn sweep_aabb(
         if !overlaps_solid(world, pos, hw, height, hd) {
             break;
         }
-        pos.y += step_size;
+        pos.y += step_size as f64;
     }
 
     // Resolve Y first so gravity settles before horizontal movement
     let steps_y = (delta.y.abs() / step_size).ceil() as u32 + 1;
     let dy = delta.y / steps_y as f32;
     for _ in 0..steps_y {
-        let next = Vec3::new(pos.x, pos.y + dy, pos.z);
+        let next = DVec3::new(pos.x, pos.y + dy as f64, pos.z);
         if overlaps_solid(world, next, hw, height, hd) {
             hit_y = true;
             break;
@@ -128,7 +138,7 @@ pub fn sweep_aabb(
     let steps_x = (delta.x.abs() / step_size).ceil() as u32 + 1;
     let dx = delta.x / steps_x as f32;
     for _ in 0..steps_x {
-        let next = Vec3::new(pos.x + dx, pos.y, pos.z);
+        let next = DVec3::new(pos.x + dx as f64, pos.y, pos.z);
         if overlaps_solid(world, next, hw, height, hd) {
             hit_x = true;
             break;
@@ -140,7 +150,7 @@ pub fn sweep_aabb(
     let steps_z = (delta.z.abs() / step_size).ceil() as u32 + 1;
     let dz = delta.z / steps_z as f32;
     for _ in 0..steps_z {
-        let next = Vec3::new(pos.x, pos.y, pos.z + dz);
+        let next = DVec3::new(pos.x, pos.y, pos.z + dz as f64);
         if overlaps_solid(world, next, hw, height, hd) {
             hit_z = true;
             break;
@@ -172,8 +182,8 @@ mod tests {
     }
 
     impl ChunkQuery for FlatGround {
-        fn get_block_at(&self, _wx: f32, wy: f32, _wz: f32) -> BlockTypeId {
-            if wy < self.ground_y {
+        fn get_block_at(&self, _wx: f64, wy: f64, _wz: f64) -> BlockTypeId {
+            if wy < self.ground_y as f64 {
                 BlockTypeId(1)
             } else {
                 BlockTypeId(0)
@@ -193,10 +203,10 @@ mod tests {
         // never move at all (nothing "refuses" to move if it's not moving);
         // de-penetration must act even when delta is zero.
         let ground = FlatGround { ground_y: 10.0 };
-        let origin = Vec3::new(0.0, 5.0, 0.0);
+        let origin = DVec3::new(0.0, 5.0, 0.0);
         let result = sweep_aabb(&ground, origin, Vec3::ZERO, HW, HEIGHT, HD);
         assert!(
-            result.pos.y >= ground.ground_y,
+            result.pos.y >= ground.ground_y as f64,
             "expected to be pushed clear of the ground (y >= {}), got y = {}",
             ground.ground_y,
             result.pos.y
@@ -208,11 +218,11 @@ mod tests {
         // Falling from well above the surface should stop right at it, not
         // inside it.
         let ground = FlatGround { ground_y: 10.0 };
-        let origin = Vec3::new(0.0, 20.0, 0.0);
+        let origin = DVec3::new(0.0, 20.0, 0.0);
         let result = sweep_aabb(&ground, origin, Vec3::new(0.0, -50.0, 0.0), HW, HEIGHT, HD);
         assert!(result.hit_y);
         assert!(
-            result.pos.y >= ground.ground_y,
+            result.pos.y >= ground.ground_y as f64,
             "landed pos.y = {} should not be below ground_y = {}",
             result.pos.y,
             ground.ground_y
@@ -226,7 +236,7 @@ mod tests {
         let ground = FlatGround {
             ground_y: f32::NEG_INFINITY,
         };
-        let origin = Vec3::new(0.0, 20.0, 0.0);
+        let origin = DVec3::new(0.0, 20.0, 0.0);
         let delta = Vec3::new(1.0, 0.0, 2.0);
         let result = sweep_aabb(&ground, origin, delta, HW, HEIGHT, HD);
         assert!(!result.hit_x && !result.hit_z);

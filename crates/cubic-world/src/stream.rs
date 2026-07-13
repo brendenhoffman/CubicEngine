@@ -2,12 +2,12 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use crate::{Chunk, ChunkPos, WorldGenerator, CHUNK_SIZE, VOXEL_SIZE};
-use cubic_math::Vec3;
+use cubic_math::DVec3;
 use std::collections::HashMap;
 
 /// Convert a world-space position to the chunk that contains it.
-pub fn world_pos_to_chunk(world: Vec3) -> ChunkPos {
-    let s = CHUNK_SIZE as f32 * VOXEL_SIZE;
+pub fn world_pos_to_chunk(world: DVec3) -> ChunkPos {
+    let s = CHUNK_SIZE as f64 * VOXEL_SIZE as f64;
     ChunkPos {
         x: (world.x / s).floor() as i32,
         y: (world.y / s).floor() as i32,

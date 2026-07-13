@@ -230,7 +230,7 @@ impl App {
                 // to report, so fall back to the camera as before.
                 let p = if self.guest.wasm_game.is_some() {
                     let feet = cubic_wasm::get_player_feet();
-                    cubic_math::Vec3::new(feet.x, feet.y, feet.z)
+                    cubic_math::DVec3::new(feet.x, feet.y, feet.z)
                 } else {
                     self.camera.position
                 };
@@ -255,9 +255,9 @@ impl App {
                 ui.label(format!("Chunks: {loaded} loaded  {pending} pending"));
 
                 // Block position (which voxel the camera is in)
-                let voxel_x = (p.x / cubic_world::VOXEL_SIZE).floor() as i32;
-                let voxel_y = (p.y / cubic_world::VOXEL_SIZE).floor() as i32;
-                let voxel_z = (p.z / cubic_world::VOXEL_SIZE).floor() as i32;
+                let voxel_x = (p.x / cubic_world::VOXEL_SIZE as f64).floor() as i32;
+                let voxel_y = (p.y / cubic_world::VOXEL_SIZE as f64).floor() as i32;
+                let voxel_z = (p.z / cubic_world::VOXEL_SIZE as f64).floor() as i32;
                 ui.label(format!("Block: {voxel_x} {voxel_y} {voxel_z}"));
                 ui.label(format!("Seed: {}", self.world.seed));
             });

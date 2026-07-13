@@ -77,11 +77,12 @@ pub fn get_tick_input() -> InputSnapshot {
 // ---------------------------------------------------------------------------
 
 /// Camera position and orientation set by the game during on_tick via `set-camera`.
+/// x/y/z are f64 (absolute world position) — see the f64-world-coordinates card.
 #[derive(Clone, Copy)]
 pub struct CameraUpdate {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
     pub yaw: f32,
     pub pitch: f32,
 }
@@ -109,9 +110,9 @@ pub fn take_camera_update() -> Option<CameraUpdate> {
 /// orbit moves the camera away from the player's actual position.
 #[derive(Clone, Copy, Default)]
 pub struct PlayerFeet {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
 }
 
 thread_local! {
@@ -140,9 +141,9 @@ pub fn get_player_feet() -> PlayerFeet {
 pub struct DrawRequest {
     pub mesh_handle: u32,
     pub tex_index: u32,
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
     pub yaw: f32,
 }
 
@@ -172,9 +173,9 @@ pub fn take_draw_queue() -> Vec<DrawRequest> {
 /// queue then, applying each edit via AsyncWorldStream::set_block_at.
 #[derive(Clone, Copy)]
 pub struct BlockEditRequest {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
     pub block_id: u32,
 }
 
@@ -203,7 +204,9 @@ pub struct InputEvent {
     pub name: String,
     /// 0=Pressed, 1=Released, 2=DoubleTap
     pub kind: u32,
-    pub payload: [f32; 3],
+    /// f64 since this can carry an absolute world position (e.g. /tp's
+    /// teleport target) — see the f64-world-coordinates card.
+    pub payload: [f64; 3],
 }
 
 thread_local! {

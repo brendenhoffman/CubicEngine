@@ -22,7 +22,7 @@ use config::{
     RenderCfg, UnfocusedPolicy, VsyncMode,
 };
 use cubic_core::init_tracing;
-use cubic_math::{Camera, Vec3};
+use cubic_math::{Camera, DVec3, Vec3};
 use cubic_platform::winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
@@ -739,7 +739,8 @@ impl App {
                 movement -= Vec3::Y;
             }
 
-            self.camera.position += movement.normalize_or_zero() * self.cfg.camera.move_speed * dt;
+            self.camera.position +=
+                (movement.normalize_or_zero() * self.cfg.camera.move_speed * dt).as_dvec3();
         }
     }
 
@@ -908,7 +909,11 @@ fn main() -> Result<()> {
         crosshair_tex: None, // loaded in resumed(), once egui_ctx/window exist
         controls,
         camera: Camera {
-            position: Vec3::new(0.0, (CHUNK_SIZE / 2) as f32 * VOXEL_SIZE + 12.0, 0.0),
+            position: DVec3::new(
+                0.0,
+                ((CHUNK_SIZE / 2) as f32 * VOXEL_SIZE + 12.0) as f64,
+                0.0,
+            ),
             pitch: -0.3,
             ..Camera::default()
         },

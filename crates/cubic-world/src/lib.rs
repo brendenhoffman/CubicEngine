@@ -16,7 +16,7 @@ pub use region::{
     SparseDiffEntry,
 };
 
-use cubic_math::Vec3;
+use cubic_math::DVec3;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -268,10 +268,12 @@ pub struct ChunkPos {
 }
 
 impl ChunkPos {
-    /// World-space position of this chunk's (0,0,0) corner in metres.
-    pub fn to_world_origin(self) -> Vec3 {
-        let s = CHUNK_SIZE as f32 * VOXEL_SIZE;
-        Vec3::new(self.x as f32 * s, self.y as f32 * s, self.z as f32 * s)
+    /// World-space position of this chunk's (0,0,0) corner in metres. f64
+    /// so precision survives at any chunk index — the i32 -> f64 cast is
+    /// always exact.
+    pub fn to_world_origin(self) -> DVec3 {
+        let s = CHUNK_SIZE as f64 * VOXEL_SIZE as f64;
+        DVec3::new(self.x as f64 * s, self.y as f64 * s, self.z as f64 * s)
     }
 }
 

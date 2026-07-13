@@ -42,13 +42,13 @@ fn cmd_tp(app: &mut App, args: &[&str]) -> Result<String, String> {
     }
 
     let x = coords[0]
-        .parse::<f32>()
+        .parse::<f64>()
         .map_err(|_| format!("Expected a number, got '{}'", coords[0]))?;
     let y = coords[1]
-        .parse::<f32>()
+        .parse::<f64>()
         .map_err(|_| format!("Expected a number, got '{}'", coords[1]))?;
     let z = coords[2]
-        .parse::<f32>()
+        .parse::<f64>()
         .map_err(|_| format!("Expected a number, got '{}'", coords[2]))?;
 
     match selector {
@@ -66,7 +66,7 @@ fn cmd_tp(app: &mut App, args: &[&str]) -> Result<String, String> {
                 kind: 0,
                 payload: [0.0; 3],
             });
-            app.camera.position = cubic_math::Vec3::new(x, y, z);
+            app.camera.position = cubic_math::DVec3::new(x, y, z);
             Ok(format!("Camera moved to {x:.1} {y:.1} {z:.1}"))
         }
         s => Err(format!("Unknown selector '{s}'. Use @p or @c.")),

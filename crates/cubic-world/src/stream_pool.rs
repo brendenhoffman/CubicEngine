@@ -41,7 +41,7 @@ pub struct ChunkQueryView<'a> {
 }
 
 impl ChunkQuery for ChunkQueryView<'_> {
-    fn get_block_at(&self, wx: f32, wy: f32, wz: f32) -> BlockTypeId {
+    fn get_block_at(&self, wx: f64, wy: f64, wz: f64) -> BlockTypeId {
         self.chunks.get_block_at(wx, wy, wz)
     }
 }
@@ -380,7 +380,7 @@ impl AsyncWorldStream {
     /// this only matters for pure-air/fully-buried chunks the player can't
     /// have raycast a hit into anyway, since a hit implies a real stored
     /// non-air voxel.
-    pub fn set_block_at(&mut self, wx: f32, wy: f32, wz: f32, id: BlockTypeId) -> bool {
+    pub fn set_block_at(&mut self, wx: f64, wy: f64, wz: f64, id: BlockTypeId) -> bool {
         let (cp, lp) = world_to_chunk_local(wx, wy, wz);
         let Some(chunk) = self.inner.chunks.get_mut(&cp) else {
             return false;

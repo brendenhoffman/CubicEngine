@@ -50,7 +50,10 @@ pub struct InputState {
 }
 
 pub struct Player {
-    pub pos: [f32; 3],
+    // f64: absolute world position, precise at any distance from the
+    // origin (see the f64-world-coordinates card). `vel` stays f32 —
+    // velocity magnitude is always small/bounded.
+    pub pos: [f64; 3],
     pub vel: [f32; 3],
     pub yaw: f32,
     pub pitch: f32,
@@ -66,7 +69,7 @@ pub struct Player {
     // wherever the player physically was, and spectator_pos moves freely
     // with no collision at all (not even a de-penetration/ground probe).
     pub spectating: bool,
-    pub spectator_pos: [f32; 3],
+    pub spectator_pos: [f64; 3],
     // Set/cleared by a "sprint" InputEvent (double-tap forward by default,
     // registered by this game's game_overrides.toml rather than being a
     // built-in engine control — see on_tick in lib.rs). Unlike the toggles
@@ -93,8 +96,8 @@ pub struct Player {
 /// positions are computed from chunk-local voxel indices elsewhere).
 #[derive(Clone, Copy)]
 pub struct RayHit {
-    pub block: [f32; 3],
-    pub place: [f32; 3],
+    pub block: [f64; 3],
+    pub place: [f64; 3],
 }
 
 impl Default for Player {
@@ -114,7 +117,7 @@ impl Player {
     /// `on_load`'s call site, which passes its terrain fallback block.
     pub fn new(spawn_y: f32, default_block: u32) -> Self {
         Self {
-            pos: [0.0, spawn_y, 0.0],
+            pos: [0.0, spawn_y as f64, 0.0],
             vel: [0.0; 3],
             yaw: 0.0,
             pitch: 0.0,
@@ -129,8 +132,8 @@ impl Player {
         }
     }
 
-    pub fn eye_pos(&self) -> [f32; 3] {
-        [self.pos[0], self.pos[1] + EYE_HEIGHT, self.pos[2]]
+    pub fn eye_pos(&self) -> [f64; 3] {
+        [self.pos[0], self.pos[1] + EYE_HEIGHT as f64, self.pos[2]]
     }
 
     /// March a ray from the eye along the look direction (yaw/pitch —
@@ -149,38 +152,39 @@ impl Player {
 
         let mut prev_voxel: Option<[i32; 3]> = None;
         let mut t = 0.0f32;
+        let voxel_size = crate::VOXEL_SIZE as f64;
         while t < REACH {
             let p = [
-                origin[0] + dir[0] * t,
-                origin[1] + dir[1] * t,
-                origin[2] + dir[2] * t,
+                origin[0] + dir[0] as f64 * t as f64,
+                origin[1] + dir[1] as f64 * t as f64,
+                origin[2] + dir[2] as f64 * t as f64,
             ];
             if physics::is_solid(p[0], p[1], p[2]) {
                 let voxel = [
-                    (p[0] / crate::VOXEL_SIZE).floor() as i32,
-                    (p[1] / crate::VOXEL_SIZE).floor() as i32,
-                    (p[2] / crate::VOXEL_SIZE).floor() as i32,
+                    (p[0] / voxel_size).floor() as i32,
+                    (p[1] / voxel_size).floor() as i32,
+                    (p[2] / voxel_size).floor() as i32,
                 ];
                 let block = [
-                    voxel[0] as f32 * crate::VOXEL_SIZE,
-                    voxel[1] as f32 * crate::VOXEL_SIZE,
-                    voxel[2] as f32 * crate::VOXEL_SIZE,
+                    voxel[0] as f64 * voxel_size,
+                    voxel[1] as f64 * voxel_size,
+                    voxel[2] as f64 * voxel_size,
                 ];
                 let place = prev_voxel
                     .map(|pv| {
                         [
-                            pv[0] as f32 * crate::VOXEL_SIZE,
-                            pv[1] as f32 * crate::VOXEL_SIZE,
-                            pv[2] as f32 * crate::VOXEL_SIZE,
+                            pv[0] as f64 * voxel_size,
+                            pv[1] as f64 * voxel_size,
+                            pv[2] as f64 * voxel_size,
                         ]
                     })
                     .unwrap_or(block);
                 return Some(RayHit { block, place });
             }
             prev_voxel = Some([
-                (p[0] / crate::VOXEL_SIZE).floor() as i32,
-                (p[1] / crate::VOXEL_SIZE).floor() as i32,
-                (p[2] / crate::VOXEL_SIZE).floor() as i32,
+                (p[0] / voxel_size).floor() as i32,
+                (p[1] / voxel_size).floor() as i32,
+                (p[2] / voxel_size).floor() as i32,
             ]);
             t += RAY_STEP;
         }
@@ -283,11 +287,11 @@ impl Player {
         let dy = self.vel[1] * dt;
         let dz = self.vel[2] * dt;
 
-        // Result buffer for sweep-aabb's out-ptr: [x, y, z, hit_x, hit_y,
-        // hit_z] = 24 bytes. Stack-allocated is fine — the WASM stack lives
-        // inside linear memory, so the host's mem.data_mut() write reaches
-        // it just like any other address.
-        let mut result_buf = [0u8; 24];
+        // Result buffer for sweep-aabb's out-ptr: [x, y, z (f64 each), hit_x,
+        // hit_y, hit_z (i32 each)] = 3*8 + 3*4 = 36 bytes. Stack-allocated is
+        // fine — the WASM stack lives inside linear memory, so the host's
+        // mem.data_mut() write reaches it just like any other address.
+        let mut result_buf = [0u8; 36];
         let out_ptr = result_buf.as_mut_ptr() as u32;
         physics::sweep_aabb(
             self.pos[0],
@@ -301,13 +305,13 @@ impl Player {
             PLAYER_HALF_D,
             out_ptr,
         );
-        // Parse result: [x:f32, y:f32, z:f32, hit_x:i32, hit_y:i32, hit_z:i32]
-        let rx = f32::from_le_bytes(result_buf[0..4].try_into().unwrap());
-        let ry = f32::from_le_bytes(result_buf[4..8].try_into().unwrap());
-        let rz = f32::from_le_bytes(result_buf[8..12].try_into().unwrap());
-        let hit_x = i32::from_le_bytes(result_buf[12..16].try_into().unwrap()) != 0;
-        let hit_y = i32::from_le_bytes(result_buf[16..20].try_into().unwrap()) != 0;
-        let hit_z = i32::from_le_bytes(result_buf[20..24].try_into().unwrap()) != 0;
+        // Parse result: [x:f64, y:f64, z:f64, hit_x:i32, hit_y:i32, hit_z:i32]
+        let rx = f64::from_le_bytes(result_buf[0..8].try_into().unwrap());
+        let ry = f64::from_le_bytes(result_buf[8..16].try_into().unwrap());
+        let rz = f64::from_le_bytes(result_buf[16..24].try_into().unwrap());
+        let hit_x = i32::from_le_bytes(result_buf[24..28].try_into().unwrap()) != 0;
+        let hit_y = i32::from_le_bytes(result_buf[28..32].try_into().unwrap()) != 0;
+        let hit_z = i32::from_le_bytes(result_buf[32..36].try_into().unwrap()) != 0;
 
         self.pos = [rx, ry, rz];
 
@@ -339,7 +343,7 @@ impl Player {
         // position; unlike the real sweep this always has a small nonzero
         // downward delta, so it actually detects standing contact.
         if !self.flying && !self.grounded {
-            let mut probe_buf = [0u8; 24];
+            let mut probe_buf = [0u8; 36];
             let probe_ptr = probe_buf.as_mut_ptr() as u32;
             physics::sweep_aabb(
                 self.pos[0],
@@ -353,7 +357,10 @@ impl Player {
                 PLAYER_HALF_D,
                 probe_ptr,
             );
-            let probe_hit_y = i32::from_le_bytes(probe_buf[16..20].try_into().unwrap()) != 0;
+            // hit_y is the second of three i32 flags starting at byte 24
+            // (after three f64 position fields) — see the result_buf parse
+            // above for the full layout.
+            let probe_hit_y = i32::from_le_bytes(probe_buf[28..32].try_into().unwrap()) != 0;
             if probe_hit_y {
                 self.grounded = true;
             }
@@ -420,9 +427,9 @@ impl Player {
         // No sweep_aabb call at all: spectating is explicitly unsolid, so
         // this is a plain kinematic integration, not even a de-penetration
         // check.
-        self.spectator_pos[0] += mx * dt;
-        self.spectator_pos[1] += my * dt;
-        self.spectator_pos[2] += mz * dt;
+        self.spectator_pos[0] += (mx * dt) as f64;
+        self.spectator_pos[1] += (my * dt) as f64;
+        self.spectator_pos[2] += (mz * dt) as f64;
 
         camera::set_camera(
             self.spectator_pos[0],
@@ -446,7 +453,7 @@ impl Player {
     /// direction, so looking up/down swings the camera over/under the
     /// player instead of just sliding it up and re-angling (which is what
     /// the old fixed-height-offset version did).
-    fn third_person_camera(&self) -> ([f32; 3], f32, f32) {
+    fn third_person_camera(&self) -> ([f64; 3], f32, f32) {
         let eye = self.eye_pos();
 
         let horiz = THIRD_PERSON_DIST * self.pitch.cos();
@@ -455,9 +462,9 @@ impl Player {
         let back_z = self.yaw.cos() * horiz;
 
         let cam_pos = [
-            eye[0] + back_x,
-            eye[1] + back_y + 0.5, // small upward bias so head is visible at flat pitch
-            eye[2] + back_z,
+            eye[0] + back_x as f64,
+            eye[1] + back_y as f64 + 0.5, // small upward bias so head is visible at flat pitch
+            eye[2] + back_z as f64,
         ];
 
         // Camera looks toward eye — same yaw and pitch as player
