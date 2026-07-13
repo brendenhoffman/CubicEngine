@@ -19,6 +19,18 @@ use cubic_render::Vertex;
 const CS: usize = CHUNK_SIZE;
 const AIR: BlockTypeId = BlockTypeId(0);
 
+/// Greedy-merged quads of differing sizes meet at T-junctions (a vertex of
+/// one quad falling mid-edge on a neighbor's edge, not a shared vertex) —
+/// GPU rasterizers don't guarantee gap-free coverage across those, so at
+/// certain view angles a stray pixel falls in the crack and shows whatever
+/// is behind the mesh. Inflating every quad's edges outward by this much
+/// (sub-millimeter, far below a texel or a screen pixel at any sane view
+/// distance) turns any such crack into a coplanar micro-overlap instead —
+/// invisible, but leaves no gap for the rasterizer to drop a pixel into.
+/// Applied uniformly, including at chunk boundaries, where the same
+/// T-junction issue can occur between two independently-meshed chunks.
+const CRACK_EPS: f32 = VOXEL_SIZE * 0.001;
+
 // ---------------------------------------------------------------------------
 // BlockFaceTextures
 // ---------------------------------------------------------------------------
@@ -173,12 +185,16 @@ pub fn mesh_chunk(
                     let wf = w as f32 * VOXEL_SIZE;
                     let hf = h as f32 * VOXEL_SIZE;
 
-                    // Four corners: BL, BR, TR, TL (in u-v space).
+                    // Four corners: BL, BR, TR, TL (in u-v space), inflated
+                    // by CRACK_EPS on every edge to close greedy-mesh
+                    // T-junction rasterization cracks (see CRACK_EPS's doc
+                    // comment) — geometry only, UVs below are left at the
+                    // true w/h so texturing is unaffected.
                     let corners = [
-                        world_pos(axis, af, u0f, v0f),           // 0 = BL
-                        world_pos(axis, af, u0f + wf, v0f),      // 1 = BR
-                        world_pos(axis, af, u0f + wf, v0f + hf), // 2 = TR
-                        world_pos(axis, af, u0f, v0f + hf),      // 3 = TL
+                        world_pos(axis, af, u0f - CRACK_EPS, v0f - CRACK_EPS), // 0 = BL
+                        world_pos(axis, af, u0f + wf + CRACK_EPS, v0f - CRACK_EPS), // 1 = BR
+                        world_pos(axis, af, u0f + wf + CRACK_EPS, v0f + hf + CRACK_EPS), // 2 = TR
+                        world_pos(axis, af, u0f - CRACK_EPS, v0f + hf + CRACK_EPS), // 3 = TL
                     ];
                     // UVs corrected per face direction so textures appear upright on all faces.
                     // Corners are BL, BR, TR, TL in u-v space — the mapping differs per axis
