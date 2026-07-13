@@ -6,7 +6,7 @@ use crate::cubic::game::{camera, physics};
 const PLAYER_HALF_W: f32 = 0.3; // 0.6m wide = 1.2 voxels
 const PLAYER_HEIGHT: f32 = 1.8; // 1.8m tall = 3.6 voxels
 const PLAYER_HALF_D: f32 = 0.3; // 0.6m deep = 1.2 voxels
-const EYE_HEIGHT: f32 = 1.62; // eye level = 3.24 voxels
+pub const EYE_HEIGHT: f32 = 1.62; // eye level = 3.24 voxels
 const THIRD_PERSON_DIST: f32 = 4.0;
 /// How far below the player to probe for standing contact (see the ground
 /// probe in tick, step 6b) — small enough not to falsely ground someone who

@@ -7,6 +7,8 @@ mod launcher;
 mod pause;
 
 pub(crate) use launcher::scan_games;
+pub(crate) mod chat;
+pub(crate) use chat::{ChatMessage, ChatMessageKind};
 
 use crate::{profile, App};
 
@@ -127,11 +129,23 @@ impl App {
     pub(crate) fn build_ui(&mut self, ui: &mut egui::Ui) {
         match self.state {
             crate::AppState::Launcher => self.build_launcher_ui(ui),
-            crate::AppState::Paused => self.build_pause_ui(ui),
+            crate::AppState::Paused => {
+                self.build_pause_ui(ui);
+                self.build_chat_ui(ui.ctx());
+                if self.chat_submit_pending {
+                    self.chat_submit_pending = false;
+                    self.submit_chat();
+                }
+            }
             crate::AppState::InGame => {
-                self.build_crosshair_ui(ui);
+                self.build_crosshair_ui(ui.ctx());
                 if self.show_diagnostics {
-                    self.build_diagnostics_ui(ui);
+                    self.build_diagnostics_ui(ui.ctx());
+                }
+                self.build_chat_ui(ui.ctx());
+                if self.chat_submit_pending {
+                    self.chat_submit_pending = false;
+                    self.submit_chat();
                 }
             }
         }

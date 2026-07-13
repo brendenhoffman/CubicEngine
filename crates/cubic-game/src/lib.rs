@@ -10,7 +10,7 @@ mod player;
 use cubic::game::block_registry::{FaceDef, register_block_with_faces};
 use exports::cubic::game::world_gen::Guest;
 use noise::{NoiseFn, OpenSimplex};
-use player::{InputState, Player};
+use player::{EYE_HEIGHT, InputState, Player};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -394,8 +394,8 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
             sprint_multiplier: f32::from_le_bytes(buf[48..52].try_into().unwrap()),
         };
 
-        // Read discrete events — up to 64 events * 40 bytes = 2560 bytes
-        let mut evt_buf = [0u8; 2560];
+        // Read discrete events — up to 64 events * 56 bytes = 3584 bytes
+        let mut evt_buf = [0u8; 3584];
         let evt_bytes =
             cubic::game::input::get_events(evt_buf.as_mut_ptr() as u32, evt_buf.len() as u32)
                 as usize;
@@ -419,13 +419,22 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
             // toggle-style actions. kind==1 (Released) is still delivered
             // for cases that do care, like "sprint" below.
             let mut i = 0;
-            while i + 40 <= evt_bytes {
+            while i + 56 <= evt_bytes {
                 let name_bytes = &evt_buf[i..i + 32];
                 let name = std::str::from_utf8(name_bytes)
                     .unwrap_or("")
                     .trim_end_matches('\0');
                 let kind = u32::from_le_bytes(evt_buf[i + 32..i + 36].try_into().unwrap());
+                // i+36..i+40 padding
+                let px = f32::from_le_bytes(evt_buf[i + 40..i + 44].try_into().unwrap());
+                let py = f32::from_le_bytes(evt_buf[i + 44..i + 48].try_into().unwrap());
+                let pz = f32::from_le_bytes(evt_buf[i + 48..i + 52].try_into().unwrap());
                 match name {
+                    "teleport" if kind != 1 => {
+                        player.pos = [px, py - EYE_HEIGHT, pz];
+                        player.vel = [0.0; 3];
+                        player.grounded = false;
+                    }
                     "fly" if kind != 1 => {
                         player.flying = !player.flying;
                         player.vel[1] = 0.0;
@@ -459,7 +468,7 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
                     "pick_block" if kind != 1 => block_action = Some(BlockAction::Pick),
                     _ => {}
                 }
-                i += 40;
+                i += 56;
             }
 
             player.tick(dt, &input_state);

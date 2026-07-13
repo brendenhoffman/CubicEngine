@@ -56,7 +56,8 @@ impl App {
                         // just a Pressed event for the "spectate" action.
                         cubic_wasm::push_input_event(cubic_wasm::InputEvent {
                             name: "spectate".to_string(),
-                            kind: 0, // Pressed
+                            kind: 0,
+                            payload: [0.0; 3],
                         });
                     }
 

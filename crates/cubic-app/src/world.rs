@@ -313,6 +313,7 @@ impl App {
         }
 
         self.region_cache = Some(region_cache);
+        self.load_chat_log(&world_dir);
     }
 
     /// Advance the guest tick, chunk streaming, mesh upload/remesh, and

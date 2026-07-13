@@ -544,6 +544,7 @@ impl InputTracker {
                     cubic_wasm::push_input_event(cubic_wasm::InputEvent {
                         name: name.clone(),
                         kind: if is_double_tap { 2 } else { 0 },
+                        payload: [0.0; 3],
                     });
                     fired.push(name.clone());
                 }
@@ -551,6 +552,7 @@ impl InputTracker {
                 cubic_wasm::push_input_event(cubic_wasm::InputEvent {
                     name: name.clone(),
                     kind: 1, // Released
+                    payload: [0.0; 3],
                 });
             }
             state.was_held = is_held;

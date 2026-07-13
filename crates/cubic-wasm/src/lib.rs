@@ -434,16 +434,20 @@ impl WasmInstance {
                 let mut written = 0usize;
                 let base = out_ptr as usize;
                 for event in &events {
-                    if written + 40 > max_bytes as usize {
+                    if written + 56 > max_bytes as usize {
                         break;
                     }
-                    let slot = &mut data[base + written..base + written + 40];
-                    slot[..40].fill(0);
+                    let slot = &mut data[base + written..base + written + 56];
+                    slot[..56].fill(0);
                     let name_bytes = event.name.as_bytes();
                     let name_len = name_bytes.len().min(31);
                     slot[..name_len].copy_from_slice(&name_bytes[..name_len]);
                     slot[32..36].copy_from_slice(&event.kind.to_le_bytes());
-                    written += 40;
+                    // slot[36..40] padding, already zeroed
+                    slot[40..44].copy_from_slice(&event.payload[0].to_le_bytes());
+                    slot[44..48].copy_from_slice(&event.payload[1].to_le_bytes());
+                    slot[48..52].copy_from_slice(&event.payload[2].to_le_bytes());
+                    written += 56;
                 }
                 written as i32
             },

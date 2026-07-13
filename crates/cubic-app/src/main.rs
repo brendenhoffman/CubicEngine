@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
 mod backend;
+mod commands;
 mod config;
 #[cfg(debug_assertions)]
 mod flat_generator;
@@ -151,9 +152,16 @@ struct App {
     gilrs: Option<gilrs::Gilrs>,
 
     current_world_name: String,
-
     region_cache: Option<Arc<Mutex<RegionCache>>>,
     autosave_timer: std::time::Instant,
+
+    // Chat
+    chat_open: bool,
+    chat_input: String,
+    chat_messages: std::collections::VecDeque<ui::ChatMessage>,
+    chat_log_path: Option<std::path::PathBuf>,
+    chat_fade_timer: Option<std::time::Instant>,
+    chat_submit_pending: bool,
 }
 
 impl ApplicationHandler for App {
@@ -401,6 +409,34 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::KeyboardInput { event, .. } => {
+                // Chat intercepts first — suppress game input while open,
+                // and handle T / / / Escape for opening and closing.
+                if matches!(self.state, AppState::InGame | AppState::Paused)
+                    && event.state == ElementState::Pressed
+                {
+                    if self.chat_open {
+                        if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
+                            self.chat_open = false;
+                            self.chat_input.clear();
+                            self.apply_cursor_state();
+                        }
+                        return;
+                    }
+                    if self.state == AppState::InGame {
+                        match event.physical_key {
+                            PhysicalKey::Code(KeyCode::KeyT) => {
+                                self.open_chat("");
+                                return;
+                            }
+                            PhysicalKey::Code(KeyCode::Slash) => {
+                                self.open_chat("/");
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
                 if let PhysicalKey::Code(code) = event.physical_key {
                     self.input
                         .set_source(InputSource::Key(code), event.state == ElementState::Pressed);
@@ -747,7 +783,7 @@ impl App {
 
     fn apply_cursor_state(&self) {
         let Some(window) = &self.window else { return };
-        let should_lock = self.focused && self.state == AppState::InGame;
+        let should_lock = self.focused && self.state == AppState::InGame && !self.chat_open;
         if should_lock {
             let _ = window
                 .set_cursor_grab(CursorGrabMode::Locked)
@@ -887,6 +923,12 @@ fn main() -> Result<()> {
         current_world_name,
         region_cache: None,
         autosave_timer: std::time::Instant::now(),
+        chat_open: false,
+        chat_input: String::new(),
+        chat_messages: std::collections::VecDeque::new(),
+        chat_log_path: None,
+        chat_fade_timer: None,
+        chat_submit_pending: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

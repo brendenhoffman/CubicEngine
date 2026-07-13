@@ -203,6 +203,7 @@ pub struct InputEvent {
     pub name: String,
     /// 0=Pressed, 1=Released, 2=DoubleTap
     pub kind: u32,
+    pub payload: [f32; 3],
 }
 
 thread_local! {

@@ -127,6 +127,12 @@ interface input {
     /// kind: 0=Pressed, 1=Released, 2=DoubleTap
     /// Returns number of bytes written (multiple of 40).
     get-events: func(out-ptr: u32, max-bytes: u32) -> u32;
+
+    record input-event {
+        name: string,
+        kind: u32,
+        payload: option<string>,  // JSON or simple space-separated for now
+    }
 }
 
 interface camera {
