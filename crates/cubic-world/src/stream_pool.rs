@@ -637,7 +637,10 @@ mod tests {
             "placing into a known_empty chunk should materialize it, not no-op"
         );
         assert!(!stream.known_empty.contains(&pos));
-        let chunk = stream.chunks().get(&pos).expect("chunk should be materialized");
+        let chunk = stream
+            .chunks()
+            .get(&pos)
+            .expect("chunk should be materialized");
         assert_eq!(chunk.get(ChunkLocalPos::new(2, 0, 2)), stone);
         assert!(stream.remesh_queue.contains(&pos));
     }
@@ -660,7 +663,10 @@ mod tests {
             placed,
             "placing into a never-generated chunk should materialize it, not no-op"
         );
-        let chunk = stream.chunks().get(&pos).expect("chunk should be materialized");
+        let chunk = stream
+            .chunks()
+            .get(&pos)
+            .expect("chunk should be materialized");
         assert_eq!(chunk.get(ChunkLocalPos::new(2, 2, 2)), stone);
     }
 
