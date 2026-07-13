@@ -57,7 +57,7 @@ impl App {
                         cubic_wasm::push_input_event(cubic_wasm::InputEvent {
                             name: "spectate".to_string(),
                             kind: 0,
-                            payload: [0.0; 3],
+                            payload: String::new(),
                         });
                     }
 

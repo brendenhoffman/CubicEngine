@@ -229,6 +229,30 @@ impl App {
         self.guest.generator = Some(Arc::clone(&wasm_gen) as Arc<dyn WorldGenerator>);
         self.guest.wasm_game = Some(wasm_gen);
 
+        // Collect game command registrations from on_load
+        self.guest.registered_commands.clear();
+        let cmd_regs = cubic_wasm::take_game_command_registrations();
+        let comp_regs = cubic_wasm::take_game_completion_registrations();
+
+        let mut commands: Vec<crate::guest::GameCommand> = cmd_regs
+            .into_iter()
+            .map(|r| crate::guest::GameCommand {
+                name: r.name,
+                usage: r.usage,
+                description: r.desc,
+                command_id: r.id,
+                completions: std::collections::HashMap::new(),
+            })
+            .collect();
+
+        for comp in comp_regs {
+            if let Some(cmd) = commands.iter_mut().find(|c| c.name == comp.command) {
+                cmd.completions.insert(comp.arg_index, comp.values);
+            }
+        }
+
+        self.guest.registered_commands = commands;
+
         // Load textures
         if let Some(backend) = &mut self.backend {
             let unique_paths: HashSet<String> = {
@@ -314,6 +338,7 @@ impl App {
 
         self.region_cache = Some(region_cache);
         self.load_chat_log(&world_dir);
+        self.load_input_history(&world_dir);
     }
 
     /// Advance the guest tick, chunk streaming, mesh upload/remesh, and
@@ -378,6 +403,7 @@ impl App {
             self.camera.position = DVec3::new(cam.x, cam.y, cam.z);
             self.camera.yaw = cam.yaw;
             self.camera.pitch = cam.pitch;
+            self.player_spectating = cam.spectating;
         }
 
         clear_tick_query();

@@ -3,6 +3,7 @@
 //! In-game chat overlay: painter-drawn message history, egui input bar,
 //! and append-only disk log.
 
+use crate::ui::input_bar::INPUT_HISTORY_CAP;
 use crate::App;
 use std::io::Write;
 
@@ -53,29 +54,49 @@ impl ChatMessageKind {
 
 impl App {
     /// Push a message to the in-memory log, reset the fade timer, and
-    /// append to the disk log if a world is loaded.
+    /// append to the disk log if a world is loaded. Splits `text` on
+    /// embedded newlines (e.g. /help's multi-line output) into one entry
+    /// per line: the history panel paints one `ChatMessage` per visual
+    /// line with no-wrap text (see `build_chat_ui`), so a single message
+    /// containing '\n' would render as one long unwrapped line overflowing
+    /// the panel instead of stacking normally. Keeping the disk log one
+    /// physical line per message here too keeps `load_chat_log` (which
+    /// reads it back line-by-line) symmetric with what was written.
     pub(crate) fn push_chat_message(&mut self, text: String, kind: ChatMessageKind) {
         let ts = wall_time_hms();
+        let date = wall_date();
+
+        let mut lines = text.lines().peekable();
+        if lines.peek().is_none() {
+            // text was empty (no lines at all) -- still record one blank entry.
+            self.push_chat_line("", &ts, &date, kind);
+            return;
+        }
+        for line in lines {
+            self.push_chat_line(line, &ts, &date, kind);
+        }
+    }
+
+    fn push_chat_line(&mut self, line: &str, ts: &str, date: &str, kind: ChatMessageKind) {
         if self.chat_messages.len() >= HISTORY_MEMORY {
             self.chat_messages.pop_front();
         }
         self.chat_messages.push_back(ChatMessage {
-            timestamp: ts.clone(),
-            text: text.clone(),
+            timestamp: ts.to_string(),
+            text: line.to_string(),
             kind,
         });
         self.chat_fade_timer = Some(std::time::Instant::now());
 
         if let Some(path) = &self.chat_log_path.clone() {
-            let date = wall_date();
-            let line = format!("[{date} {ts}] {text}\n");
+            let entry = format!("[{date} {ts}] {line}\n");
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
                 .truncate(false)
                 .open(path)
             {
-                let _ = f.write_all(line.as_bytes());
+                let _ = f.write_all(entry.as_bytes());
             }
         }
     }
@@ -84,20 +105,51 @@ impl App {
     /// command mode). Releases cursor grab while chat is open.
     pub(crate) fn open_chat(&mut self, prefill: &str) {
         self.chat_open = true;
-        self.chat_input = prefill.to_string();
+        self.input_bar.text = prefill.to_string();
+        self.input_bar.history_cursor = None;
+        self.input_bar.ghost = None;
+        self.input_bar.popup_open = false;
+        self.input_bar.ctrl_r_mode = false;
+        self.apply_cursor_state();
+    }
+
+    /// Close the chat bar without submitting (Escape) — discards the draft
+    /// and re-locks the cursor, same cleanup `submit_chat` does on its way
+    /// out, just without dispatching anything.
+    pub(crate) fn close_chat(&mut self) {
+        self.input_bar.text.clear();
+        self.input_bar.ghost = None;
+        self.input_bar.popup_open = false;
+        self.input_bar.completions.clear();
+        self.input_bar.history_cursor = None;
+        self.input_bar.ctrl_r_mode = false;
+        self.input_bar.ctrl_r_query.clear();
+        self.chat_open = false;
         self.apply_cursor_state();
     }
 
     /// Submit the current input, dispatch commands or push plain messages,
     /// then close the bar and re-lock the cursor.
     pub(crate) fn submit_chat(&mut self) {
-        let input = self.chat_input.trim().to_string();
-        self.chat_input.clear();
+        let input = self.input_bar.text.trim().to_string();
+        self.input_bar.text.clear();
+        self.input_bar.ghost = None;
+        self.input_bar.popup_open = false;
         self.chat_open = false;
         self.apply_cursor_state();
 
         if input.is_empty() {
             return;
+        }
+
+        self.input_bar.push_history(input.clone());
+        if let Some(path) = self
+            .chat_log_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_owned())
+        {
+            self.save_input_history(&path);
         }
 
         if input.starts_with('/') {
@@ -193,7 +245,15 @@ impl App {
             }
         }
 
-        // --- Input bar ---
+        // ctrl-r uses a separate buffer so the TextEdit
+        // doesn't write into self.input_bar.text while searching.
+        let mut ctrl_r_buf = if self.input_bar.ctrl_r_mode {
+            self.input_bar.ctrl_r_query.clone()
+        } else {
+            String::new()
+        };
+
+        // Input bar
         if self.chat_open {
             let bar_rect = egui::Rect::from_min_size(
                 egui::pos2(margin, screen.max.y - margin - input_height),
@@ -208,8 +268,17 @@ impl App {
                 egui::Color32::WHITE,
             );
 
-            // TextEdit in a transparent Area — just enough egui for
-            // keyboard routing, visually invisible behind the painter quad.
+            // Paint syntax highlighting, ghost, ctrl-r prompt, popup. Game-
+            // registered commands (e.g. /give) are just as valid as the
+            // built-ins (see commands::dispatch's fallback) and need to be
+            // in this list too, or they'd always paint red as "unknown".
+            let mut known: Vec<&str> = vec!["tp", "set", "help", "locate"];
+            known.extend(self.guest.registered_commands.iter().map(|c| c.name.as_str()));
+            self.input_bar.paint(ctx, &painter, bar_rect, &font, &known);
+
+            // Invisible TextEdit for keyboard routing only --
+            // in ctrl-r mode it targets ctrl_r_buf instead of text so
+            // typed characters feed the search query, not the command.
             egui::Area::new(egui::Id::new("chat_input_area"))
                 .fixed_pos(egui::pos2(bar_rect.min.x + 6.0, bar_rect.min.y + 3.0))
                 .order(egui::Order::Foreground)
@@ -217,21 +286,75 @@ impl App {
                     ui.style_mut().visuals.extreme_bg_color = egui::Color32::TRANSPARENT;
                     ui.style_mut().visuals.widgets.inactive.bg_fill = egui::Color32::TRANSPARENT;
                     ui.style_mut().visuals.widgets.active.bg_fill = egui::Color32::TRANSPARENT;
-                    ui.style_mut().visuals.override_text_color = Some(egui::Color32::WHITE);
+                    // Transparent text -- painter draws the visible text
+                    ui.style_mut().visuals.override_text_color = Some(egui::Color32::TRANSPARENT);
 
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.chat_input)
-                            .desired_width(bar_rect.width() - 12.0)
-                            .frame(egui::Frame::NONE)
-                            .font(font),
-                    );
+                    let edit_target = if self.input_bar.ctrl_r_mode {
+                        &mut ctrl_r_buf
+                    } else {
+                        &mut self.input_bar.text
+                    };
 
-                    if !resp.has_focus() {
-                        resp.request_focus();
+                    let mut output = egui::TextEdit::singleline(edit_target)
+                        .desired_width(bar_rect.width() - 12.0)
+                        .frame(egui::Frame::NONE)
+                        .font(font.clone())
+                        .show(ui);
+
+                    if !output.response.has_focus() {
+                        output.response.request_focus();
                     }
 
-                    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    // Force cursor to end after history navigation or tab complete
+                    if self.input_bar.force_cursor_end {
+                        self.input_bar.force_cursor_end = false;
+                        let len = self.input_bar.text.chars().count();
+                        let cursor = egui::text::CCursor::new(len);
+                        let cursor_range = egui::text::CCursorRange::one(cursor);
+                        output.state.cursor.set_char_range(Some(cursor_range));
+                        output.state.store(ui.ctx(), output.response.id);
+                    }
+
+                    if output.response.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
                         self.chat_submit_pending = true;
+                    }
+
+                    if self.input_bar.ctrl_r_mode {
+                        // Sync query back and apply search on every change
+                        if output.response.changed() {
+                            self.input_bar.ctrl_r_query = ctrl_r_buf.clone();
+                            self.input_bar.ctrl_r_apply();
+                        }
+                    } else {
+                        // Normal mode: update ghost and auto-completions
+                        self.input_bar.update_ghost();
+
+                        if output.response.changed() && self.input_bar.text.starts_with('/') {
+                            let cur = self.input_bar.text.len();
+                            let text = self.input_bar.text.clone();
+                            let candidates = crate::commands::completions(self, &text, cur);
+                            if !candidates.is_empty() {
+                                self.input_bar.completions = candidates;
+                                if self.input_bar.completions.len() > 1 {
+                                    self.input_bar.popup_open = true;
+                                }
+                                if self.input_bar.completion_cursor
+                                    >= self.input_bar.completions.len()
+                                {
+                                    self.input_bar.completion_cursor = 0;
+                                }
+                            } else {
+                                self.input_bar.popup_open = false;
+                                self.input_bar.completions.clear();
+                            }
+                        }
+
+                        // Clear completions if text no longer starts with /
+                        if output.response.changed() && !self.input_bar.text.starts_with('/') {
+                            self.input_bar.popup_open = false;
+                            self.input_bar.completions.clear();
+                        }
                     }
                 });
         }
@@ -276,6 +399,28 @@ impl App {
                 kind: ChatMessageKind::Chat,
             });
         }
+    }
+
+    pub(crate) fn load_input_history(&mut self, world_dir: &std::path::Path) {
+        let path = world_dir.join("input_history.txt");
+        self.input_bar.history.clear();
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        for line in content.lines().take(INPUT_HISTORY_CAP) {
+            self.input_bar.history.push_back(line.to_string());
+        }
+    }
+
+    pub(crate) fn save_input_history(&self, world_dir: &std::path::Path) {
+        let path = world_dir.join("input_history.txt");
+        let content: String = self
+            .input_bar
+            .history
+            .iter()
+            .map(|h| format!("{h}\n"))
+            .collect();
+        let _ = std::fs::write(&path, content);
     }
 }
 

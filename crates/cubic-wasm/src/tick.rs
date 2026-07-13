@@ -85,6 +85,7 @@ pub struct CameraUpdate {
     pub z: f64,
     pub yaw: f32,
     pub pitch: f32,
+    pub spectating: bool,
 }
 
 thread_local! {
@@ -206,7 +207,7 @@ pub struct InputEvent {
     pub kind: u32,
     /// f64 since this can carry an absolute world position (e.g. /tp's
     /// teleport target) — see the f64-world-coordinates card.
-    pub payload: [f64; 3],
+    pub payload: String,
 }
 
 thread_local! {
@@ -220,6 +221,73 @@ pub fn push_input_event(event: InputEvent) {
 
 pub fn take_input_events() -> Vec<InputEvent> {
     INPUT_EVENTS.with(|q| std::mem::take(&mut *q.borrow_mut()))
+}
+
+// ---------------------------------------------------------------------------
+// Command dispatch channel
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static PENDING_COMMAND: RefCell<Option<(u32, Vec<String>)>> =
+        const { RefCell::new(None) };
+    static COMMAND_RESULT: RefCell<Option<String>> =
+        const { RefCell::new(None) };
+}
+
+pub fn set_pending_command(id: u32, args: Vec<String>) {
+    PENDING_COMMAND.with(|c| *c.borrow_mut() = Some((id, args)));
+}
+
+pub fn take_pending_command() -> Option<(u32, Vec<String>)> {
+    PENDING_COMMAND.with(|c| c.borrow_mut().take())
+}
+
+pub fn set_command_result(result: String) {
+    COMMAND_RESULT.with(|c| *c.borrow_mut() = Some(result));
+}
+
+pub fn take_command_result() -> Option<String> {
+    COMMAND_RESULT.with(|c| c.borrow_mut().take())
+}
+
+// ---------------------------------------------------------------------------
+// Game command registration (populated during on_load)
+// ---------------------------------------------------------------------------
+
+pub struct GameCommandRegistration {
+    pub name: String,
+    pub usage: String,
+    pub desc: String,
+    pub id: u32,
+}
+
+pub struct GameCompletionRegistration {
+    pub command: String,
+    pub arg_index: u32,
+    pub values: Vec<String>,
+}
+
+thread_local! {
+    static GAME_COMMAND_REGS: RefCell<Vec<GameCommandRegistration>> =
+        const { RefCell::new(Vec::new()) };
+    static GAME_COMPLETION_REGS: RefCell<Vec<GameCompletionRegistration>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+pub fn push_game_command_registration(reg: GameCommandRegistration) {
+    GAME_COMMAND_REGS.with(|r| r.borrow_mut().push(reg));
+}
+
+pub fn push_game_completion_registration(reg: GameCompletionRegistration) {
+    GAME_COMPLETION_REGS.with(|r| r.borrow_mut().push(reg));
+}
+
+pub fn take_game_command_registrations() -> Vec<GameCommandRegistration> {
+    GAME_COMMAND_REGS.with(|r| std::mem::take(&mut *r.borrow_mut()))
+}
+
+pub fn take_game_completion_registrations() -> Vec<GameCompletionRegistration> {
+    GAME_COMPLETION_REGS.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
 // ---------------------------------------------------------------------------

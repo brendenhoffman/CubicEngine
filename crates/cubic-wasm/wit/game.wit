@@ -128,24 +128,58 @@ interface input {
     get-input: func(out-ptr: u32) -> u32;
 
     /// Writes discrete input events that occurred this tick into out-ptr.
-    /// Each event is 64 bytes: [name: u8[32] (null-padded), kind: u32,
-    /// _pad: u32, payload: f64[3]]. kind: 0=Pressed, 1=Released, 2=DoubleTap.
-    /// payload is f64 (not f32) since it can carry an absolute world
-    /// position (e.g. /tp's teleport target) — see the f64-world-coordinates
-    /// card. Returns number of bytes written (multiple of 64).
+    /// Each entry is variably sized and 8-byte aligned: [name: u8[32]
+    /// (null-padded), kind: u32, payload-len: u16, payload: u8[payload-len],
+    /// pad to next multiple of 8]. kind: 0=Pressed, 1=Released, 2=DoubleTap.
+    /// payload is a UTF-8 string (space-separated numbers for positional
+    /// data like /tp's teleport target, empty when unused) rather than a
+    /// fixed-size type, so an event can carry whatever shape of data its
+    /// name implies without growing every other event's stride. Returns
+    /// number of bytes written.
     get-events: func(out-ptr: u32, max-bytes: u32) -> u32;
 
     record input-event {
         name: string,
         kind: u32,
-        payload: option<string>,  // JSON or simple space-separated for now
+        payload: string,
     }
+}
+
+interface commands {
+    /// Called by the guest during on-load to register a command.
+    /// Returns a command-id the guest passes back in on-command.
+    register-command: func(name-ptr: u32, name-len: u32,
+                           usage-ptr: u32, usage-len: u32,
+                           desc-ptr: u32, desc-len: u32) -> u32;
+
+    /// Register completion values for a command argument position.
+    register-completion: func(cmd-ptr: u32, cmd-len: u32,
+                              arg-index: u32,
+                              vals-ptr: u32, vals-len: u32,
+                              val-stride: u32);
+
+    /// Host provides: read the pending command's args. Returns bytes written.
+    get-command-args: func(out-ptr: u32, max-bytes: u32) -> u32;
+
+    /// Guest calls: write the command result string.
+    set-command-result: func(ptr: u32, len: u32);
+}
+
+interface command-dispatch {
+    /// Called by the host when a game-registered command (see
+    /// commands.register-command) is invoked. The guest reads args via
+    /// commands.get-command-args and writes its response via
+    /// commands.set-command-result before returning. This is a separate
+    /// exported interface from `commands` (which the guest calls *into*
+    /// the host) since a single interface can't mix directions within one
+    /// `world` import/export declaration.
+    on-command: func(command-id: u32);
 }
 
 interface camera {
     // x/y/z are f64 absolute world position (see the physics interface's
     // comment for why); yaw/pitch stay f32 (orientation, not position).
-    set-camera: func(x: f64, y: f64, z: f64, yaw: f32, pitch: f32);
+    set-camera: func(x: f64, y: f64, z: f64, yaw: f32, pitch: f32, spectating: u32);
 
     /// Player feet position (pos, not eye) — tracked separately from the
     /// camera since third-person orbit moves the camera away from the
@@ -169,10 +203,12 @@ interface render {
 world game {
     export world-gen;
     export tick;
+    export command-dispatch;
     import block-registry;
     import data;
     import physics;
     import input;
     import camera;
     import render;
+    import commands;
 }

@@ -374,7 +374,7 @@ impl Player {
             let eye = self.eye_pos();
             (eye[0], eye[1], eye[2], self.yaw, self.pitch)
         };
-        camera::set_camera(cx, cy, cz, cyaw, cpitch);
+        camera::set_camera(cx, cy, cz, cyaw, cpitch, 0);
 
         // Feet position, tracked separately from the camera — third-person
         // orbit moves the camera away from the player, so diagnostics need
@@ -437,6 +437,7 @@ impl Player {
             self.spectator_pos[2],
             self.yaw,
             self.pitch,
+            1,
         );
         // Report the spectator's own position here, not the frozen player
         // — while spectating, "where am I" (for diagnostics) means the free

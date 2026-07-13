@@ -4,10 +4,13 @@
 pub mod tick;
 pub use tick::{
     call_load_mesh, call_load_tex, clear_tick_query, get_player_feet, get_tick_input,
-    push_block_edit, push_draw_request, push_input_event, set_camera_update, set_load_fns,
-    set_player_feet, set_tick_input, set_tick_query, take_block_edits, take_camera_update,
-    take_draw_queue, take_input_events, with_chunk_query, BlockEditRequest, CameraUpdate,
-    DrawRequest, InputEvent, InputSnapshot, PlayerFeet,
+    push_block_edit, push_draw_request, push_game_command_registration,
+    push_game_completion_registration, push_input_event, set_camera_update, set_command_result,
+    set_load_fns, set_pending_command, set_player_feet, set_tick_input, set_tick_query,
+    take_block_edits, take_camera_update, take_command_result, take_draw_queue,
+    take_game_command_registrations, take_game_completion_registrations, take_input_events,
+    take_pending_command, with_chunk_query, BlockEditRequest, CameraUpdate, DrawRequest,
+    GameCommandRegistration, GameCompletionRegistration, InputEvent, InputSnapshot, PlayerFeet,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -41,7 +44,9 @@ const IMPORT_PHYSICS_MODULE: &str = "cubic:game/physics@0.1.0";
 const IMPORT_INPUT_MODULE: &str = "cubic:game/input@0.1.0";
 const IMPORT_CAMERA_MODULE: &str = "cubic:game/camera@0.1.0";
 const EXPORT_ON_TICK: &str = "cubic:game/tick@0.1.0#on-tick";
+const EXPORT_ON_COMMAND: &str = "cubic:game/command-dispatch@0.1.0#on-command";
 const IMPORT_RENDER_MODULE: &str = "cubic:game/render@0.1.0";
+const IMPORT_COMMANDS_MODULE: &str = "cubic:game/commands@0.1.0";
 
 // ---------------------------------------------------------------------------
 // Memory layout
@@ -154,6 +159,9 @@ struct WasmInstance {
     // None until cubic-game implements the `tick` interface's `on-tick`
     // export — tick() is a no-op until then.
     fn_on_tick: Option<TypedFunc<f32, ()>>,
+    // None until cubic-game implements the `command-dispatch` interface's
+    // `on-command` export — on_command() is a no-op until then.
+    fn_on_command: Option<TypedFunc<u32, ()>>,
     generator_handle: u32,
 }
 
@@ -434,20 +442,36 @@ impl WasmInstance {
                 let mut written = 0usize;
                 let base = out_ptr as usize;
                 for event in &events {
-                    if written + 64 > max_bytes as usize {
+                    let payload_bytes = event.payload.as_bytes();
+                    let payload_len = payload_bytes.len().min(254) as u16;
+                    // Entry: [name: 32][kind: u32][payload_len: u16][payload: payload_len][pad to 8-byte align]
+                    let entry_size = {
+                        let raw = 32 + 4 + 2 + payload_len as usize;
+                        // Round up to next multiple of 8
+                        (raw + 7) & !7
+                    };
+                    if written + entry_size > max_bytes as usize {
                         break;
                     }
-                    let slot = &mut data[base + written..base + written + 64];
-                    slot[..64].fill(0);
+                    // Zero the whole entry first
+                    data[base + written..base + written + entry_size].fill(0);
+                    // Name (null-terminated, 32 bytes)
                     let name_bytes = event.name.as_bytes();
                     let name_len = name_bytes.len().min(31);
-                    slot[..name_len].copy_from_slice(&name_bytes[..name_len]);
-                    slot[32..36].copy_from_slice(&event.kind.to_le_bytes());
-                    // slot[36..40] padding, already zeroed
-                    slot[40..48].copy_from_slice(&event.payload[0].to_le_bytes());
-                    slot[48..56].copy_from_slice(&event.payload[1].to_le_bytes());
-                    slot[56..64].copy_from_slice(&event.payload[2].to_le_bytes());
-                    written += 64;
+                    data[base + written..base + written + name_len]
+                        .copy_from_slice(&name_bytes[..name_len]);
+                    // Kind
+                    data[base + written + 32..base + written + 36]
+                        .copy_from_slice(&event.kind.to_le_bytes());
+                    // Payload length
+                    data[base + written + 36..base + written + 38]
+                        .copy_from_slice(&payload_len.to_le_bytes());
+                    // Payload
+                    if payload_len > 0 {
+                        data[base + written + 38..base + written + 38 + payload_len as usize]
+                            .copy_from_slice(&payload_bytes[..payload_len as usize]);
+                    }
+                    written += entry_size;
                 }
                 written as i32
             },
@@ -463,13 +487,16 @@ impl WasmInstance {
              y: f64,
              z: f64,
              yaw: f32,
-             pitch: f32| {
+             pitch: f32,
+             spectating: i32| {
+                // ← new param
                 set_camera_update(CameraUpdate {
                     x,
                     y,
                     z,
                     yaw,
                     pitch,
+                    spectating: spectating != 0,
                 });
             },
         )?;
@@ -539,6 +566,138 @@ impl WasmInstance {
             },
         )?;
 
+        // --- commands ---
+
+        // Next command ID counter, shared across all instances via thread-local
+        thread_local! {
+            static NEXT_COMMAND_ID: std::cell::Cell<u32> = const { std::cell::Cell::new(1) };
+        }
+
+        linker.func_wrap(
+            IMPORT_COMMANDS_MODULE,
+            "register-command",
+            |mut caller: wasmtime::Caller<'_, HostState>,
+             name_ptr: i32,
+             name_len: i32,
+             usage_ptr: i32,
+             usage_len: i32,
+             desc_ptr: i32,
+             desc_len: i32|
+             -> i32 {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+                let read_str = |data: &[u8], ptr: i32, len: i32| {
+                    std::str::from_utf8(&data[ptr as usize..(ptr + len) as usize])
+                        .unwrap_or("")
+                        .to_owned()
+                };
+                let (name, usage, desc) = {
+                    let data = mem.data(&caller);
+                    (
+                        read_str(data, name_ptr, name_len),
+                        read_str(data, usage_ptr, usage_len),
+                        read_str(data, desc_ptr, desc_len),
+                    )
+                };
+                let id = NEXT_COMMAND_ID.with(|c| {
+                    let id = c.get();
+                    c.set(id + 1);
+                    id
+                });
+                push_game_command_registration(GameCommandRegistration {
+                    name,
+                    usage,
+                    desc,
+                    id,
+                });
+                id as i32
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_COMMANDS_MODULE,
+            "register-completion",
+            |mut caller: wasmtime::Caller<'_, HostState>,
+             cmd_ptr: i32,
+             cmd_len: i32,
+             arg_index: i32,
+             vals_ptr: i32,
+             vals_len: i32,
+             val_stride: i32| {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+                let data = mem.data(&caller);
+                let cmd =
+                    std::str::from_utf8(&data[cmd_ptr as usize..(cmd_ptr + cmd_len) as usize])
+                        .unwrap_or("")
+                        .to_owned();
+                let mut values = Vec::new();
+                let base = vals_ptr as usize;
+                let count = vals_len as usize;
+                let stride = val_stride as usize;
+                for i in 0..count {
+                    let s = &data[base + i * stride..base + i * stride + stride];
+                    let end = s.iter().position(|&b| b == 0).unwrap_or(stride);
+                    if let Ok(v) = std::str::from_utf8(&s[..end]) {
+                        values.push(v.to_owned());
+                    }
+                }
+                push_game_completion_registration(GameCompletionRegistration {
+                    command: cmd,
+                    arg_index: arg_index as u32,
+                    values,
+                });
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_COMMANDS_MODULE,
+            "get-command-args",
+            |mut caller: wasmtime::Caller<'_, HostState>, out_ptr: i32, max_bytes: i32| -> i32 {
+                let args = take_pending_command()
+                    .map(|(_, args)| args)
+                    .unwrap_or_default();
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+                let data = mem.data_mut(&mut caller);
+                let base = out_ptr as usize;
+                let mut written = 0usize;
+                for arg in &args {
+                    let bytes = arg.as_bytes();
+                    let len = bytes.len();
+                    if written + len + 1 > max_bytes as usize {
+                        break;
+                    }
+                    data[base + written..base + written + len].copy_from_slice(bytes);
+                    data[base + written + len] = 0; // null separator
+                    written += len + 1;
+                }
+                written as i32
+            },
+        )?;
+
+        linker.func_wrap(
+            IMPORT_COMMANDS_MODULE,
+            "set-command-result",
+            |mut caller: wasmtime::Caller<'_, HostState>, ptr: i32, len: i32| {
+                let mem = caller
+                    .get_export("memory")
+                    .and_then(|e| e.into_memory())
+                    .expect("guest has no memory export");
+                let data = mem.data(&caller);
+                let s = std::str::from_utf8(&data[ptr as usize..(ptr + len) as usize])
+                    .unwrap_or("")
+                    .to_owned();
+                set_command_result(s);
+            },
+        )?;
+
         // --- instantiate and get exports ---
 
         let instance = linker.instantiate(&mut store, module)?;
@@ -568,6 +727,10 @@ impl WasmInstance {
             .get_typed_func::<f32, ()>(&mut store, EXPORT_ON_TICK)
             .ok();
 
+        let fn_on_command = instance
+            .get_typed_func::<u32, ()>(&mut store, EXPORT_ON_COMMAND)
+            .ok();
+
         let generator_handle = fn_on_load.call(&mut store, seed)?;
         tracing::info!("WASM guest on_load complete, generator_handle={generator_handle}");
 
@@ -577,6 +740,7 @@ impl WasmInstance {
             fn_generate,
             fn_is_definitely_air,
             fn_on_tick,
+            fn_on_command,
             generator_handle,
         })
     }
@@ -618,6 +782,15 @@ impl WasmInstance {
             }
         }
         chunk
+    }
+
+    fn on_command(&mut self, command_id: u32, args: Vec<String>) -> Result<String> {
+        let Some(f) = &self.fn_on_command else {
+            return Ok(String::new());
+        };
+        set_pending_command(command_id, args);
+        f.call(&mut self.store, command_id)?;
+        Ok(take_command_result().unwrap_or_default())
     }
 }
 
@@ -746,6 +919,17 @@ impl WasmWorldGenerator {
                 let _ = instance.tick(dt);
             }
         });
+    }
+
+    pub fn on_command(&self, command_id: u32, args: Vec<String>) -> String {
+        WASM_INSTANCE.with(|cell| {
+            let mut opt = cell.borrow_mut();
+            if let Some(instance) = opt.as_mut() {
+                instance.on_command(command_id, args).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        })
     }
 }
 

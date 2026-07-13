@@ -28,7 +28,7 @@ use cubic_platform::winit::{
     dpi::PhysicalSize,
     event::{DeviceEvent, DeviceId, ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{KeyCode, PhysicalKey},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     raw_window_handle::{HasDisplayHandle, HasWindowHandle},
     window::{CursorGrabMode, Window, WindowId},
 };
@@ -141,6 +141,12 @@ struct App {
     world: world::WorldRenderer,
     camera: Camera,
     input: InputState,
+    // Tracked from WindowEvent::ModifiersChanged rather than InputState's
+    // held-key tracking, which is deliberately suppressed while chat has
+    // focus (see window_event's chat-input block) — a Ctrl-R detection
+    // that relied on InputState would see Ctrl as never-held, since its
+    // own key-down event never reaches set_source while chat is open.
+    modifiers: ModifiersState,
     last_frame_instant: std::time::Instant,
     last_frame_dt: f32,
     detected_refresh_hz: f32,
@@ -157,11 +163,12 @@ struct App {
 
     // Chat
     chat_open: bool,
-    chat_input: String,
+    input_bar: ui::input_bar::CommandInputBar,
     chat_messages: std::collections::VecDeque<ui::ChatMessage>,
     chat_log_path: Option<std::path::PathBuf>,
     chat_fade_timer: Option<std::time::Instant>,
     chat_submit_pending: bool,
+    player_spectating: bool,
 }
 
 impl ApplicationHandler for App {
@@ -269,6 +276,15 @@ impl ApplicationHandler for App {
             if window_id != window.id() {
                 return;
             }
+        }
+
+        // Tracked unconditionally, before egui or any other branch below can
+        // consume/return early — Ctrl-R detection in the chat input block
+        // needs reliable modifier state even while chat suppresses ordinary
+        // key events from reaching InputState (see `modifiers`'s doc comment
+        // on the App struct).
+        if let WindowEvent::ModifiersChanged(mods) = &event {
+            self.modifiers = mods.state();
         }
 
         // While the Controls tab is capturing a new binding (see
@@ -415,11 +431,117 @@ impl ApplicationHandler for App {
                     && event.state == ElementState::Pressed
                 {
                     if self.chat_open {
-                        if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
-                            self.chat_open = false;
-                            self.chat_input.clear();
-                            self.apply_cursor_state();
+                        if self.input_bar.ctrl_r_mode {
+                            if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
+                                let restore = self.input_bar.draft.clone();
+                                self.input_bar.ctrl_r_cancel(restore);
+                                return;
+                            }
+                            if let PhysicalKey::Code(KeyCode::Enter) = event.physical_key {
+                                self.input_bar.ctrl_r_accept();
+                                return;
+                            }
+                            // Repeated Ctrl-R while already searching cycles
+                            // to the next older match for the same query,
+                            // like bash's reverse-i-search.
+                            if let PhysicalKey::Code(KeyCode::KeyR) = event.physical_key {
+                                if self.modifiers.control_key() {
+                                    self.input_bar.ctrl_r_next();
+                                    return;
+                                }
+                            }
+                            // Deliberately NOT handling Backspace or
+                            // event.text here: this raw event was already
+                            // fed to egui_winit above (unconditionally,
+                            // before this match), so the TextEdit bound to
+                            // ctrl_r_buf in build_chat_ui will process
+                            // typing/backspacing on its own next frame, and
+                            // its "sync back to ctrl_r_query on change"
+                            // logic there is the single source of truth —
+                            // same as normal (non-ctrl-r) mode, which never
+                            // pushes into self.input_bar.text manually
+                            // either. Doing it here too double-applies every
+                            // keystroke (query ends up "tt" from one "t").
                         }
+
+                        // Esc: ctrl-r (above) takes priority when active —
+                        // one press cancels just the search, restoring the
+                        // draft; a second press (now that ctrl_r_mode is
+                        // false) reaches here and closes chat entirely.
+                        if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
+                            self.close_chat();
+                            return;
+                        }
+
+                        match event.physical_key {
+                            PhysicalKey::Code(KeyCode::ArrowUp) => {
+                                if self.input_bar.popup_open {
+                                    self.input_bar.completion_up();
+                                } else if self.input_bar.ctrl_r_mode {
+                                    // no-op in ctrl-r
+                                } else {
+                                    self.input_bar.history_up();
+                                }
+                                return;
+                            }
+                            PhysicalKey::Code(KeyCode::ArrowDown) => {
+                                if self.input_bar.popup_open {
+                                    self.input_bar.completion_down();
+                                } else {
+                                    self.input_bar.history_down();
+                                }
+                                return;
+                            }
+                            PhysicalKey::Code(KeyCode::ArrowRight)
+                            | PhysicalKey::Code(KeyCode::End) => {
+                                if self.input_bar.popup_open {
+                                    self.input_bar.accept_completion();
+                                } else {
+                                    self.input_bar.accept_ghost();
+                                }
+                                return;
+                            }
+                            PhysicalKey::Code(KeyCode::Tab) => {
+                                if self.input_bar.popup_open {
+                                    self.input_bar.accept_completion();
+                                } else {
+                                    let cur = self.input_bar.text.len();
+                                    let candidates = crate::commands::completions(
+                                        self,
+                                        &self.input_bar.text.clone(),
+                                        cur,
+                                    );
+                                    self.input_bar.refresh_completions(candidates);
+                                }
+                                return;
+                            }
+                            _ => {}
+                        }
+
+                        // Ctrl-R. Checked via `self.modifiers` (tracked from
+                        // WindowEvent::ModifiersChanged), not
+                        // InputState::is_held — Ctrl's own key-down event
+                        // never reaches InputState::set_source while chat is
+                        // open (see the early `return`s throughout this
+                        // block), so is_held(ControlLeft/Right) would always
+                        // read stale/false here. Only entered when not
+                        // already searching — ctrl_r_mode's own block above
+                        // handles a held Ctrl during an active search (no
+                        // `event.text` is produced for the Ctrl+R combo
+                        // itself, so it just falls through to here), and
+                        // re-triggering would wipe the in-progress query.
+                        if !self.input_bar.ctrl_r_mode {
+                            if let PhysicalKey::Code(KeyCode::KeyR) = event.physical_key {
+                                if self.modifiers.control_key() {
+                                    self.input_bar.draft = self.input_bar.text.clone();
+                                    self.input_bar.ctrl_r_mode = true;
+                                    self.input_bar.ctrl_r_query.clear();
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Suppress all other keys from reaching the game while chat is open
                         return;
                     }
                     if self.state == AppState::InGame {
@@ -601,7 +723,12 @@ impl ApplicationHandler for App {
         event: DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta } = event {
-            if self.focused && self.state == AppState::InGame {
+            // Raw motion deltas arrive independent of cursor grab (see
+            // apply_cursor_state's should_lock, which already excludes
+            // chat_open for the grab decision) — without also excluding it
+            // here, moving the mouse over the open chat bar still turns the
+            // camera underneath it.
+            if self.focused && self.state == AppState::InGame && !self.chat_open {
                 self.input
                     .accumulate_mouse_delta(delta.0 as f32, delta.1 as f32);
             }
@@ -918,6 +1045,7 @@ fn main() -> Result<()> {
             ..Camera::default()
         },
         input: InputState::default(),
+        modifiers: ModifiersState::empty(),
         last_frame_instant: std::time::Instant::now(),
         last_frame_dt: 0.0,
         detected_refresh_hz: 60.0, // overwritten in resumed()
@@ -929,11 +1057,12 @@ fn main() -> Result<()> {
         region_cache: None,
         autosave_timer: std::time::Instant::now(),
         chat_open: false,
-        chat_input: String::new(),
+        input_bar: ui::input_bar::CommandInputBar::default(),
         chat_messages: std::collections::VecDeque::new(),
         chat_log_path: None,
         chat_fade_timer: None,
         chat_submit_pending: false,
+        player_spectating: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

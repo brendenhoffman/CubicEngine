@@ -20,4 +20,22 @@ pub(crate) struct GuestPlugin {
     // Same generator as `generator`, but concretely typed so on_tick can be
     // called — `Arc<dyn WorldGenerator>` doesn't expose `tick`.
     pub(crate) wasm_game: Option<Arc<WasmWorldGenerator>>,
+    // Commands the guest registered during on_load (see cubic_wasm's
+    // take_game_command_registrations/take_game_completion_registrations) —
+    // rebuilt fresh by load_world() on every launch, same as the other
+    // fields here. Consulted by commands::dispatch for unrecognized
+    // host-side command names and by commands::completions for tab-complete.
+    pub(crate) registered_commands: Vec<GameCommand>,
+}
+
+/// One game-registered command (see the `commands` WIT interface's
+/// register-command/register-completion) — `name` without the leading `/`.
+pub(crate) struct GameCommand {
+    pub(crate) name: String,
+    pub(crate) usage: String,
+    pub(crate) description: String,
+    pub(crate) command_id: u32,
+    // Keyed by zero-based argument position (see register-completion's
+    // arg-index) — completion candidates for that argument slot.
+    pub(crate) completions: std::collections::HashMap<u32, Vec<String>>,
 }

@@ -9,6 +9,7 @@ mod pause;
 pub(crate) use launcher::scan_games;
 pub(crate) mod chat;
 pub(crate) use chat::{ChatMessage, ChatMessageKind};
+pub(crate) mod input_bar;
 
 use crate::{profile, App};
 

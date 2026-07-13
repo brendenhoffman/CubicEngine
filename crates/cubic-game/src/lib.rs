@@ -8,6 +8,7 @@ wit_bindgen::generate!({
 mod player;
 
 use cubic::game::block_registry::{FaceDef, register_block_with_faces};
+use cubic::game::commands;
 use exports::cubic::game::world_gen::Guest;
 use noise::{NoiseFn, OpenSimplex};
 use player::{EYE_HEIGHT, InputState, Player};
@@ -179,6 +180,13 @@ fn generator() -> &'static NoiseGenerator {
         .expect("generator not initialized — on_load not called")
 }
 
+static GIVE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Block name -> registered id, persisted from on_load's local scan so
+/// on_command (which runs later, per-invocation) can resolve a /give
+/// argument like "stone" back to a BlockTypeId.
+static BLOCK_IDS: OnceLock<HashMap<String, u32>> = OnceLock::new();
+
 // ---------------------------------------------------------------------------
 // Constants — must match cubic-world
 // ---------------------------------------------------------------------------
@@ -214,6 +222,54 @@ fn voxel_center(min_corner: [f64; 3]) -> [f64; 3] {
         min_corner[1] + half_voxel,
         min_corner[2] + half_voxel,
     ]
+}
+
+/// Bytes per entry in the flat completion-values buffer `commands.
+/// register-completion` expects — see that WIT function's doc comment:
+/// `vals-len` values, each a null-padded `val-stride`-byte slot.
+const COMPLETION_STRIDE: usize = 32;
+
+/// Register `names` as the completion candidates for /give's first
+/// (block-name) argument.
+fn register_completions_for_give(names: &[&str]) {
+    let mut buf = vec![0u8; names.len() * COMPLETION_STRIDE];
+    for (i, name) in names.iter().enumerate() {
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(COMPLETION_STRIDE - 1);
+        let start = i * COMPLETION_STRIDE;
+        buf[start..start + len].copy_from_slice(&bytes[..len]);
+        // Remaining bytes in this slot (including the rest of `buf`'s
+        // initial zero-fill) are already the null padding register-completion
+        // expects.
+    }
+    let cmd = "give";
+    commands::register_completion(
+        cmd.as_ptr() as u32,
+        cmd.len() as u32,
+        0, // arg-index: /give's first argument
+        buf.as_ptr() as u32,
+        names.len() as u32,
+        COMPLETION_STRIDE as u32,
+    );
+}
+
+/// `/give <block>` — sets the player's selected block (what break/place's
+/// "place" action uses) to the named block type.
+fn cmd_give(args: &[&str]) -> String {
+    let Some(name) = args.first() else {
+        return "Usage: /give <block>".to_string();
+    };
+    let Some(ids) = BLOCK_IDS.get() else {
+        return "Block registry not ready".to_string();
+    };
+    let Some(&id) = ids.get(*name) else {
+        return format!("Unknown block '{name}'");
+    };
+    let Some(player_cell) = PLAYER.get() else {
+        return "Player not ready".to_string();
+    };
+    player_cell.0.borrow_mut().selected_block = id;
+    format!("Selected block set to {name}")
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +311,31 @@ impl Guest for GamePlugin {
                 block_ids.insert(name, id);
             }
         }
+
+        // Persist the name -> id map (built above while scanning blocks/)
+        // for on_command to resolve /give's block-name argument later --
+        // on_load only runs once, but on_command runs per-invocation.
+        BLOCK_IDS
+            .set(block_ids.clone())
+            .unwrap_or_else(|_| panic!("on_load called twice"));
+
+        // Register /give command
+        let name = "give";
+        let usage = "/give <block>";
+        let desc = "Set your selected block";
+        let give_id = commands::register_command(
+            name.as_ptr() as u32,
+            name.len() as u32,
+            usage.as_ptr() as u32,
+            usage.len() as u32,
+            desc.as_ptr() as u32,
+            desc.len() as u32,
+        );
+        GIVE_ID.store(give_id, std::sync::atomic::Ordering::Relaxed);
+
+        // Register block name completions for /give arg 0
+        let names: Vec<&str> = block_ids.keys().map(|s| s.as_str()).collect();
+        register_completions_for_give(&names);
 
         // Read terrain config from datapack
         let mut buf = vec![0u8; 65536];
@@ -404,8 +485,8 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
             sprint_multiplier: f32::from_le_bytes(buf[48..52].try_into().unwrap()),
         };
 
-        // Read discrete events — up to 64 events * 64 bytes = 4096 bytes
-        let mut evt_buf = [0u8; 4096];
+        // Buffer: 64 events × max entry size ~300 bytes
+        let mut evt_buf = [0u8; 19200];
         let evt_bytes =
             cubic::game::input::get_events(evt_buf.as_mut_ptr() as u32, evt_buf.len() as u32)
                 as usize;
@@ -429,33 +510,67 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
             // toggle-style actions. kind==1 (Released) is still delivered
             // for cases that do care, like "sprint" below.
             let mut i = 0;
-            while i + 64 <= evt_bytes {
+            while i < evt_bytes {
+                if i + 38 > evt_bytes {
+                    break;
+                }
                 let name_bytes = &evt_buf[i..i + 32];
                 let name = std::str::from_utf8(name_bytes)
                     .unwrap_or("")
                     .trim_end_matches('\0');
                 let kind = u32::from_le_bytes(evt_buf[i + 32..i + 36].try_into().unwrap());
-                // i+36..i+40 padding
-                let px = f64::from_le_bytes(evt_buf[i + 40..i + 48].try_into().unwrap());
-                let py = f64::from_le_bytes(evt_buf[i + 48..i + 56].try_into().unwrap());
-                let pz = f64::from_le_bytes(evt_buf[i + 56..i + 64].try_into().unwrap());
+                let payload_len =
+                    u16::from_le_bytes(evt_buf[i + 36..i + 38].try_into().unwrap()) as usize;
+                let payload = if payload_len > 0 && i + 38 + payload_len <= evt_bytes {
+                    std::str::from_utf8(&evt_buf[i + 38..i + 38 + payload_len]).unwrap_or("")
+                } else {
+                    ""
+                };
+                // Advance by padded entry size
+                let raw = 32 + 4 + 2 + payload_len;
+                let entry_size = (raw + 7) & !7;
+                i += entry_size;
+
                 match name {
                     "teleport" if kind != 1 => {
-                        player.pos = [px, py - EYE_HEIGHT as f64, pz];
-                        player.vel = [0.0; 3];
-                        player.grounded = false;
+                        let coords: Vec<f64> = payload
+                            .split_whitespace()
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        if coords.len() == 3 {
+                            player.pos = [coords[0], coords[1] - EYE_HEIGHT as f64, coords[2]];
+                            player.vel = [0.0; 3];
+                            player.grounded = false;
+                        }
+                    }
+                    "teleport_spectator" if kind != 1 => {
+                        let coords: Vec<f64> = payload
+                            .split_whitespace()
+                            .filter_map(|s| s.parse().ok())
+                            .collect();
+                        if coords.len() == 3 {
+                            player.spectator_pos = [coords[0], coords[1], coords[2]];
+                        }
                     }
                     "fly" if kind != 1 => {
                         player.flying = !player.flying;
                         player.vel[1] = 0.0;
                     }
                     "spectate" if kind != 1 => {
-                        // Initialize spectator_pos to the current eye on
-                        // the ON transition only, so re-entering
-                        // spectate later doesn't snap the camera back to
-                        // a stale position.
                         if !player.spectating {
-                            player.spectator_pos = player.eye_pos();
+                            if !payload.is_empty() {
+                                let coords: Vec<f64> = payload
+                                    .split_whitespace()
+                                    .filter_map(|s| s.parse().ok())
+                                    .collect();
+                                if coords.len() == 3 {
+                                    player.spectator_pos = [coords[0], coords[1], coords[2]];
+                                } else {
+                                    player.spectator_pos = player.eye_pos();
+                                }
+                            } else {
+                                player.spectator_pos = player.eye_pos();
+                            }
                         }
                         player.spectating = !player.spectating;
                     }
@@ -478,7 +593,11 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
                     "pick_block" if kind != 1 => block_action = Some(BlockAction::Pick),
                     _ => {}
                 }
-                i += 64;
+                // `i` was already advanced by entry_size above -- this
+                // event's actual (padded) size, not a fixed stride. A
+                // second, unconditional `i += 64` here used to double-skip
+                // every iteration, corrupting any tick with more than one
+                // input event.
             }
 
             player.tick(dt, &input_state);
@@ -534,6 +653,30 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
                 );
             }
         }
+    }
+}
+
+impl exports::cubic::game::command_dispatch::Guest for GamePlugin {
+    fn on_command(command_id: u32) {
+        let give_id = GIVE_ID.load(std::sync::atomic::Ordering::Relaxed);
+
+        let mut arg_buf = [0u8; 1024];
+        let args_len =
+            commands::get_command_args(arg_buf.as_mut_ptr() as u32, arg_buf.len() as u32) as usize;
+
+        let args: Vec<&str> = arg_buf[..args_len]
+            .split(|&b| b == 0)
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let result = if command_id == give_id {
+            cmd_give(&args)
+        } else {
+            String::new()
+        };
+
+        commands::set_command_result(result.as_ptr() as u32, result.len() as u32);
     }
 }
 
