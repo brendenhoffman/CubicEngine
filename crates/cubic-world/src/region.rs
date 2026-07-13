@@ -506,6 +506,23 @@ impl RegionFile {
         Ok(Some(deserialize_diff(&buf)?))
     }
 
+    /// Cheap existence check: does this chunk have a saved (non-tombstoned)
+    /// diff? Reads only the XZ entry and Y index — never the diff payload
+    /// itself, unlike `read_chunk` — so it's safe to call from a per-frame
+    /// streaming loop for chunks a generator's `is_definitely_air` heuristic
+    /// would otherwise skip outright (that heuristic knows nothing about
+    /// player edits). For a virgin/empty column (the common case) this is a
+    /// single small read of the XZ table with no further I/O at all, since
+    /// `read_y_index` short-circuits when `col_offset == 0 && col_len == 0`.
+    pub fn has_chunk(&mut self, chunk_x: i32, chunk_y: i32, chunk_z: i32) -> Result<bool> {
+        let slot = xz_slot(chunk_x, chunk_z);
+        let (col_offset, col_len) = self.read_xz_entry(slot)?;
+        let y_index = self.read_y_index(col_offset, col_len)?;
+        Ok(y_index
+            .iter()
+            .any(|e| e.chunk_y == chunk_y as i16 && e.is_live()))
+    }
+
     /// Write a diff for a chunk. Appends payload data then rewrites the Y index.
     pub fn write_chunk(
         &mut self,
@@ -739,5 +756,70 @@ impl RegionCache {
     pub fn remove_chunk(&mut self, chunk_x: i32, chunk_y: i32, chunk_z: i32) -> anyhow::Result<()> {
         self.get_or_open(chunk_x, chunk_z)?
             .remove_chunk(chunk_x, chunk_y, chunk_z)
+    }
+
+    pub fn has_chunk(&mut self, chunk_x: i32, chunk_y: i32, chunk_z: i32) -> anyhow::Result<bool> {
+        self.get_or_open(chunk_x, chunk_z)?
+            .has_chunk(chunk_x, chunk_y, chunk_z)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh, unique scratch directory per test — cleaned up on drop so
+    /// repeated runs don't accumulate files in the OS temp dir.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "cubic_world_region_test_{tag}_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn region_path(&self) -> PathBuf {
+            self.0.join("r.0.0.cbr")
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn has_chunk_false_for_virgin_column() {
+        let dir = TempDir::new("virgin");
+        let mut rf = RegionFile::open(&dir.region_path()).unwrap();
+        // Virgin column: read_y_index should short-circuit on the
+        // zeroed XZ entry without touching the data region at all.
+        assert!(!rf.has_chunk(0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn has_chunk_true_after_write_false_after_remove() {
+        let dir = TempDir::new("roundtrip");
+        let mut rf = RegionFile::open(&dir.region_path()).unwrap();
+        let diff = ChunkDiff::Sparse {
+            entries: vec![],
+            cpd: vec![],
+        };
+        rf.write_chunk(1, 2, 3, &diff).unwrap();
+        assert!(rf.has_chunk(1, 2, 3).unwrap());
+        // A different chunk_y in the same XZ column must stay unaffected.
+        assert!(!rf.has_chunk(1, 4, 3).unwrap());
+
+        rf.remove_chunk(1, 2, 3).unwrap();
+        assert!(
+            !rf.has_chunk(1, 2, 3).unwrap(),
+            "tombstoned chunk should report false"
+        );
     }
 }

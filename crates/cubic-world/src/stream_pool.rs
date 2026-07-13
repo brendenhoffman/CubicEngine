@@ -242,21 +242,34 @@ impl AsyncWorldStream {
             for y in (center.y - ry)..=(center.y + ry) {
                 for z in (center.z - rxz)..=(center.z + rxz) {
                     let pos = ChunkPos { x, y, z };
-                    if !self.inner.chunks.contains_key(&pos)
-                        && !self.in_flight.contains(&pos)
-                        && !self.known_empty.contains(&pos)
-                        && !generator.is_definitely_air(pos)
+                    if self.inner.chunks.contains_key(&pos)
+                        || self.in_flight.contains(&pos)
+                        || self.known_empty.contains(&pos)
                     {
-                        self.in_flight.insert(pos);
-                        // best-effort send — if the channel is full we'll retry next frame
-                        let _ = self.work_tx.send(WorkItem {
-                            pos,
-                            seed,
-                            generator: Arc::clone(generator),
-                            face_textures: Arc::clone(face_textures),
-                            region_cache: self.region_cache.clone(),
-                        });
+                        continue;
                     }
+                    if generator.is_definitely_air(pos) && !self.has_saved_diff(pos) {
+                        // The generator's heuristic is coarse (e.g. "this
+                        // chunk's Y range is entirely above the highest
+                        // possible terrain height") and knows nothing about
+                        // player edits — see set_block_at's doc comment,
+                        // which can materialize exactly this kind of chunk
+                        // on demand when a diff *does* exist. Record it as
+                        // known_empty so every later frame hits the cheap
+                        // in-memory check above instead of repeating this
+                        // (rare, one-time-per-position) disk lookup.
+                        self.known_empty.insert(pos);
+                        continue;
+                    }
+                    self.in_flight.insert(pos);
+                    // best-effort send — if the channel is full we'll retry next frame
+                    let _ = self.work_tx.send(WorkItem {
+                        pos,
+                        seed,
+                        generator: Arc::clone(generator),
+                        face_textures: Arc::clone(face_textures),
+                        region_cache: self.region_cache.clone(),
+                    });
                 }
             }
         }
@@ -342,6 +355,22 @@ impl AsyncWorldStream {
         }
     }
 
+    /// Cheap existence-only region-cache lookup (see
+    /// `RegionFile::has_chunk`), used to override
+    /// `WorldGenerator::is_definitely_air`'s coarse heuristic when a player
+    /// has actually edited a chunk it would otherwise skip. `false` (not
+    /// `true`) on any I/O error or missing region cache — worst case that
+    /// just means trusting the heuristic, same as before this existed.
+    fn has_saved_diff(&self, pos: ChunkPos) -> bool {
+        let Some(cache) = &self.region_cache else {
+            return false;
+        };
+        let Ok(mut cache) = cache.lock() else {
+            return false;
+        };
+        cache.has_chunk(pos.x, pos.y, pos.z).unwrap_or(false)
+    }
+
     /// Delegate to inner stream for neighbor lookups
     pub fn neighbors(&self, pos: ChunkPos) -> [Option<&Chunk>; 6] {
         self.inner.neighbors(pos)
@@ -372,19 +401,55 @@ impl AsyncWorldStream {
     /// RedrawRequested in cubic-app), so callers don't need any separate
     /// "apply this edit's mesh" step.
     ///
-    /// Returns false (no-op) if the containing chunk isn't currently
-    /// materialized — either out of the streamed range, or one whose last
-    /// mesh had zero geometry and so was never stored (see `known_empty`
-    /// on `AsyncWorldStream`; the same "revisit when block removal exists"
-    /// gap the mesher's dirty-chunk comment already flags). In practice
-    /// this only matters for pure-air/fully-buried chunks the player can't
-    /// have raycast a hit into anyway, since a hit implies a real stored
-    /// non-air voxel.
+    /// If the containing chunk isn't materialized, this generates it on
+    /// demand (via `self.generator`, reapplying any saved diff, exactly
+    /// like the async worker's normal generate path) before applying the
+    /// edit. Three different cases land here and all need this:
+    /// - `known_empty`: streamed once, turned out to have zero visible
+    ///   faces (pure air or fully buried solid), and so was discarded
+    ///   rather than stored (see `known_empty`'s doc comment).
+    /// - Skipped by `WorldGenerator::is_definitely_air` in `update()`'s
+    ///   request loop — that check is a coarse, cheap-to-compute bound
+    ///   (e.g. "this chunk's Y range is entirely above the highest
+    ///   possible terrain height"), so a chunk it flags is never even
+    ///   requested, let alone generated. Building straight up past that
+    ///   bound is exactly how a player reaches one of these.
+    /// - Simply never requested yet, e.g. the streaming loop hasn't reached
+    ///   it this frame.
+    ///
+    /// All three are safe to materialize synchronously here: a block edit
+    /// is only ever raycast-bounded to within reach of the player, so it's
+    /// always near the currently active area, and this pays the same
+    /// per-chunk generation cost the async worker would pay anyway, just
+    /// off the worker thread. The one case that must stay a no-op is
+    /// `in_flight` — a worker is already generating this exact chunk, and
+    /// generating a second copy here would race its result, silently
+    /// overwriting this edit when the worker's result lands.
     pub fn set_block_at(&mut self, wx: f64, wy: f64, wz: f64, id: BlockTypeId) -> bool {
         let (cp, lp) = world_to_chunk_local(wx, wy, wz);
-        let Some(chunk) = self.inner.chunks.get_mut(&cp) else {
-            return false;
-        };
+        if !self.inner.chunks.contains_key(&cp) {
+            if self.in_flight.contains(&cp) {
+                return false;
+            }
+            let Some(generator) = &self.generator else {
+                return false;
+            };
+            let mut chunk = generator.generate(cp, self.seed);
+            if let Some(cache) = &self.region_cache {
+                if let Ok(mut cache) = cache.lock() {
+                    if let Ok(Some(diff)) = cache.read_chunk(cp.x, cp.y, cp.z) {
+                        apply_diff(&mut chunk, &diff);
+                    }
+                }
+            }
+            self.known_empty.remove(&cp);
+            self.inner.chunks.insert(cp, chunk);
+        }
+        let chunk = self
+            .inner
+            .chunks
+            .get_mut(&cp)
+            .expect("just materialized or already present above");
         chunk.set(lp, id);
         self.dirty.insert(cp);
         self.remesh_queue.push(cp);
@@ -532,5 +597,160 @@ mod tests {
         assert!(out.contains(&ChunkPos { x: -1, y: 0, z: 0 }));
         assert!(out.contains(&ChunkPos { x: 0, y: 1, z: 0 }));
         assert!(out.contains(&ChunkPos { x: 0, y: 0, z: -1 }));
+    }
+
+    /// Always generates an all-air chunk and always reports itself as
+    /// "definitely air" — stands in for both the `known_empty` case (a
+    /// chunk streamed once, found empty, and discarded) and the
+    /// never-generated-at-all case (a chunk `update()`'s request loop
+    /// skipped outright because `is_definitely_air` said not to bother —
+    /// see `set_block_at`'s doc comment).
+    struct AirGenerator;
+    impl WorldGenerator for AirGenerator {
+        fn generate(&self, _pos: ChunkPos, _seed: u64) -> Chunk {
+            Chunk::new()
+        }
+        fn is_definitely_air(&self, _pos: ChunkPos) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn set_block_at_materializes_known_empty_chunk() {
+        // Building upward: the surface chunk is loaded, but the chunk
+        // directly above it meshed to zero faces on first generation (pure
+        // air) and was therefore never stored — only recorded in
+        // known_empty. Placing a block into it (e.g. against the surface
+        // chunk's top face) must succeed, not silently no-op.
+        let mut stream = AsyncWorldStream::new(1, 1, None);
+        stream.generator = Some(Arc::new(AirGenerator) as Arc<dyn WorldGenerator>);
+        let pos = ChunkPos { x: 0, y: 1, z: 0 };
+        stream.known_empty.insert(pos);
+
+        let stone = BlockTypeId(1);
+        // World Y 16.0 is the first metre of chunk y=1 (chunk size = 32 *
+        // 0.5 = 16m), local voxel (2,0,2) within it.
+        let placed = stream.set_block_at(1.0, 16.0, 1.0, stone);
+
+        assert!(
+            placed,
+            "placing into a known_empty chunk should materialize it, not no-op"
+        );
+        assert!(!stream.known_empty.contains(&pos));
+        let chunk = stream.chunks().get(&pos).expect("chunk should be materialized");
+        assert_eq!(chunk.get(ChunkLocalPos::new(2, 0, 2)), stone);
+        assert!(stream.remesh_queue.contains(&pos));
+    }
+
+    #[test]
+    fn set_block_at_materializes_chunk_never_generated_at_all() {
+        // The chunk was never streamed AT ALL — not known_empty, not
+        // in_flight, not in inner.chunks — exactly what happens when
+        // is_definitely_air short-circuits it out of update()'s request
+        // loop entirely (e.g. building straight up past the generator's
+        // "highest possible terrain" bound). Must still succeed.
+        let mut stream = AsyncWorldStream::new(1, 1, None);
+        stream.generator = Some(Arc::new(AirGenerator) as Arc<dyn WorldGenerator>);
+        let pos = ChunkPos { x: 0, y: 3, z: 0 };
+
+        let stone = BlockTypeId(1);
+        let placed = stream.set_block_at(1.0, 49.0, 1.0, stone); // chunk y=3 spans world Y [48, 64)
+
+        assert!(
+            placed,
+            "placing into a never-generated chunk should materialize it, not no-op"
+        );
+        let chunk = stream.chunks().get(&pos).expect("chunk should be materialized");
+        assert_eq!(chunk.get(ChunkLocalPos::new(2, 2, 2)), stone);
+    }
+
+    #[test]
+    fn set_block_at_noop_while_chunk_in_flight() {
+        // A worker is already generating this exact chunk. Materializing a
+        // second copy here would race the worker's own result landing,
+        // which would silently overwrite this edit — must stay a no-op.
+        let mut stream = AsyncWorldStream::new(1, 1, None);
+        stream.generator = Some(Arc::new(AirGenerator) as Arc<dyn WorldGenerator>);
+        let pos = ChunkPos { x: 0, y: 0, z: 0 };
+        stream.in_flight.insert(pos);
+
+        let placed = stream.set_block_at(1.0, 1.0, 1.0, BlockTypeId(1));
+        assert!(!placed);
+        assert!(!stream.chunks().contains_key(&pos));
+    }
+
+    /// Fresh, unique scratch directory per test — cleaned up on drop.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "cubic_world_stream_pool_test_{tag}_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn update_promotes_definitely_air_chunk_with_saved_diff() {
+        // A chunk the generator's is_definitely_air heuristic would skip
+        // outright (e.g. above the highest possible terrain, as with
+        // building above the surface) but which has a saved diff from a
+        // previous session (e.g. the player built there, flew away far
+        // enough to unload it, and came back) must still get requested for
+        // generation, not silently dropped into known_empty forever.
+        let dir = TempDir::new("with_diff");
+        let mut cache = RegionCache::new(dir.0.clone(), 4);
+        let pos = ChunkPos { x: 0, y: 3, z: 0 };
+        let diff = crate::region::ChunkDiff::Sparse {
+            entries: vec![crate::region::SparseDiffEntry {
+                local_pos: crate::region::encode_local_pos(2, 2, 2),
+                block_id: 1,
+            }],
+            cpd: vec![],
+        };
+        cache.write_chunk(pos.x, pos.y, pos.z, &diff).unwrap();
+
+        let mut stream = AsyncWorldStream::new(1, 1, None);
+        let generator = Arc::new(AirGenerator) as Arc<dyn WorldGenerator>;
+        stream.set_persistence(Arc::new(Mutex::new(cache)), Arc::clone(&generator), 0, 512);
+
+        stream.update(pos, &generator, 0, &Arc::new(BlockFaceTextures::new()));
+
+        assert!(
+            stream.in_flight.contains(&pos),
+            "chunk with a saved diff should be requested despite is_definitely_air"
+        );
+        assert!(!stream.known_empty.contains(&pos));
+    }
+
+    #[test]
+    fn update_still_skips_definitely_air_chunk_with_no_diff() {
+        // Same generator/heuristic, but nothing was ever saved for this
+        // position — the ordinary case (vast majority of "definitely air"
+        // chunks) must still take the cheap known_empty short-circuit path,
+        // not pay a worker generation for genuinely empty space.
+        let dir = TempDir::new("no_diff");
+        let cache = RegionCache::new(dir.0.clone(), 4);
+
+        let mut stream = AsyncWorldStream::new(1, 1, None);
+        let generator = Arc::new(AirGenerator) as Arc<dyn WorldGenerator>;
+        stream.set_persistence(Arc::new(Mutex::new(cache)), Arc::clone(&generator), 0, 512);
+
+        let pos = ChunkPos { x: 0, y: 3, z: 0 };
+        stream.update(pos, &generator, 0, &Arc::new(BlockFaceTextures::new()));
+
+        assert!(stream.known_empty.contains(&pos));
+        assert!(!stream.in_flight.contains(&pos));
     }
 }
