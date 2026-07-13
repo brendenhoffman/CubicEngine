@@ -15,11 +15,11 @@ use cubic_wasm::{
 };
 use cubic_world::ChunkPos;
 use cubic_world::{
-    mesh_chunk, world_pos_to_chunk, AsyncWorldStream, BlockFaceTextures, WorldGenerator,
-    CHUNK_SIZE, VOXEL_SIZE,
+    mesh_chunk, world_pos_to_chunk, AsyncWorldStream, BlockFaceTextures, RegionCache,
+    WorldGenerator, CHUNK_SIZE, VOXEL_SIZE,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::error;
 
 /// Renderer-facing world state: chunk/entity mesh handles, the bindless
@@ -105,7 +105,7 @@ impl App {
                         .unwrap_or_default()
                         .as_secs();
                     // Minimal RFC 3339 — no chrono dep needed
-                    format_unix_as_rfc3339(secs)
+                    profile::format_unix_as_rfc3339(secs)
                 },
                 engine_version: env!("CARGO_PKG_VERSION").to_string(),
             };
@@ -118,6 +118,10 @@ impl App {
                 tracing::warn!("failed to write world.toml: {e}");
             }
         }
+        let region_cache = Arc::new(Mutex::new(RegionCache::new(
+            world_dir.clone(),
+            16, // max open region files
+        )));
 
         // Reinitialize seed
         let seed = if self.cfg.world.seed == 0 {
@@ -298,7 +302,17 @@ impl App {
             self.cfg.world.stream_radius_y,
             Some(Arc::new(cubic_wasm::set_worker_id as fn(usize))),
         );
-        self.world.chunk_meshes.clear();
+
+        if let Some(generator) = self.guest.generator.clone() {
+            self.world.stream.set_persistence(
+                Arc::clone(&region_cache),
+                generator,
+                self.world.seed,
+                self.cfg.world.diff_threshold,
+            );
+        }
+
+        self.region_cache = Some(region_cache);
     }
 
     /// Advance the guest tick, chunk streaming, mesh upload/remesh, and
@@ -519,55 +533,13 @@ impl App {
                 backend.draw_mesh(handle, push);
             }
         }
-    }
-}
 
-/// Formats a Unix timestamp as a bare RFC 3339 UTC string without pulling
-/// in chrono. Accurate for dates from 1970 through ~2099.
-fn format_unix_as_rfc3339(secs: u64) -> String {
-    // Days since epoch
-    let mut days = secs / 86400;
-    let time_of_day = secs % 86400;
-    let h = time_of_day / 3600;
-    let m = (time_of_day % 3600) / 60;
-    let s = time_of_day % 60;
-
-    // Gregorian calendar from day count
-    let mut year = 1970u64;
-    loop {
-        let leap =
-            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-        let days_in_year = if leap { 366 } else { 365 };
-        if days < days_in_year {
-            break;
+        // Autosave
+        let interval = self.cfg.world.autosave_interval_s;
+        if interval > 0 && self.autosave_timer.elapsed().as_secs() >= interval {
+            self.world.stream.flush_dirty();
+            self.autosave_timer = std::time::Instant::now();
+            tracing::info!("autosave complete");
         }
-        days -= days_in_year;
-        year += 1;
     }
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let days_per_month = [
-        31u64,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    let mut month = 1u64;
-    for &dim in &days_per_month {
-        if days < dim {
-            break;
-        }
-        days -= dim;
-        month += 1;
-    }
-    let day = days + 1;
-
-    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }

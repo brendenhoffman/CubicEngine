@@ -34,8 +34,9 @@ use cubic_platform::winit::{
 use cubic_render::{RenderSize, Renderer};
 use cubic_render_gl::GlRenderer;
 use cubic_render_vk::VkRenderer;
-use cubic_world::{CHUNK_SIZE, VOXEL_SIZE};
+use cubic_world::{RegionCache, CHUNK_SIZE, VOXEL_SIZE};
 use input::{resolve_controls, InputSource, InputState, InputTracker, ResolvedControls, MAX_PITCH};
+use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 use ui::{
     scan_games, str_to_window_mode, LauncherState, LauncherTab, PendingWindowedResize, WindowMode,
@@ -150,6 +151,9 @@ struct App {
     gilrs: Option<gilrs::Gilrs>,
 
     current_world_name: String,
+
+    region_cache: Option<Arc<Mutex<RegionCache>>>,
+    autosave_timer: std::time::Instant,
 }
 
 impl ApplicationHandler for App {
@@ -242,6 +246,9 @@ impl ApplicationHandler for App {
                 w.request_redraw();
             }
         }
+
+        // Refresh world list
+        self.refresh_world_list();
     }
 
     fn window_event(
@@ -571,6 +578,7 @@ impl ApplicationHandler for App {
         }
 
         if self.quit_requested {
+            self.world.stream.flush_dirty();
             self.exiting = true;
             self.backend = None;
             // See the CloseRequested handler above for why this must come
@@ -809,12 +817,17 @@ fn main() -> Result<()> {
         available_games: scan_games(),
         selected_profile: profile_name.clone(),
         available_profiles: profile::list_profiles(&game_name),
-        seed_str: cfg.world.seed.to_string(),
         window_mode,
         window_width_str,
         window_height_str,
         settings_open: false,
         remapping: None,
+        world_list: vec![],
+        new_world_name: String::new(),
+        new_world_seed_str: "0".to_string(),
+        renaming: None,
+        pending_delete: None,
+        worlds_error: None,
     };
 
     let current_world_name = current_profile
@@ -872,6 +885,8 @@ fn main() -> Result<()> {
             .inspect_err(|e| tracing::warn!("gamepad support unavailable: {e}"))
             .ok(),
         current_world_name,
+        region_cache: None,
+        autosave_timer: std::time::Instant::now(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())

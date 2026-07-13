@@ -416,6 +416,10 @@ pub(crate) struct WorldCfg {
     pub(crate) upload_budget_min_ms: f32,
     #[serde(default = "default_stream_radius_y")]
     pub(crate) stream_radius_y: i32,
+    #[serde(default = "default_diff_threshold")]
+    pub diff_threshold: usize,
+    #[serde(default = "default_autosave_interval_s")]
+    pub autosave_interval_s: u64,
 }
 
 impl Default for WorldCfg {
@@ -426,6 +430,8 @@ impl Default for WorldCfg {
             upload_budget_ms: 0.0,
             upload_budget_min_ms: default_upload_budget_min_ms(),
             stream_radius_y: default_stream_radius_y(),
+            autosave_interval_s: default_autosave_interval_s(),
+            diff_threshold: default_diff_threshold(),
         }
     }
 }
@@ -919,4 +925,11 @@ pub(crate) fn save_global_cfg(cfg: &AppCfg) {
         }
         Err(e) => tracing::warn!("failed to serialize config: {e}"),
     }
+}
+
+fn default_diff_threshold() -> usize {
+    512
+}
+fn default_autosave_interval_s() -> u64 {
+    60
 }

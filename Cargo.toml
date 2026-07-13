@@ -64,6 +64,7 @@ wit-bindgen = "0.59"
 noise = "0.9"
 dirs = "6"
 gilrs = "0.11"
+lz4_flex = "0.13"
 
 [patch.crates-io]
 egui-ash-renderer = { git = "https://github.com/brendenhoffman/egui-ash-renderer" }

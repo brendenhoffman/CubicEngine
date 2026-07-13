@@ -194,7 +194,7 @@ pub struct ControlsOverride {
 
 /// Immutable metadata written once when a world is created and never
 /// overwritten. Read back to show seed/date in the world picker UI.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorldToml {
     pub seed: u64,
     pub generator: String,
@@ -283,4 +283,54 @@ pub fn list_worlds(game_name: &str, profile_name: &str) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Formats a Unix timestamp as a bare RFC 3339 UTC string without pulling
+/// in chrono. Accurate for dates from 1970 through ~2099.
+pub(crate) fn format_unix_as_rfc3339(secs: u64) -> String {
+    // Days since epoch
+    let mut days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let h = time_of_day / 3600;
+    let m = (time_of_day % 3600) / 60;
+    let s = time_of_day % 60;
+
+    // Gregorian calendar from day count
+    let mut year = 1970u64;
+    loop {
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let days_in_year = if leap { 366 } else { 365 };
+        if days < days_in_year {
+            break;
+        }
+        days -= days_in_year;
+        year += 1;
+    }
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_per_month = [
+        31u64,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 1u64;
+    for &dim in &days_per_month {
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+    let day = days + 1;
+
+    format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z")
 }

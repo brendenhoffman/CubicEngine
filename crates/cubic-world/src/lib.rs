@@ -10,6 +10,11 @@ pub mod stream_pool;
 pub use stream_pool::AsyncWorldStream;
 pub mod physics;
 pub use physics::{sweep_aabb, world_to_chunk_local, ChunkQuery, SweepResult};
+pub mod region;
+pub use region::{
+    apply_diff, diff_from_chunks, region_path, ChunkDiff, CpdEntry, RegionCache, RegionFile,
+    SparseDiffEntry,
+};
 
 use cubic_math::Vec3;
 use std::collections::HashMap;

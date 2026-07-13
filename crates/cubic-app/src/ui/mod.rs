@@ -8,7 +8,7 @@ mod pause;
 
 pub(crate) use launcher::scan_games;
 
-use crate::App;
+use crate::{profile, App};
 
 /// Transient launcher UI state — not persisted directly; committed to
 /// cfg/profile.toml as the user interacts (see handle_launch,
@@ -18,7 +18,6 @@ pub(crate) struct LauncherState {
     pub(crate) available_games: Vec<GameEntry>,
     pub(crate) selected_profile: String,
     pub(crate) available_profiles: Vec<String>,
-    pub(crate) seed_str: String, // text field buffer for seed input
     pub(crate) window_mode: WindowMode,
     pub(crate) window_width_str: String,
     pub(crate) window_height_str: String,
@@ -32,6 +31,13 @@ pub(crate) struct LauncherState {
     // window_event's pre-egui interception and App::poll_gamepads) and
     // auto-cancels after REMAP_TIMEOUT if nothing is pressed.
     pub(crate) remapping: Option<(String, std::time::Instant)>,
+    // Worlds tab
+    pub(crate) world_list: Vec<WorldEntry>,
+    pub(crate) new_world_name: String,
+    pub(crate) new_world_seed_str: String,
+    pub(crate) renaming: Option<(String, String)>, // (old_name, draft_name)
+    pub(crate) pending_delete: Option<String>,     // world name awaiting confirm
+    pub(crate) worlds_error: Option<String>,       // inline validation error
 }
 
 pub(crate) const REMAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
@@ -46,6 +52,13 @@ pub(crate) struct GameEntry {
     // plugin from this path) is future work.
     #[allow(dead_code)]
     pub(crate) path: std::path::PathBuf, // full path to game directory
+}
+
+#[derive(Clone)]
+pub(crate) struct WorldEntry {
+    pub(crate) name: String,
+    /// None if world.toml is missing or malformed
+    pub(crate) meta: Option<profile::WorldToml>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -107,6 +120,7 @@ pub(crate) enum LauncherTab {
     Profile,
     Settings,
     Controls,
+    Worlds,
 }
 
 impl App {
@@ -231,6 +245,7 @@ impl App {
                 let voxel_y = (p.y / cubic_world::VOXEL_SIZE).floor() as i32;
                 let voxel_z = (p.z / cubic_world::VOXEL_SIZE).floor() as i32;
                 ui.label(format!("Block: {voxel_x} {voxel_y} {voxel_z}"));
+                ui.label(format!("Seed: {}", self.world.seed));
             });
     }
 }

@@ -10,7 +10,7 @@ use crate::profile;
 use crate::{App, AppState};
 use cubic_platform::winit::window::Fullscreen;
 
-use super::{GameEntry, LauncherTab, PendingWindowedResize, WindowMode};
+use super::{GameEntry, LauncherTab, PendingWindowedResize, WindowMode, WorldEntry};
 
 pub(crate) fn scan_games() -> Vec<GameEntry> {
     let mut games = vec![];
@@ -59,9 +59,15 @@ impl App {
     /// `self.cfg`/`self.guest.plugin` here; switching games/profiles at runtime is
     /// future work, per the `current_profile`/`current_game_name` fields).
     pub(crate) fn handle_launch(&mut self) {
-        // Parse seed
-        let seed = self.launcher.seed_str.parse::<u64>().unwrap_or(0);
-        self.cfg.world.seed = seed;
+        // Seed comes from world.toml for existing worlds, not from the launcher
+        // seed field -- that field is only used when creating a new world.
+        if let Ok(meta) = profile::read_world_toml(
+            &self.current_game_name,
+            &self.current_profile_name,
+            &self.current_world_name,
+        ) {
+            self.cfg.world.seed = meta.seed;
+        }
 
         // Apply window mode
         if let Some(window) = &self.window {
@@ -149,6 +155,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.launcher_tab, LauncherTab::Game, "Game");
                 ui.selectable_value(&mut self.launcher_tab, LauncherTab::Profile, "Profile");
+                ui.selectable_value(&mut self.launcher_tab, LauncherTab::Worlds, "Worlds");
                 ui.selectable_value(&mut self.launcher_tab, LauncherTab::Settings, "Settings");
                 ui.selectable_value(&mut self.launcher_tab, LauncherTab::Controls, "Controls");
             });
@@ -157,6 +164,7 @@ impl App {
             match self.launcher_tab {
                 LauncherTab::Game => self.build_game_tab(ui),
                 LauncherTab::Profile => self.build_profile_tab(ui),
+                LauncherTab::Worlds => self.build_worlds_tab(ui),
                 LauncherTab::Settings => self.build_settings_tab(ui),
                 LauncherTab::Controls => self.build_controls_tab(ui),
             }
@@ -245,10 +253,6 @@ impl App {
                     profile::list_profiles(&self.launcher.selected_game);
             }
         });
-
-        ui.separator();
-        ui.label("World seed (0 = random):");
-        ui.text_edit_singleline(&mut self.launcher.seed_str);
     }
 
     pub(crate) fn build_settings_tab(&mut self, ui: &mut egui::Ui) {
@@ -511,6 +515,246 @@ impl App {
         }
     }
 
+    fn build_worlds_tab(&mut self, ui: &mut egui::Ui) {
+        // --- World list ---
+        if self.launcher.world_list.is_empty() {
+            ui.label("No worlds yet. Create one to get started.");
+        } else {
+            egui::ScrollArea::vertical()
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    let world_list = self.launcher.world_list.clone();
+                    for entry in &world_list {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                // Name or rename field
+                                let is_renaming = self
+                                    .launcher
+                                    .renaming
+                                    .as_ref()
+                                    .map(|(old, _)| old == &entry.name)
+                                    .unwrap_or(false);
+
+                                if is_renaming {
+                                    let draft = &mut self.launcher.renaming.as_mut().unwrap().1;
+                                    let resp = ui.text_edit_singleline(draft);
+                                    if resp.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                    {
+                                        self.commit_rename();
+                                    }
+                                    if ui.button("OK").clicked() {
+                                        self.commit_rename();
+                                    }
+                                    if ui.button("Cancel").clicked() {
+                                        self.launcher.renaming = None;
+                                    }
+                                } else {
+                                    // Name + metadata
+                                    ui.vertical(|ui| {
+                                        ui.strong(&entry.name);
+                                        match &entry.meta {
+                                            Some(meta) => {
+                                                ui.small(format!(
+                                                    "Seed: {}  |  Created: {}",
+                                                    meta.seed,
+                                                    &meta.created_at[..10] // YYYY-MM-DD
+                                                ));
+                                            }
+                                            None => {
+                                                ui.small("(corrupt — missing world.toml)");
+                                            }
+                                        }
+                                    });
+
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            // Delete
+                                            let is_pending_delete =
+                                                self.launcher.pending_delete.as_deref()
+                                                    == Some(&entry.name);
+                                            if is_pending_delete {
+                                                ui.label("Delete?");
+                                                if ui.button("Yes").clicked() {
+                                                    self.delete_world(&entry.name.clone());
+                                                }
+                                                if ui.button("No").clicked() {
+                                                    self.launcher.pending_delete = None;
+                                                }
+                                            } else {
+                                                if ui.button("Delete").clicked() {
+                                                    self.launcher.pending_delete =
+                                                        Some(entry.name.clone());
+                                                }
+                                                // Rename -- only for valid worlds
+                                                if entry.meta.is_some()
+                                                    && ui.button("Rename").clicked()
+                                                {
+                                                    self.launcher.renaming = Some((
+                                                        entry.name.clone(),
+                                                        entry.name.clone(),
+                                                    ));
+                                                }
+                                                // Play -- only for valid worlds
+                                                if entry.meta.is_some()
+                                                    && ui.button("Play").clicked()
+                                                {
+                                                    self.current_world_name = entry.name.clone();
+                                                    self.handle_launch();
+                                                }
+                                            }
+                                        },
+                                    );
+                                }
+                            });
+                        });
+                    }
+                });
+        }
+
+        ui.separator();
+
+        // --- Create new world ---
+        ui.label("New world:");
+        ui.horizontal(|ui| {
+            ui.label("Name:");
+            ui.text_edit_singleline(&mut self.launcher.new_world_name);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Seed (0 = random):");
+            ui.text_edit_singleline(&mut self.launcher.new_world_seed_str);
+        });
+
+        if let Some(err) = &self.launcher.worlds_error {
+            ui.colored_label(egui::Color32::RED, err);
+        }
+
+        if ui.button("+ Create World").clicked() {
+            self.try_create_world();
+        }
+    }
+
+    fn try_create_world(&mut self) {
+        let name = self.launcher.new_world_name.trim().to_string();
+
+        // Validate
+        if name.is_empty() {
+            self.launcher.worlds_error = Some("World name cannot be empty.".to_string());
+            return;
+        }
+        if name.contains('/') || name.contains('\\') || name.contains('.') {
+            self.launcher.worlds_error = Some("World name cannot contain / \\ or .".to_string());
+            return;
+        }
+        if self.launcher.world_list.iter().any(|e| e.name == name) {
+            self.launcher.worlds_error = Some(format!("A world named \"{name}\" already exists."));
+            return;
+        }
+
+        let seed: u64 = match self.launcher.new_world_seed_str.trim().parse::<u64>() {
+            Ok(0) | Err(_) => rand_seed(),
+            Ok(s) => s,
+        };
+
+        let world_dir = profile::world_dir(
+            &self.launcher.selected_game,
+            &self.launcher.selected_profile,
+            &name,
+        );
+        if let Err(e) = std::fs::create_dir_all(world_dir.join("regions")) {
+            self.launcher.worlds_error = Some(format!("Failed to create world directory: {e}"));
+            return;
+        }
+
+        let meta = profile::WorldToml {
+            seed,
+            generator: self.launcher.selected_game.clone(),
+            created_at: {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                profile::format_unix_as_rfc3339(secs)
+            },
+            engine_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        if let Err(e) = profile::write_world_toml(
+            &self.launcher.selected_game,
+            &self.launcher.selected_profile,
+            &name,
+            &meta,
+        ) {
+            self.launcher.worlds_error = Some(format!("Failed to write world.toml: {e}"));
+            return;
+        }
+
+        // Launch into it immediately
+        self.launcher.worlds_error = None;
+        self.launcher.new_world_name.clear();
+        self.current_world_name = name;
+        self.handle_launch();
+    }
+
+    fn commit_rename(&mut self) {
+        let Some((old_name, new_name)) = self.launcher.renaming.take() else {
+            return;
+        };
+        let new_name = new_name.trim().to_string();
+        if new_name.is_empty()
+            || new_name.contains('/')
+            || new_name.contains('\\')
+            || new_name.contains('.')
+        {
+            self.launcher.worlds_error = Some("Invalid world name.".to_string());
+            return;
+        }
+        if self.launcher.world_list.iter().any(|e| e.name == new_name) {
+            self.launcher.worlds_error =
+                Some(format!("A world named \"{new_name}\" already exists."));
+            return;
+        }
+
+        let old_dir = profile::world_dir(
+            &self.launcher.selected_game,
+            &self.launcher.selected_profile,
+            &old_name,
+        );
+        let new_dir = profile::world_dir(
+            &self.launcher.selected_game,
+            &self.launcher.selected_profile,
+            &new_name,
+        );
+        if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+            self.launcher.worlds_error = Some(format!("Rename failed: {e}"));
+            return;
+        }
+
+        // Update current_world_name if we renamed the active world
+        if self.current_world_name == old_name {
+            self.current_world_name = new_name.clone();
+        }
+
+        self.launcher.worlds_error = None;
+        self.refresh_world_list();
+    }
+
+    fn delete_world(&mut self, name: &str) {
+        let world_dir = profile::world_dir(
+            &self.launcher.selected_game,
+            &self.launcher.selected_profile,
+            name,
+        );
+        if let Err(e) = std::fs::remove_dir_all(&world_dir) {
+            self.launcher.worlds_error = Some(format!("Delete failed: {e}"));
+        }
+        self.launcher.pending_delete = None;
+        if self.current_world_name == name {
+            self.current_world_name = "New World".to_string();
+        }
+        self.refresh_world_list();
+    }
+
     /// One row of the Controls tab: a capture button (left-click to bind
     /// any key/mouse/gamepad button, right-click to clear), a modifier
     /// combo, and — if `show_trigger` — a trigger-kind combo. Shared by
@@ -771,4 +1015,36 @@ impl App {
         }
         self.persist_control_change();
     }
+
+    pub(crate) fn refresh_world_list(&mut self) {
+        let names = profile::list_worlds(
+            &self.launcher.selected_game,
+            &self.launcher.selected_profile,
+        );
+        self.launcher.world_list = names
+            .into_iter()
+            .map(|name| {
+                let meta = profile::read_world_toml(
+                    &self.launcher.selected_game,
+                    &self.launcher.selected_profile,
+                    &name,
+                )
+                .ok();
+                WorldEntry { name, meta }
+            })
+            .collect();
+    }
+}
+
+/// Generate a random u64 seed from system time. No dependency on rand --
+/// mixing in the nanosecond component gives enough entropy for a world seed.
+fn rand_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| {
+            let s = d.as_secs();
+            let n = d.subsec_nanos() as u64;
+            s ^ (n << 32) ^ (n >> 16)
+        })
+        .unwrap_or(12345678)
 }

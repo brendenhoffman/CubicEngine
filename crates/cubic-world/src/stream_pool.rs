@@ -2,6 +2,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use crate::physics::{world_to_chunk_local, ChunkQuery};
+use crate::region::{apply_diff, diff_from_chunks, RegionCache};
 use crate::{
     mesh_chunk, BlockFaceTextures, BlockTypeId, Chunk, ChunkPos, StreamDelta, WorldGenerator,
     WorldStream, CHUNK_SIZE,
@@ -21,6 +22,7 @@ struct WorkItem {
     seed: u64,
     generator: Arc<dyn WorldGenerator>,
     face_textures: Arc<BlockFaceTextures>,
+    region_cache: Option<Arc<Mutex<RegionCache>>>,
 }
 
 struct WorkResult {
@@ -65,6 +67,11 @@ pub struct AsyncWorldStream {
     // need revisiting when block removal exists (dirty chunk system).
     known_empty: HashSet<ChunkPos>,
     _workers: Vec<JoinHandle<()>>,
+    dirty: HashSet<ChunkPos>,
+    region_cache: Option<Arc<Mutex<RegionCache>>>,
+    generator: Option<Arc<dyn WorldGenerator>>,
+    seed: u64,
+    diff_threshold: usize,
 }
 
 impl AsyncWorldStream {
@@ -101,7 +108,21 @@ impl AsyncWorldStream {
                         };
                         match item {
                             Ok(work) => {
-                                let chunk = work.generator.generate(work.pos, work.seed);
+                                let mut chunk = work.generator.generate(work.pos, work.seed);
+
+                                if let Some(cache) = &work.region_cache {
+                                    if let Ok(mut cache) = cache.lock() {
+                                        match cache.read_chunk(work.pos.x, work.pos.y, work.pos.z) {
+                                            Ok(Some(diff)) => apply_diff(&mut chunk, &diff),
+                                            Ok(None) => {}
+                                            Err(e) => tracing::warn!(
+                                                "failed to read diff for {:?}: {e:#}",
+                                                work.pos
+                                            ),
+                                        }
+                                    }
+                                }
+
                                 let (vertices, indices) =
                                     mesh_chunk(&chunk, [None; 6], &work.face_textures);
                                 if vertices.is_empty() {
@@ -144,7 +165,25 @@ impl AsyncWorldStream {
             remeshed_with: HashMap::new(),
             known_empty: HashSet::new(),
             _workers: workers,
+            dirty: HashSet::new(),
+            region_cache: None,
+            generator: None,
+            seed: 0,
+            diff_threshold: 512,
         }
+    }
+
+    pub fn set_persistence(
+        &mut self,
+        region_cache: Arc<Mutex<RegionCache>>,
+        generator: Arc<dyn WorldGenerator>,
+        seed: u64,
+        diff_threshold: usize,
+    ) {
+        self.region_cache = Some(region_cache);
+        self.generator = Some(generator);
+        self.seed = seed;
+        self.diff_threshold = diff_threshold;
     }
 
     /// Same contract as `WorldStream::update` but generation is async.
@@ -215,6 +254,7 @@ impl AsyncWorldStream {
                             seed,
                             generator: Arc::clone(generator),
                             face_textures: Arc::clone(face_textures),
+                            region_cache: self.region_cache.clone(),
                         });
                     }
                 }
@@ -248,6 +288,34 @@ impl AsyncWorldStream {
 
         // Apply unloads
         for pos in &to_unload {
+            if self.dirty.contains(pos) {
+                if let (Some(chunk), Some(cache), Some(gen)) = (
+                    self.inner.chunks.get(pos),
+                    &self.region_cache,
+                    &self.generator,
+                ) {
+                    let baseline = gen.generate(*pos, self.seed);
+                    match diff_from_chunks(&baseline, chunk, self.diff_threshold) {
+                        Some(diff) => {
+                            if let Ok(mut cache) = cache.lock() {
+                                if let Err(e) = cache.write_chunk(pos.x, pos.y, pos.z, &diff) {
+                                    tracing::error!("failed to save chunk {pos:?}: {e:#}");
+                                }
+                            }
+                        }
+                        None => {
+                            // Chunk reverted to virgin -- remove any previously saved diff
+                            if let Ok(mut cache) = cache.lock() {
+                                if let Err(e) = cache.remove_chunk(pos.x, pos.y, pos.z) {
+                                    tracing::warn!("failed to tombstone chunk {pos:?}: {e:#}");
+                                }
+                            }
+                        }
+                    }
+                }
+                self.dirty.remove(pos);
+            }
+
             self.inner.chunks.remove(pos);
             self.remeshed_with.remove(pos);
             // Clear this position's bit in each neighbor's recorded mask so
@@ -318,9 +386,41 @@ impl AsyncWorldStream {
             return false;
         };
         chunk.set(lp, id);
+        self.dirty.insert(cp);
         self.remesh_queue.push(cp);
         self.remesh_queue.extend(boundary_neighbors(cp, lp));
         true
+    }
+
+    /// Save all dirty loaded chunks to disk without unloading them.
+    /// Called by the autosave timer and on clean quit.
+    pub fn flush_dirty(&mut self) {
+        let (Some(cache), Some(gen)) = (&self.region_cache, &self.generator) else {
+            return;
+        };
+        let dirty_positions: Vec<ChunkPos> = self.dirty.iter().copied().collect();
+        for pos in dirty_positions {
+            let Some(chunk) = self.inner.chunks.get(&pos) else {
+                self.dirty.remove(&pos);
+                continue;
+            };
+            let baseline = gen.generate(pos, self.seed);
+            match diff_from_chunks(&baseline, chunk, self.diff_threshold) {
+                Some(diff) => {
+                    if let Ok(mut cache) = cache.lock() {
+                        if let Err(e) = cache.write_chunk(pos.x, pos.y, pos.z, &diff) {
+                            tracing::error!("autosave failed for {pos:?}: {e:#}");
+                        }
+                    }
+                }
+                None => {
+                    if let Ok(mut cache) = cache.lock() {
+                        let _ = cache.remove_chunk(pos.x, pos.y, pos.z);
+                    }
+                    self.dirty.remove(&pos);
+                }
+            }
+        }
     }
 }
 
