@@ -273,7 +273,12 @@ impl App {
             // built-ins (see commands::dispatch's fallback) and need to be
             // in this list too, or they'd always paint red as "unknown".
             let mut known: Vec<&str> = vec!["tp", "set", "help", "locate"];
-            known.extend(self.guest.registered_commands.iter().map(|c| c.name.as_str()));
+            known.extend(
+                self.guest
+                    .registered_commands
+                    .iter()
+                    .map(|c| c.name.as_str()),
+            );
             self.input_bar.paint(ctx, &painter, bar_rect, &font, &known);
 
             // Invisible TextEdit for keyboard routing only --
