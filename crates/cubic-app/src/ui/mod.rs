@@ -261,6 +261,54 @@ impl App {
                 let voxel_z = (p.z / cubic_world::VOXEL_SIZE as f64).floor() as i32;
                 ui.label(format!("Block: {voxel_x} {voxel_y} {voxel_z}"));
                 ui.label(format!("Seed: {}", self.world.seed));
+
+                // Worldgen — pushed once per tick by the guest (see
+                // world_tick_and_draw's take_worldgen_debug call). Absent
+                // before the guest's first tick or when no game is loaded.
+                if let Some(debug) = self.worldgen_debug {
+                    ui.separator();
+                    ui.label("Worldgen");
+                    ui.label(format!("Surface:   {:+.0}m", debug.surface_height_m));
+                    ui.colored_label(
+                        temp_color(debug.temp_c),
+                        format!("Temp:      {:+.1}\u{b0}C", debug.temp_c),
+                    );
+                    ui.colored_label(
+                        moisture_color(debug.moisture_pct),
+                        format!("Moisture:  {:.0}%", debug.moisture_pct),
+                    );
+                    ui.label(format!(
+                        "Plate:     {}  Uplift: {:+.0}m",
+                        debug.plate_id, debug.uplift_m
+                    ));
+                    ui.label(format!(
+                        "Boundary:  {}  {:.0}km",
+                        crate::biome::classify_boundary(debug.boundary_type),
+                        debug.boundary_distance_km
+                    ));
+                }
             });
+    }
+}
+
+/// Blue for cold (< 0°C), white for temperate, orange for hot (> 25°C).
+fn temp_color(temp_c: f32) -> egui::Color32 {
+    if temp_c < 0.0 {
+        egui::Color32::from_rgb(100, 160, 255)
+    } else if temp_c > 25.0 {
+        egui::Color32::from_rgb(255, 160, 60)
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
+/// Brown for dry (< 30%), green for wet (> 60%), white in between.
+fn moisture_color(moisture_pct: f32) -> egui::Color32 {
+    if moisture_pct < 30.0 {
+        egui::Color32::from_rgb(180, 130, 70)
+    } else if moisture_pct > 60.0 {
+        egui::Color32::from_rgb(100, 220, 100)
+    } else {
+        egui::Color32::WHITE
     }
 }

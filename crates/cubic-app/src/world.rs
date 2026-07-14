@@ -10,8 +10,8 @@ use crate::App;
 use cubic_math::{DVec3, Vec3};
 use cubic_render::{MeshHandle, PushData};
 use cubic_wasm::{
-    clear_tick_query, set_tick_input, set_tick_query, take_camera_update, InputSnapshot,
-    WasmPlugin, WasmWorldGenerator,
+    clear_tick_query, set_tick_input, set_tick_query, take_camera_update, take_worldgen_debug,
+    InputSnapshot, WasmPlugin, WasmWorldGenerator,
 };
 use cubic_world::ChunkPos;
 use cubic_world::{
@@ -404,6 +404,10 @@ impl App {
             self.camera.yaw = cam.yaw;
             self.camera.pitch = cam.pitch;
             self.player_spectating = cam.spectating;
+        }
+
+        if let Some(debug) = take_worldgen_debug() {
+            self.worldgen_debug = Some(debug);
         }
 
         clear_tick_query();

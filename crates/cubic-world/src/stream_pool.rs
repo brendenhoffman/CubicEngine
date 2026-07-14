@@ -248,7 +248,7 @@ impl AsyncWorldStream {
                     {
                         continue;
                     }
-                    if generator.is_definitely_air(pos) && !self.has_saved_diff(pos) {
+                    if generator.is_definitely_air(pos, seed) && !self.has_saved_diff(pos) {
                         // The generator's heuristic is coarse (e.g. "this
                         // chunk's Y range is entirely above the highest
                         // possible terrain height") and knows nothing about
@@ -610,7 +610,7 @@ mod tests {
         fn generate(&self, _pos: ChunkPos, _seed: u64) -> Chunk {
             Chunk::new()
         }
-        fn is_definitely_air(&self, _pos: ChunkPos) -> bool {
+        fn is_definitely_air(&self, _pos: ChunkPos, _seed: u64) -> bool {
             true
         }
     }

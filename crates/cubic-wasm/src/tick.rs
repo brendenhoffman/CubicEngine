@@ -103,6 +103,40 @@ pub fn take_camera_update() -> Option<CameraUpdate> {
 }
 
 // ---------------------------------------------------------------------------
+// Worldgen debug
+// ---------------------------------------------------------------------------
+
+/// Worldgen debug snapshot at the player's current XZ column, set by the
+/// game during on_tick via `set-worldgen-debug`. Drives the F3 diagnostics
+/// overlay and the /locate and /tectonic commands.
+#[derive(Clone, Copy)]
+pub struct WorldgenDebug {
+    pub surface_height_m: f32,
+    pub temp_c: f32,
+    pub moisture_pct: f32,
+    pub plate_id: u32,
+    pub plate_density: f32,
+    pub uplift_m: f32,
+    pub boundary_type: f32,
+    pub boundary_distance_km: f32,
+}
+
+thread_local! {
+    static WORLDGEN_DEBUG: Cell<Option<WorldgenDebug>> = const { Cell::new(None) };
+}
+
+/// Store a worldgen debug snapshot from the guest's `set-worldgen-debug` call.
+pub fn set_worldgen_debug(debug: WorldgenDebug) {
+    WORLDGEN_DEBUG.with(|c| c.set(Some(debug)));
+}
+
+/// Take (and clear) the worldgen debug snapshot the guest set during the
+/// most recent tick.
+pub fn take_worldgen_debug() -> Option<WorldgenDebug> {
+    WORLDGEN_DEBUG.with(|c| c.take())
+}
+
+// ---------------------------------------------------------------------------
 // Player feet position
 // ---------------------------------------------------------------------------
 

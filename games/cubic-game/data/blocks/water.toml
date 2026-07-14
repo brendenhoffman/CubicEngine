@@ -1,0 +1,5 @@
+[block]
+name = "water"
+
+[block.faces]
+all = "assets/textures/blocks/water.png"

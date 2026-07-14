@@ -15,7 +15,8 @@ pub(crate) fn dispatch(app: &mut App, input: &str) {
         "tp" => cmd_tp(app, &args),
         "set" => cmd_set(app, &args),
         "help" => cmd_help(app, &args),
-        "locate" => Ok("Biome location not yet implemented.".to_string()),
+        "locate" => cmd_locate(app, &args),
+        "tectonic" => cmd_tectonic(app, &args),
         other => {
             // Check game-registered commands
             if let Some(cmd) = app
@@ -62,7 +63,7 @@ pub(crate) fn completions(app: &App, input: &str, cursor_pos: usize) -> Vec<Stri
     // Completing the command name itself
     if tokens.is_empty() || (tokens.len() == 1 && !ends_with_space) {
         let partial = tokens.first().copied().unwrap_or("");
-        let mut matches: Vec<String> = ["tp", "set", "help", "locate"]
+        let mut matches: Vec<String> = ["tp", "set", "help", "locate", "tectonic"]
             .iter()
             .filter(|c| c.starts_with(partial))
             .map(|c| format!("/{c}"))
@@ -124,12 +125,22 @@ pub(crate) fn completions(app: &App, input: &str, cursor_pos: usize) -> Vec<Stri
             }
         }
         "help" => {
-            let builtins = ["tp", "set", "help", "locate"];
+            let builtins = ["tp", "set", "help", "locate", "tectonic"];
             builtins
                 .iter()
                 .filter(|c| c.starts_with(partial))
                 .map(|c| c.to_string())
                 .collect()
+        }
+        "locate" => {
+            if arg_index == 0 {
+                vec!["biome".to_string()]
+                    .into_iter()
+                    .filter(|s| s.starts_with(partial))
+                    .collect()
+            } else {
+                vec![]
+            }
         }
         _ => {
             // Game-registered command completions
@@ -273,7 +284,8 @@ fn cmd_help(app: &App, args: &[&str]) -> Result<String, String> {
     if args.is_empty() {
         let mut out = "/tp [@p|@c] <x> <y> <z> — teleport (~ for relative)\n\
               /set [<key> <value>] — view/change hot config\n\
-              /locate biome <name> — find biome (not yet implemented)\n\
+              /locate biome [name] — show current biome, or search for one\n\
+              /tectonic — show tectonic/climate data at your position\n\
               /help [command] — show help"
             .to_string();
         if !app.guest.registered_commands.is_empty() {
@@ -293,9 +305,14 @@ fn cmd_help(app: &App, args: &[&str]) -> Result<String, String> {
                          Keys: fly_speed walk_speed jump_velocity gravity \
                          sprint_multiplier mouse_sensitivity"
                 .to_string()),
-            "locate" => {
-                Ok("/locate biome <name> — find nearest biome (not yet implemented)".to_string())
-            }
+            "locate" => Ok("/locate biome — show the biome at your current position\n\
+                            /locate biome <name> — search for a biome (not yet implemented)"
+                .to_string()),
+            "tectonic" => Ok(
+                "/tectonic — show plate, uplift, boundary, climate, and biome data \
+                    at your current position"
+                    .to_string(),
+            ),
             "help" => Ok("/help [command] — list commands or show usage for one".to_string()),
             other => {
                 if let Some(cmd) = app
@@ -310,4 +327,60 @@ fn cmd_help(app: &App, args: &[&str]) -> Result<String, String> {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// /locate
+// ---------------------------------------------------------------------------
+
+fn cmd_locate(app: &App, args: &[&str]) -> Result<String, String> {
+    if args.first() != Some(&"biome") {
+        return Err("Usage: /locate biome [name]".to_string());
+    }
+    if args.len() > 1 {
+        return Ok("Searching... (not yet implemented)".to_string());
+    }
+
+    let debug = app
+        .worldgen_debug
+        .ok_or_else(|| "Worldgen data not ready yet.".to_string())?;
+    let biome =
+        crate::biome::classify_biome(debug.temp_c, debug.moisture_pct, debug.surface_height_m);
+    Ok(format!(
+        "You are in: {biome} ({:.0}\u{b0}C, {:.0}% moisture)",
+        debug.temp_c, debug.moisture_pct
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// /tectonic
+// ---------------------------------------------------------------------------
+
+fn cmd_tectonic(app: &App, _args: &[&str]) -> Result<String, String> {
+    let debug = app
+        .worldgen_debug
+        .ok_or_else(|| "Worldgen data not ready yet.".to_string())?;
+
+    let plate_kind = if debug.plate_density < 0.5 {
+        "continental"
+    } else {
+        "oceanic"
+    };
+    let boundary_kind = crate::biome::classify_boundary(debug.boundary_type);
+    let biome =
+        crate::biome::classify_biome(debug.temp_c, debug.moisture_pct, debug.surface_height_m);
+
+    Ok(format!(
+        "Plate {} ({plate_kind}, density {:.2})\n\
+         Uplift: {:+.0}m  Boundary: {:.0}km ({boundary_kind} {:.2})\n\
+         Surface temp: {:+.1}\u{b0}C  Moisture: {:.0}%\n\
+         Biome: {biome}",
+        debug.plate_id,
+        debug.plate_density,
+        debug.uplift_m,
+        debug.boundary_distance_km,
+        debug.boundary_type,
+        debug.temp_c,
+        debug.moisture_pct,
+    ))
 }

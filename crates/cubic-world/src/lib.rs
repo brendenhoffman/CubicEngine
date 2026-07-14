@@ -15,6 +15,11 @@ pub use region::{
     apply_diff, diff_from_chunks, region_path, ChunkDiff, CpdEntry, RegionCache, RegionFile,
     SparseDiffEntry,
 };
+pub mod world_constants;
+pub use world_constants::{
+    latitude_to_base_temp_c, world_z_to_latitude, EQUATOR_TO_POLE_M, MAX_TERRAIN_HEIGHT_M,
+    MIN_OCEAN_FLOOR_M, MOISTURE_GRID_CELL_M, NS_TILE_M, SEA_LEVEL_M, TEMP_LAPSE_RATE_C_PER_M,
+};
 
 use cubic_math::DVec3;
 use std::collections::HashMap;

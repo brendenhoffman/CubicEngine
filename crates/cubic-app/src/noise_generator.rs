@@ -77,7 +77,7 @@ impl WorldGenerator for NoiseGenerator {
         chunk
     }
 
-    fn is_definitely_air(&self, pos: ChunkPos) -> bool {
+    fn is_definitely_air(&self, pos: ChunkPos, _seed: u64) -> bool {
         let chunk_y_min = pos.y as f32 * CHUNK_SIZE as f32 * VOXEL_SIZE;
         let chunk_y_max = chunk_y_min + CHUNK_SIZE as f32 * VOXEL_SIZE;
         chunk_y_min > self.max_possible_height() || chunk_y_max <= 0.0

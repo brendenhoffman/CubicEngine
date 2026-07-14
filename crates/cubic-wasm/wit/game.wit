@@ -186,6 +186,21 @@ interface camera {
     /// player. Used by diagnostics (XYZ / block position) instead of the
     /// camera position when a WASM game is driving it.
     set-player-feet: func(x: f64, y: f64, z: f64);
+
+    /// Worldgen debug snapshot at the player's current XZ column, pushed
+    /// once per tick for the F3 diagnostics overlay and the /locate and
+    /// /tectonic commands. boundary-type ranges -1.0 (divergent) to +1.0
+    /// (convergent); plate-density < 0.5 is continental, >= 0.5 oceanic.
+    set-worldgen-debug: func(
+        surface-height-m: f32,
+        temp-c: f32,
+        moisture-pct: f32,
+        plate-id: u32,
+        plate-density: f32,
+        uplift-m: f32,
+        boundary-type: f32,
+        boundary-distance-km: f32,
+    );
 }
 
 interface tick {

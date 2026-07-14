@@ -5,91 +5,32 @@ wit_bindgen::generate!({
     path: "../cubic-wasm/wit/game.wit",
 });
 
+mod climate;
+mod generator;
+mod heightmap;
 mod player;
+mod tectonics;
+mod terrain_config;
+mod world_constants;
 
+use climate::ClimateCache;
 use cubic::game::block_registry::{FaceDef, register_block_with_faces};
 use cubic::game::commands;
 use exports::cubic::game::world_gen::Guest;
-use noise::{NoiseFn, OpenSimplex};
+use generator::{BlockIds, generate_column};
+use heightmap::{NoiseState, sample_heightmap};
 use player::{EYE_HEIGHT, InputState, Player};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use tectonics::{TectonicPlates, random_spawn};
+use terrain_config::TerrainCfg;
+use world_constants::MAX_TERRAIN_HEIGHT_M;
 
-// ---------------------------------------------------------------------------
-// Noise config
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct NoiseLayer {
-    frequency: f32,
-    amplitude: f32,
-}
-
-struct ResolvedSurfaceRule {
-    block_id: u32,
-    max_depth: Option<u32>,
-}
-
-struct NoiseGenerator {
-    base_height: f32,
-    layers: Vec<NoiseLayer>,
-    noise: OpenSimplex,
-    surface_rules: Vec<ResolvedSurfaceRule>,
-    fallback_id: u32, // used if no rules match (shouldn't happen with a catch-all)
-}
-
-impl NoiseGenerator {
-    /// `world_x`/`world_z` are f64 — X/Z are unbounded (per the
-    /// f64-world-coordinates card), and f32 loses adjacent-voxel precision
-    /// past ~16.78M metres (2^24), causing many consecutive voxel columns to
-    /// round to the same noise sample and the terrain to visibly alias/flatten
-    /// at extreme distance. `h` (a terrain height, always small — capped
-    /// ~12,000m by the generator) stays f32.
-    fn surface_height(&self, world_x: f64, world_z: f64) -> f32 {
-        let mut h = self.base_height;
-        for layer in &self.layers {
-            h += self.noise.get([
-                world_x * layer.frequency as f64,
-                world_z * layer.frequency as f64,
-            ]) as f32
-                * layer.amplitude;
-        }
-        h
-    }
-
-    fn max_possible_height(&self) -> f32 {
-        self.base_height + self.layers.iter().map(|l| l.amplitude).sum::<f32>()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Terrain TOML schema
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-struct TerrainConfig {
-    terrain: TerrainInner,
-}
-
-#[derive(Deserialize)]
-struct TerrainInner {
-    base_height: f32,
-    #[allow(dead_code)]
-    sea_level: f32,
-    #[serde(default)]
-    layers: Vec<NoiseLayer>,
-    #[serde(default)]
-    surface_rules: Vec<SurfaceRule>,
-}
-
-#[derive(Deserialize)]
-struct SurfaceRule {
-    block: String,
-    #[serde(default)]
-    max_depth: Option<u32>, // None = no limit (catch-all)
-}
+/// Moisture tiles kept resident in `WorldGen::climate_cache` at once (each
+/// ~360KB -- see `ClimateCache`'s doc comment).
+const MOISTURE_CACHE_TILES: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Block textures
@@ -160,7 +101,22 @@ fn load_block(path: &str) -> Option<(String, [String; 6])> {
 // Global state — safe because WASM is single-threaded per instance
 // ---------------------------------------------------------------------------
 
-static GENERATOR: OnceLock<NoiseGenerator> = OnceLock::new();
+/// Everything the world generator needs to place blocks: tectonics (plate
+/// envelope), noise (heightmap detail), climate (temperature/moisture, with
+/// its moisture-tile cache), and the resolved ids of the blocks it places.
+/// Generation happens on worker threads (see `WasmWorldGenerator` in
+/// cubic-wasm), so the moisture cache needs a `Mutex`; everything else here
+/// is read-only after `on_load`.
+struct WorldGen {
+    seed: u64,
+    plates: TectonicPlates,
+    noise: NoiseState,
+    climate_cache: Mutex<ClimateCache>,
+    ids: BlockIds,
+    cfg: TerrainCfg,
+}
+
+static GENERATOR: OnceLock<WorldGen> = OnceLock::new();
 
 // RefCell isn't Sync, so it can't sit in a OnceLock static as-is even
 // though this module only ever runs on one thread (no wasm threads
@@ -174,7 +130,7 @@ unsafe impl Sync for PlayerCell {}
 
 static PLAYER: OnceLock<PlayerCell> = OnceLock::new();
 
-fn generator() -> &'static NoiseGenerator {
+fn generator() -> &'static WorldGen {
     GENERATOR
         .get()
         .expect("generator not initialized — on_load not called")
@@ -191,9 +147,9 @@ static BLOCK_IDS: OnceLock<HashMap<String, u32>> = OnceLock::new();
 // Constants — must match cubic-world
 // ---------------------------------------------------------------------------
 
-const CHUNK_SIZE: usize = 32;
+pub(crate) const CHUNK_SIZE: usize = 32;
 const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
-const VOXEL_SIZE: f32 = 0.5;
+pub(crate) const VOXEL_SIZE: f32 = 0.5;
 
 /// Clearance above the queried surface height used for the player's spawn
 /// point (see `on_load`) — one voxel is enough to start in air rather than
@@ -222,6 +178,42 @@ fn voxel_center(min_corner: [f64; 3]) -> [f64; 3] {
         min_corner[1] + half_voxel,
         min_corner[2] + half_voxel,
     ]
+}
+
+/// Sample worldgen state at the player's current column and push it to the
+/// host for the F3 diagnostics overlay and the /locate + /tectonic
+/// commands. Called once per tick from `on_tick`.
+fn push_worldgen_debug(x: f64, z: f64) {
+    let wg = generator();
+    let tec = wg.plates.sample(x, z);
+    let surface_m = sample_heightmap(x, z, wg.seed, &tec, &wg.noise, &wg.cfg.noise);
+    let climate = climate::sample_climate(
+        x,
+        z,
+        surface_m as f64,
+        wg.seed,
+        &wg.plates,
+        &wg.climate_cache,
+        &wg.cfg.climate,
+    );
+    let plate_density = wg
+        .plates
+        .plates
+        .iter()
+        .find(|p| p.id == tec.plate_id)
+        .map(|p| p.density)
+        .unwrap_or(0.0);
+
+    cubic::game::camera::set_worldgen_debug(
+        surface_m,
+        climate.temp_c,
+        climate.moisture_pct,
+        tec.plate_id,
+        plate_density,
+        tec.uplift_m,
+        tec.boundary_type,
+        tec.boundary_distance_m / 1000.0,
+    );
 }
 
 /// Bytes per entry in the flat completion-values buffer `commands.
@@ -337,29 +329,6 @@ impl Guest for GamePlugin {
         let names: Vec<&str> = block_ids.keys().map(|s| s.as_str()).collect();
         register_completions_for_give(&names);
 
-        // Read terrain config from datapack
-        let mut buf = vec![0u8; 65536];
-        let len = cubic::game::data::read_file(
-            "world/terrain.toml",
-            buf.as_mut_ptr() as u32,
-            buf.len() as u32,
-        );
-        buf.truncate(len as usize);
-        let cfg: TerrainConfig =
-            toml::from_str(std::str::from_utf8(&buf).expect("terrain.toml is not valid utf8"))
-                .expect("failed to parse terrain.toml");
-
-        // Resolve surface rules: map block names to registered IDs
-        let surface_rules: Vec<ResolvedSurfaceRule> = cfg
-            .terrain
-            .surface_rules
-            .iter()
-            .map(|r| ResolvedSurfaceRule {
-                block_id: block_ids.get(&r.block).copied().unwrap_or(0),
-                max_depth: r.max_depth,
-            })
-            .collect();
-
         // Load player model
         let mesh_path = b"assets/models/player.obj";
         let mesh_handle =
@@ -383,44 +352,79 @@ impl Guest for GamePlugin {
         HIGHLIGHT_MESH.set(hl_mesh_handle).ok();
         HIGHLIGHT_TEX.set(hl_tex_index).ok();
 
-        let fallback_id = block_ids.get("stone").copied().unwrap_or(0);
+        let ids = BlockIds {
+            stone: block_ids.get("stone").copied().unwrap_or(0),
+            dirt: block_ids.get("dirt").copied().unwrap_or(0),
+            grass: block_ids.get("grass").copied().unwrap_or(0),
+            sand: block_ids.get("sand").copied().unwrap_or(0),
+            gravel: block_ids.get("gravel").copied().unwrap_or(0),
+            snow: block_ids.get("snow").copied().unwrap_or(0),
+            ice: block_ids.get("ice").copied().unwrap_or(0),
+            water: block_ids.get("water").copied().unwrap_or(0),
+        };
+        let fallback_id = ids.stone;
+
+        // Live-tunable worldgen parameters -- see terrain_config.rs. Falls
+        // back to the exact values that used to be hardcoded constants if
+        // the file is missing, invalid, or partially specified.
+        let mut cfg_buf = vec![0u8; 65536];
+        let cfg_len = cubic::game::data::read_file(
+            "world/terrain.toml",
+            cfg_buf.as_mut_ptr() as u32,
+            cfg_buf.len() as u32,
+        );
+        cfg_buf.truncate(cfg_len as usize);
+        let cfg = terrain_config::parse_terrain_config(std::str::from_utf8(&cfg_buf).unwrap_or(""));
 
         GENERATOR
-            .set(NoiseGenerator {
-                base_height: cfg.terrain.base_height,
-                layers: cfg.terrain.layers,
-                noise: OpenSimplex::new(seed as u32),
-                surface_rules,
-                fallback_id,
+            .set(WorldGen {
+                seed,
+                plates: TectonicPlates::new(seed, cfg.world, cfg.uplift),
+                noise: NoiseState::new(seed),
+                climate_cache: Mutex::new(ClimateCache::new(
+                    MOISTURE_CACHE_TILES,
+                    cfg.climate.moisture_tile_cells,
+                )),
+                ids,
+                cfg,
             })
             .unwrap_or_else(|_| panic!("on_load called twice"));
 
-        // Spawn at the actual terrain height under (0, 0) — surface_height
-        // is the same continuous height function generate() already uses to
-        // decide solid-vs-air, and it needs no chunks loaded, so we can
-        // query it directly instead of guessing a fixed height (which can
-        // land below the real surface on tall-terrain seeds) or dropping
-        // the player from way above and waiting for gravity. SPAWN_MARGIN
+        // Spawn at a random mid-latitude continental location -- a fixed
+        // point like (0, 0) can land in an ocean on many seeds. Query the
+        // same tectonic/heightmap functions generate() uses to decide
+        // solid-vs-air, so no chunks need to be loaded first. SPAWN_MARGIN
         // is just enough clearance that the spawn AABB starts in air, not
         // exactly on the solid/air boundary; sweep_aabb's de-penetration
         // step (see cubic-world/src/physics.rs) covers the rest if this
         // column's voxel quantization puts solid ground fractionally above
         // that estimate.
-        let spawn_y = generator().surface_height(0.0, 0.0) + SPAWN_MARGIN;
+        let wg = generator();
+        let [spawn_x, spawn_z] = random_spawn(&wg.plates, seed);
+        let spawn_tec = wg.plates.sample(spawn_x, spawn_z);
+        let spawn_surface =
+            sample_heightmap(spawn_x, spawn_z, seed, &spawn_tec, &wg.noise, &wg.cfg.noise);
+        let spawn_y = spawn_surface + SPAWN_MARGIN;
         PLAYER
-            .set(PlayerCell(RefCell::new(Player::new(spawn_y, fallback_id))))
+            .set(PlayerCell(RefCell::new(Player::new(
+                spawn_x,
+                spawn_y,
+                spawn_z,
+                fallback_id,
+            ))))
             .unwrap_or_else(|_| panic!("on_load called twice"));
 
         0
     }
 
     fn generate(_handle: u32, cx: i32, cy: i32, cz: i32, out_ptr: u32) -> u32 {
-        let noise_gen = generator();
-        // X/Z origins are f64 — see surface_height's doc comment for why.
-        // Y stays f32: height is capped ~12,000m by the generator, nowhere
-        // near f32's ~16.78M precision cliff.
+        let wg = generator();
+        // X/Z origins are f64 -- X/Z are unbounded (per the
+        // f64-world-coordinates card), and f32 loses adjacent-voxel
+        // precision past ~16.78M metres (2^24), causing many consecutive
+        // voxel columns to round to the same sample and terrain to visibly
+        // alias/flatten at extreme distance.
         let origin_x = (cx as f64) * (CHUNK_SIZE as f64) * VOXEL_SIZE as f64;
-        let origin_y = (cy as f32) * (CHUNK_SIZE as f32) * VOXEL_SIZE;
         let origin_z = (cz as f64) * (CHUNK_SIZE as f64) * VOXEL_SIZE as f64;
 
         // Write voxels into shared memory at out_ptr.
@@ -428,25 +432,28 @@ impl Guest for GamePlugin {
         // Safety: out_ptr is a valid offset into WASM linear memory,
         // pre-allocated by the host for this worker's output buffer.
         let mem_ptr = out_ptr as *mut u32;
-        for y in 0..CHUNK_SIZE {
-            let world_y = origin_y + y as f32 * VOXEL_SIZE;
-            for z in 0..CHUNK_SIZE {
-                let world_z = origin_z + z as f64 * VOXEL_SIZE as f64;
-                for x in 0..CHUNK_SIZE {
-                    let world_x = origin_x + x as f64 * VOXEL_SIZE as f64;
-                    let surface = noise_gen.surface_height(world_x, world_z);
+        for z in 0..CHUNK_SIZE {
+            let world_z = origin_z + z as f64 * VOXEL_SIZE as f64;
+            for x in 0..CHUNK_SIZE {
+                let world_x = origin_x + x as f64 * VOXEL_SIZE as f64;
+
+                let tec = wg.plates.sample(world_x, world_z);
+                let surface_m =
+                    sample_heightmap(world_x, world_z, wg.seed, &tec, &wg.noise, &wg.cfg.noise);
+                let climate = climate::sample_climate(
+                    world_x,
+                    world_z,
+                    surface_m as f64,
+                    wg.seed,
+                    &wg.plates,
+                    &wg.climate_cache,
+                    &wg.cfg.climate,
+                );
+
+                let column =
+                    generate_column(cy, surface_m as f64, &climate, &wg.ids, &wg.cfg.biomes);
+                for (y, &id) in column.iter().enumerate() {
                     let index = x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE;
-                    let id = if world_y < surface {
-                        let depth_voxels = ((surface - world_y) / VOXEL_SIZE).ceil() as u32;
-                        noise_gen
-                            .surface_rules
-                            .iter()
-                            .find(|r| r.max_depth.is_none_or(|d| depth_voxels <= d))
-                            .map(|r| r.block_id)
-                            .unwrap_or(noise_gen.fallback_id)
-                    } else {
-                        0
-                    };
                     // Safety: index < CHUNK_VOLUME, buffer pre-allocated by host
                     unsafe {
                         mem_ptr.add(index).write(id);
@@ -458,10 +465,13 @@ impl Guest for GamePlugin {
     }
 
     fn is_definitely_air(_handle: u32, _cx: i32, cy: i32, _cz: i32) -> bool {
-        let noise_gen = generator();
+        // Coarse, cheap heuristic (no tectonics/heightmap sampling): a
+        // chunk is only ever definitely air above the global max terrain
+        // height. Below sea level always has water or ocean floor, never
+        // air, so that side never short-circuits.
         let chunk_y_min = (cy as f32) * (CHUNK_SIZE as f32) * VOXEL_SIZE;
         let chunk_y_max = chunk_y_min + (CHUNK_SIZE as f32) * VOXEL_SIZE;
-        chunk_y_min > noise_gen.max_possible_height() || chunk_y_max <= 0.0
+        chunk_y_min > MAX_TERRAIN_HEIGHT_M as f32 || chunk_y_max <= 0.0
     }
 }
 
@@ -601,6 +611,7 @@ impl exports::cubic::game::tick::Guest for GamePlugin {
             }
 
             player.tick(dt, &input_state);
+            push_worldgen_debug(player.pos[0], player.pos[2]);
 
             if let (Some(action), Some(target)) = (block_action, player.target) {
                 match action {

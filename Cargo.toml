@@ -9,7 +9,7 @@ members = [
   "crates/cubic-world",
   "crates/cubic-app",
   "crates/cubic-wasm",
-  # wasm32-wasip1-only plugin crate. It's a full workspace member (not its
+  # wasm32-unknown-unknown-only plugin crate. It's a full workspace member (not its
   # own opt-out workspace) so rust-analyzer's default project discovery
   # actually picks it up instead of treating it as a detached file with no
   # crate graph or proc-macro expansion. Kept out of default-members below

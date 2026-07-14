@@ -7,10 +7,11 @@ pub use tick::{
     push_block_edit, push_draw_request, push_game_command_registration,
     push_game_completion_registration, push_input_event, set_camera_update, set_command_result,
     set_load_fns, set_pending_command, set_player_feet, set_tick_input, set_tick_query,
-    take_block_edits, take_camera_update, take_command_result, take_draw_queue,
+    set_worldgen_debug, take_block_edits, take_camera_update, take_command_result, take_draw_queue,
     take_game_command_registrations, take_game_completion_registrations, take_input_events,
-    take_pending_command, with_chunk_query, BlockEditRequest, CameraUpdate, DrawRequest,
-    GameCommandRegistration, GameCompletionRegistration, InputEvent, InputSnapshot, PlayerFeet,
+    take_pending_command, take_worldgen_debug, with_chunk_query, BlockEditRequest, CameraUpdate,
+    DrawRequest, GameCommandRegistration, GameCompletionRegistration, InputEvent, InputSnapshot,
+    PlayerFeet, WorldgenDebug,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -509,6 +510,31 @@ impl WasmInstance {
             },
         )?;
 
+        linker.func_wrap(
+            IMPORT_CAMERA_MODULE,
+            "set-worldgen-debug",
+            |_caller: wasmtime::Caller<'_, HostState>,
+             surface_height_m: f32,
+             temp_c: f32,
+             moisture_pct: f32,
+             plate_id: u32,
+             plate_density: f32,
+             uplift_m: f32,
+             boundary_type: f32,
+             boundary_distance_km: f32| {
+                set_worldgen_debug(WorldgenDebug {
+                    surface_height_m,
+                    temp_c,
+                    moisture_pct,
+                    plate_id,
+                    plate_density,
+                    uplift_m,
+                    boundary_type,
+                    boundary_distance_km,
+                });
+            },
+        )?;
+
         // --- render ---
 
         linker.func_wrap(
@@ -966,7 +992,9 @@ impl WorldGenerator for WasmWorldGenerator {
         })
     }
 
-    fn is_definitely_air(&self, pos: ChunkPos) -> bool {
+    fn is_definitely_air(&self, pos: ChunkPos, _seed: u64) -> bool {
+        // The WASM guest's own is-definitely-air export already has the
+        // seed baked in from on_load, so it doesn't need it passed again.
         WASM_INSTANCE.with(|cell| {
             let mut opt = cell.borrow_mut();
             if opt.is_none() {

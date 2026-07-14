@@ -102,22 +102,23 @@ pub struct RayHit {
 
 impl Default for Player {
     fn default() -> Self {
-        Self::new(DEFAULT_SPAWN_Y, 0)
+        Self::new(0.0, DEFAULT_SPAWN_Y, 0.0, 0)
     }
 }
 
 impl Player {
-    /// `spawn_y` should be the actual queried terrain height at the spawn
-    /// column plus a little clearance (see `on_load`'s call site) — a fixed
-    /// height can end up below the real surface on seeds with tall noise
-    /// output, spawning the player embedded in the ground with no way to
-    /// sweep back out (see `sweep_aabb`'s de-penetration step, which only
-    /// ever helps once already ticking, not for the very first placement).
-    /// `default_block` is the initially selected block for placing — see
-    /// `on_load`'s call site, which passes its terrain fallback block.
-    pub fn new(spawn_y: f32, default_block: u32) -> Self {
+    /// `spawn_x`/`spawn_y`/`spawn_z` should be the actual queried terrain
+    /// height (plus a little clearance) at a chosen spawn column (see
+    /// `on_load`'s call site) — a fixed height can end up below the real
+    /// surface on seeds with tall noise output, spawning the player
+    /// embedded in the ground with no way to sweep back out (see
+    /// `sweep_aabb`'s de-penetration step, which only ever helps once
+    /// already ticking, not for the very first placement). `default_block`
+    /// is the initially selected block for placing — see `on_load`'s call
+    /// site, which passes its terrain fallback block.
+    pub fn new(spawn_x: f64, spawn_y: f32, spawn_z: f64, default_block: u32) -> Self {
         Self {
-            pos: [0.0, spawn_y as f64, 0.0],
+            pos: [spawn_x, spawn_y as f64, spawn_z],
             vel: [0.0; 3],
             yaw: 0.0,
             pitch: 0.0,

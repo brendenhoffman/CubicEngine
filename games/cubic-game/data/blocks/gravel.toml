@@ -1,0 +1,5 @@
+[block]
+name = "gravel"
+
+[block.faces]
+all = "assets/textures/blocks/gravel.png"

@@ -1,26 +1,81 @@
-[terrain]
-base_height = 16.0
-sea_level = 8.0
+# Live-tunable worldgen parameters. Every key here is optional -- a
+# missing file, a missing [section], or a missing individual key all fall
+# back to the values shown below (which reproduce the engine's built-in
+# defaults exactly). Edit a value and relaunch to see the effect; no
+# recompile needed.
 
-[[terrain.layers]]
-frequency = 0.01
-amplitude = 16.0
+[world]
+# Number of tectonic plates generated from the world seed.
+plate_count = 28
+# Fraction of plates assigned continental density (0.0-1.0). Higher means
+# more land coverage.
+continental_fraction = 0.40
 
-[[terrain.layers]]
-frequency = 0.05
-amplitude = 4.0
+[uplift]
+# Base elevation for continental plates, in meters.
+continental_base_m = 500.0
+# Additional elevation per unit of low density: (0.5 - density) * this.
+continental_density_scale = 4000.0
+# Base subsidence for oceanic plates, in meters (negative).
+oceanic_base_m = -500.0
+# Additional subsidence per unit of high density: (density - 0.5) * this.
+oceanic_density_scale = 3000.0
+# Distance over which a plate boundary's influence falls off (meters,
+# e-folding distance).
+boundary_falloff_m = 200000.0
+# Maximum uplift at a head-on convergent boundary, in meters.
+max_convergent_uplift_m = 12000.0
+# Maximum additional subsidence at a divergent boundary, in meters.
+max_divergent_subsidence_m = 3000.0
 
-[[terrain.layers]]
-frequency = 0.1
-amplitude = 1.0
+[noise]
+# Layer 1: regional variation.
+regional_frequency = 0.000002
+regional_amplitude = 500.0
+regional_octaves = 4
 
-[[terrain.surface_rules]]
-block = "grass"
-max_depth = 1
+# Layer 2: local terrain.
+local_frequency = 0.00005
+local_amplitude_ocean = 200.0
+local_amplitude_plain = 300.0
+local_amplitude_mountain = 500.0
+local_octaves = 6
 
-[[terrain.surface_rules]]
-block = "dirt"
-max_depth = 4
+# Layer 3: mountain ridges (only in high-uplift convergent zones).
+ridge_frequency = 0.0005
+ridge_amplitude_factor = 0.3
+ridge_octaves = 8
+ridge_boundary_type_threshold = 0.3
+ridge_uplift_threshold_m = 2000.0
 
-[[terrain.surface_rules]]
-block = "stone"
+# Coastline warping.
+coastal_frequency = 0.0001
+coastal_amplitude = 200.0
+coastal_blend_zone_m = 300.0
+coastal_octaves = 3
+
+[climate]
+# Wind simulation iterations (more = better rain shadows, slower first load).
+moisture_iterations = 40
+# Moisture tile size in cells (tile covers cell_count * 1km per side).
+moisture_tile_cells = 300
+# Orographic moisture drop per 1000m of terrain rise (percentage points).
+orographic_drop_per_1000m = 15.0
+# Ocean evaporation rate (fraction of deficit restored per iteration).
+ocean_evaporation_rate = 0.30
+# Starting moisture over ocean (percent).
+ocean_base_moisture = 90.0
+# Starting moisture over land before wind (percent).
+land_base_moisture = 20.0
+
+[biomes]
+# Temperature thresholds in Celsius.
+glacier_temp_c = -8.0
+snow_surface_temp_c = -5.0
+alpine_elevation_m = 3500.0
+beach_elevation_max_m = 3.0
+desert_temp_c = 20.0
+desert_moisture_pct = 25.0
+
+# Subsurface dirt layer thickness in blocks.
+dirt_depth_blocks = 3

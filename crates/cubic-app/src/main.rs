@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CEPL-1.0
 #![deny(unsafe_op_in_unsafe_fn)]
 mod backend;
+mod biome;
 mod commands;
 mod config;
 #[cfg(debug_assertions)]
@@ -169,6 +170,11 @@ struct App {
     chat_fade_timer: Option<std::time::Instant>,
     chat_submit_pending: bool,
     player_spectating: bool,
+    // Worldgen debug snapshot at the player's position, pushed once per
+    // tick by the guest (see world_tick_and_draw's take_worldgen_debug
+    // call). Drives the F3 diagnostics overlay and the /locate + /tectonic
+    // commands. None before the guest's first tick or when no game is loaded.
+    worldgen_debug: Option<cubic_wasm::WorldgenDebug>,
 }
 
 impl ApplicationHandler for App {
@@ -1063,6 +1069,7 @@ fn main() -> Result<()> {
         chat_fade_timer: None,
         chat_submit_pending: false,
         player_spectating: false,
+        worldgen_debug: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
